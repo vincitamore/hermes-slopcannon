@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import json
 import sys
 import threading
 from typing import Any
@@ -14,34 +13,71 @@ from .client import Client, SlopcannonError
 _LOCAL_SURFACES = {"cli", "tui", "desktop", "acp"}
 _login_lock = threading.Lock()
 
-HELP = (
-    "/slop status   connection, balance and service readiness\n"
-    "/slop login    connect your SLOPCANNON account (opens slop.cc in your browser)\n"
-    "/slop logout   forget the stored SLOPCANNON token on this machine\n"
-    "/slop sync     refresh the SLOPCANNON tool list from the server (next session)"
-)
+HELP = "\n".join([
+    "SLOPCANNON",
+    "  /slop status   account, credits and service",
+    "  /slop login    connect your account (opens slop.cc in your browser)",
+    "  /slop logout   forget this machine's SLOPCANNON token",
+    "  /slop sync     refresh the tool list from the server (applies next session)",
+])
+
+_LABEL_WIDTH = 10
+
+
+def _row(label: str, value: str) -> str:
+    return f"  {label:<{_LABEL_WIDTH}} {value}"
+
+
+def _credits(value: Any) -> str:
+    return f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else "?"
+
+
+def _expiry(epoch: Any) -> str:
+    if not isinstance(epoch, (int, float)):
+        return ""
+    import datetime as _dt
+
+    return "expires " + _dt.datetime.fromtimestamp(epoch).strftime("%d %b %Y").lstrip("0")
 
 
 def _status_text() -> str:
     summary = auth.token_summary()
-    lines = [f"SLOPCANNON: {'connected' if summary['connected'] else 'not connected'}"
-             + (f" ({summary['token_prefix']}, via {summary['via']})" if summary["connected"] else "")]
+    rows = ["SLOPCANNON"]
+    if summary["connected"]:
+        via = {"oauth": "signed in at slop.cc", "pasted": "account token", "environment": "token from environment"}
+        account = " · ".join(part for part in (
+            "connected", via.get(summary["via"] or "", summary["via"] or ""), _expiry(summary["expires_at"])) if part)
+        rows.append(_row("account", account))
+    else:
+        rows.append(_row("account", "not connected · run /slop login"))
+
     client = Client()
-    try:
-        runtime = client.capabilities().get("hostedRuntime") or {}
-        lines.append(f"service: {runtime.get('status')}, submissions "
-                     f"{'open' if runtime.get('submissionReady') else 'closed'}")
-    except Exception as exc:  # status must never raise into the UI
-        lines.append(f"service: unreachable ({exc})")
     if summary["connected"]:
         try:
             balance = client.balance()
-            lines.append("balance: " + json.dumps(balance, separators=(",", ":"))[:300])
+            available, reserved = balance.get("availableCredits"), balance.get("reservedCredits")
+            credits = f"{_credits(available)} available"
+            if isinstance(reserved, int) and reserved:
+                credits += f" · {_credits(reserved)} held for running work"
+            if balance.get("scope") == "organization-customer":
+                credits += " · organization allowance"
+            rows.append(_row("credits", credits))
         except SlopcannonError as exc:
-            lines.append(f"balance: {exc}")
-    else:
-        lines.append("Run /slop login to connect.")
-    return "\n".join(lines)
+            rows.append(_row("credits", f"unavailable ({exc})"))
+
+    try:
+        runtime = client.capabilities().get("hostedRuntime") or {}
+        status = str(runtime.get("status") or "unknown")
+        rows.append(_row("service", " · ".join([
+            status,
+            "rendering open" if runtime.get("submissionReady") else "rendering paused",
+        ])))
+    except Exception as exc:  # status must never raise into the UI
+        rows.append(_row("service", f"unreachable ({type(exc).__name__})"))
+
+    if summary["connected"]:
+        rows.append(_row("top-up", "slop.cc/account#buy-credits"))
+    return "\n".join(rows)
 
 
 def _surface() -> str:
@@ -54,7 +90,7 @@ def _surface() -> str:
 
 def _login_in_background() -> str:
     if not _login_lock.acquire(blocking=False):
-        return "A SLOPCANNON sign-in is already waiting in your browser."
+        return "\n".join(["SLOPCANNON", _row("sign-in", "already waiting in your browser")])
 
     def run() -> None:
         try:
@@ -65,8 +101,8 @@ def _login_in_background() -> str:
             _login_lock.release()
 
     threading.Thread(target=run, name="slopcannon-login", daemon=True).start()
-    return ("Opening slop.cc in your browser to connect SLOPCANNON. Approve there, then run "
-            "/slop status. Tools see the new connection on the next call.")
+    return "\n".join(["SLOPCANNON", _row("sign-in", "opening slop.cc in your browser"),
+                      _row("next", "approve there, then /slop status")])
 
 
 def slash(raw_args: str = "", **_: Any) -> str:
@@ -76,20 +112,21 @@ def slash(raw_args: str = "", **_: Any) -> str:
     if verb == "login":
         surface = _surface()
         if surface not in _LOCAL_SURFACES:
-            return ("Sign-in opens a browser on the machine Hermes runs on, so it cannot start from "
-                    f"{surface}. On that machine run `hermes slopcannon login`, or "
-                    "`hermes slopcannon login --token-stdin` with a token from slop.cc/account. "
-                    "Never paste a token into chat.")
+            return "\n".join(["SLOPCANNON", _row("sign-in", f"needs a browser on the Hermes machine, not {surface}"),
+                              _row("instead", "run `hermes slopcannon login` on that machine"),
+                              _row("headless", "`hermes slopcannon login --token-stdin` with a slop.cc/account token"),
+                              _row("never", "paste a token into chat")])
         return _login_in_background()
     if verb == "logout":
         auth.clear_token()
-        return "SLOPCANNON token removed from this machine. Revoke it at slop.cc/account if needed."
+        return "\n".join(["SLOPCANNON", _row("account", "disconnected on this machine"),
+                          _row("revoke", "slop.cc/account, to end the token everywhere")])
     if verb == "sync":
         try:
             count = server_tools.refresh()
         except SlopcannonError as exc:
-            return f"Sync failed: {exc}"
-        return f"Synced {count} SLOPCANNON tools. They load in your next session."
+            return "\n".join(["SLOPCANNON", _row("sync", f"failed ({exc})")])
+        return "\n".join(["SLOPCANNON", _row("sync", f"{count} tools · they load in your next session")])
     return HELP
 
 

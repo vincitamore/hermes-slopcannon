@@ -372,6 +372,25 @@ class ToolsTest(unittest.TestCase):
 
 
 class AuthTest(unittest.TestCase):
+    def test_status_is_aligned_rows_without_raw_json(self):
+        from slopcannon_plugin import commands
+
+        bind()
+        transport = httpx.MockTransport(lambda r: httpx.Response(200, json=(
+            {"data": {"availableCredits": 4430, "reservedCredits": 56}} if r.url.path == "/v1/billing/balance"
+            else {"hostedRuntime": {"status": "available", "submissionReady": True}})))
+        real = client_mod.Client
+        with mock.patch.object(commands, "Client", lambda *a, **k: real(origin=ORIGIN, token="t", transport=transport)), \
+                mock.patch.object(auth, "token_summary", return_value={
+                    "connected": True, "via": "oauth", "expires_at": None, "token_prefix": "slop_live_x", "scopes": None}):
+            text = commands.slash("status")
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "SLOPCANNON")
+        self.assertIn("4,430 available · 56 held for running work", text)
+        self.assertIn("available · rendering open", text)
+        self.assertNotIn("{", text)
+        self.assertNotIn("slop_live", text)
+        self.assertEqual(len({line.index(line.split()[1]) for line in lines[1:]}), 1)  # one value column
     def test_pkce_pair(self):
         verifier, challenge = auth._pkce_pair()
         self.assertRegex(verifier, r"^[A-Za-z0-9._~-]{43,128}$")
