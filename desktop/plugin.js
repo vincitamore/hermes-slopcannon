@@ -8,7 +8,7 @@
 // Contributions:
 //   - route `/slopcannon` + sidebar nav row `SLOPCANNON` (the studio page)
 //   - status bar item (right cluster): credits and running renders
-//   - palette: Open studio, Sign in, Refresh
+//   - palette: Open studio, Copy sign-in command, Refresh
 //   - transcript directive `::slopcannon-film{id="<production id>"}`
 //   - tool media renderer for this package's own tools' MEDIA files
 //
@@ -22,6 +22,8 @@ import { Component, createElement as h, Fragment, useEffect, useMemo, useState }
 const ID = 'slopcannon'
 const ROUTE = '/slopcannon'
 const TOP_UP_URL = 'https://slop.cc/account#buy-credits'
+// Sign-in belongs to Hermes and runs in a terminal; the studio only shows the command.
+const SIGN_IN_COMMAND = 'hermes auth add slopcannon:slop'
 const PRODUCTION_ID = /^[a-z0-9][a-z0-9-]{0,63}$/
 const FAST_POLL_MS = 5_000
 const SLOW_POLL_MS = 30_000
@@ -182,6 +184,7 @@ function normStatus(raw) {
       submissionReady: typeof s.submissionReady === 'boolean' ? s.submissionReady : null
     },
     error: str(o.error),
+    signInCommand: str(obj(o.signIn).command) || SIGN_IN_COMMAND,
     // Whole productions run on the backend's Node.js; `ok: false` means none can start.
     node: isObj(o.node) ? { ok: o.node.ok !== false, message: str(o.node.message) } : null
   }
@@ -1016,19 +1019,21 @@ function openStudio(productionId) {
   }
 }
 
-async function signIn() {
+// Copies the sign-in command; Hermes runs the sign-in itself, in a terminal on the backend machine.
+async function signIn(command) {
+  const text = command || SIGN_IN_COMMAND
+  let copied = false
   try {
-    const r = obj(await api('/login', { method: 'POST', body: {} }))
-    if (r.started) notify('info', 'Finish signing in to SLOPCANNON in the browser window that opened.')
-    else notify('warning', 'Sign-in did not start. Run `hermes slopcannon login` on the backend machine.')
-  } catch (err) {
-    reportError(err, 'Could not start the SLOPCANNON sign-in.')
+    copied = Boolean(CTX && (await CTX.os.writeClipboard(text)))
+  } catch {
+    copied = false
   }
-  invalidateAll()
-  if (CTX) {
-    CTX.setTimeout(invalidateAll, 15_000)
-    CTX.setTimeout(invalidateAll, 45_000)
-  }
+  notify(
+    copied ? 'info' : 'warning',
+    copied
+      ? `Copied \`${text}\`. Run it in a terminal on the Hermes machine, then refresh the studio.`
+      : `Run \`${text}\` in a terminal on the Hermes machine, then refresh the studio.`
+  )
 }
 
 async function topUp() {
@@ -1044,7 +1049,7 @@ async function topUp() {
 // -----------------------------------------------------------------------------
 // Studio: account strip
 
-const VIA_LABEL = { oauth: 'browser sign-in', pasted: 'pasted key', environment: 'environment key' }
+const VIA_LABEL = { 'hermes sign-in': 'Hermes sign-in', 'personal token': 'personal token' }
 
 function AccountStrip() {
   const status = useStatus()
@@ -1066,15 +1071,22 @@ function AccountStrip() {
       'div',
       { className: 'sc-strip' },
       h('span', { className: 'sc-strip-item' }, icon('account'), h('span', { className: 'sc-strong' }, 'Not signed in')),
+      h(
+        'span',
+        { className: 'sc-strip-item sc-muted' },
+        'Run',
+        h('span', { className: 'sc-mono' }, s.signInCommand),
+        'in a terminal, or set a personal token in the plugin settings'
+      ),
       s.error ? h('span', { className: 'sc-strip-item sc-muted' }, redact(s.error)) : null,
       h('span', { className: 'sc-spacer' }),
-      h(Btn, { label: 'Sign in', iconName: 'sign-in', variant: 'default', onClick: signIn })
+      h(Btn, { label: 'Copy command', iconName: 'copy', variant: 'default', onClick: () => signIn(s.signInCommand) })
     )
   }
   const c = s.credits
   const svc = s.service
   const expiresMs = s.expiresAt ? s.expiresAt * 1000 : null
-  const expires = expiresMs ? (expiresMs > Date.now() ? `expires ${fmtWhen(expiresMs)}` : 'sign-in expired') : null
+  const expires = expiresMs ? (expiresMs > Date.now() ? `session ${fmtWhen(expiresMs)}` : 'session expired') : null
   return h(
     'div',
     { className: 'sc-strip' },
@@ -1904,8 +1916,8 @@ export default {
         area: PALETTE_AREA,
         data: {
           id: 'slopcannon.signIn',
-          label: 'SLOPCANNON: Sign in',
-          keywords: ['slopcannon', 'login', 'sign in', 'account'],
+          label: 'SLOPCANNON: Copy sign-in command',
+          keywords: ['slopcannon', 'login', 'sign in', 'account', 'hermes auth add'],
           run: () => void signIn()
         }
       },
