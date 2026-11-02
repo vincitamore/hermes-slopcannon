@@ -1,0 +1,154 @@
+"""Backend routes for the SLOPCANNON desktop studio: ``/api/plugins/slopcannon/``.
+
+Hermes imports this file inside the gateway process when the plugin is enabled
+in ``plugins.enabled``. It reads the same on-disk production state the agent
+tools write, so the studio is correct whichever process drove a production.
+Nothing here spends credits or records a rights sign-off: those happen only
+through agent tool calls that pass Hermes's approval prompt.
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+import threading
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
+
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+_ALIAS = "hermes_slopcannon_studio"
+
+
+def _package() -> ModuleType:
+    """The plugin package: the copy Hermes already loaded, else one loaded from this folder."""
+    init = (_PACKAGE_DIR / "__init__.py").resolve()
+    for name, module in list(sys.modules.items()):
+        file = getattr(module, "__file__", None)
+        if file and name.count(".") <= 1 and Path(file).resolve() == init:
+            return module
+    if _ALIAS not in sys.modules:
+        spec = importlib.util.spec_from_file_location(_ALIAS, init, submodule_search_locations=[str(_PACKAGE_DIR)])
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load the SLOPCANNON plugin package")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[_ALIAS] = module
+        spec.loader.exec_module(module)
+    return sys.modules[_ALIAS]
+
+
+def _mod(name: str) -> Any:
+    package = _package()
+    return importlib.import_module(f"{package.__name__}.{name}")
+
+
+router = APIRouter()
+_login_lock = threading.Lock()
+
+
+@router.get("/status")
+def status() -> dict[str, Any]:
+    auth, client_mod = _mod("auth"), _mod("client")
+    summary = auth.token_summary()
+    out: dict[str, Any] = {
+        "connected": bool(summary.get("connected")), "via": summary.get("via"),
+        "expiresAt": summary.get("expires_at"), "credits": None,
+        "service": {"status": None, "submissionReady": None}, "error": None,
+        "node": _mod("production").node_status(),
+    }
+    client = client_mod.Client()
+    try:
+        runtime = client.capabilities().get("hostedRuntime") or {}
+        out["service"] = {"status": runtime.get("status"), "submissionReady": runtime.get("submissionReady")}
+    except Exception as exc:
+        out["error"] = f"service unreachable ({type(exc).__name__})"
+    if out["connected"]:
+        try:
+            balance = client.balance()
+            out["credits"] = {"available": balance.get("availableCredits"),
+                              "reserved": balance.get("reservedCredits"), "scope": balance.get("scope")}
+        except Exception as exc:
+            out["error"] = str(exc)[:300]
+    out["node"] = {k: v for k, v in out["node"].items() if k != "node"}  # never a local path
+    return out
+
+
+@router.get("/productions")
+def productions() -> dict[str, Any]:
+    production = _mod("production")
+    rows = []
+    for pid in production.list_ids()[:50]:
+        try:
+            rows.append(production.summary(pid))
+        except Exception:
+            continue
+    return {"productions": rows}
+
+
+@router.get("/productions/{production_id}")
+def production_detail(production_id: str) -> dict[str, Any]:
+    production = _mod("production")
+    try:
+        return production.summary(production_id, detail=True)
+    except production.ProductionError as exc:
+        raise HTTPException(status_code=404 if exc.code == "unknown_production" else 400, detail=str(exc))
+
+
+@router.post("/productions/{production_id}/stop")
+def production_stop(production_id: str) -> dict[str, Any]:
+    production = _mod("production")
+    try:
+        return {"stopped": production.stop(production_id)}
+    except production.ProductionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/login")
+def login() -> dict[str, Any]:
+    """Start the browser sign-in on this machine (the one Hermes runs on)."""
+    auth = _mod("auth")
+    if not _login_lock.acquire(blocking=False):
+        return {"started": False, "reason": "a sign-in is already waiting in your browser"}
+
+    def run() -> None:
+        try:
+            auth.login(say=lambda _msg: None)
+        except Exception:
+            pass
+        finally:
+            _login_lock.release()
+            try:
+                from hermes_cli.plugin_events import broadcast_plugin_event
+
+                broadcast_plugin_event("slopcannon", "account.updated", {})
+            except Exception:
+                pass
+
+    threading.Thread(target=run, name="slopcannon-login", daemon=True).start()
+    return {"started": True}
+
+
+@router.get("/media")
+def media(path: str = Query(..., min_length=1)) -> FileResponse:
+    """Stream a clip or master this plugin saved (byte ranges supported); nothing else on disk."""
+    production = _mod("production")
+    target = Path(path).expanduser()
+    try:
+        target = target.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=404, detail="not found")
+    allowed = False
+    for root in production.allowed_media_roots():
+        try:
+            target.relative_to(Path(root).resolve())
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed or not target.is_file() or target.suffix.lower() not in {".mp4", ".mov", ".webm", ".m4a", ".mp3", ".wav"}:
+        raise HTTPException(status_code=404, detail="not found")
+    media_type = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+                  ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav"}[target.suffix.lower()]
+    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=3600"})

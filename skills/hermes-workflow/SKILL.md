@@ -5,10 +5,13 @@ description: Make a SLOPCANNON music video, source-video remix or audio-first ad
 
 # SLOPCANNON in Hermes
 
-The plugin registers every SLOPCANNON server tool under its own name (`slopcannon_create_project`, `slopcannon_create_quote`, `slopcannon_submit_generation`, ...), exactly as the canonical skill and `references/hosted-api.md` name them, plus four tools only a local agent has. Together they replace the CLI and browser hand-offs the canonical skill describes; the creative and safety rules in `slopcannon:slopcannon-music-video` still apply in full. Load it with `skill_view("slopcannon:slopcannon-music-video")` before writing a treatment or a timed plan, and read its references when a step names them.
+The plugin registers every SLOPCANNON server tool under its own name (`slopcannon_create_project`, `slopcannon_create_quote`, `slopcannon_submit_generation`, ...), exactly as the canonical skill and `references/hosted-api.md` name them, plus tools only a local agent has: whole productions in one call, uploads from disk, song timing, waiting, and video home as native media. Together they replace the CLI and browser hand-offs the canonical skill describes; the creative and safety rules in `slopcannon:slopcannon-music-video` still apply in full. Load it with `skill_view("slopcannon:slopcannon-music-video")` before writing a treatment or a timed plan, and read its references when a step names them.
 
 | Need | Tool |
 |---|---|
+| A whole music video from a song, gates and all | `slopcannon_produce`, then `slopcannon_production_status` |
+| Word-timed lyrics for a song (no credits) | `slopcannon_transcribe` |
+| Stop a running production | `slopcannon_production_stop` |
 | Connection, balance, limits, rights statement | `slopcannon_account` |
 | Song or reference picture from disk into a project | `slopcannon_upload` |
 | Everything the server does (projects, analysis, scene audio, planning, direction, references, quotes, generation, takes, assembly, characters, audio spots, ad pitches, Slop TV) | the `slopcannon_*` server tools, called directly |
@@ -29,7 +32,25 @@ The plugin registers every SLOPCANNON server tool under its own name (`slopcanno
 
 `slopcannon_wait` and `slopcannon_download` save MP4s under the plugin's download folder and return `media` lines such as `MEDIA:C:/.../scene.mp4`. Put each one alone on its own line in your reply: Hermes desktop plays it inline, and messaging platforms receive it as a native video. In the terminal UI, which has no attachment channel, give the path instead. Do not paste capability download links into shared chats.
 
-## A music video, end to end
+## A music video: the managed path (use this by default)
+
+`slopcannon_produce` runs SLOPCANNON's own production driver in the background: project, uploads, server scene audio, the timed plan, quotes, one first scene for review, parallel renders, character checks and server assembly. It is resumable and never buys a scene twice.
+
+1. `slopcannon_account`: connected, `submissionReady`, `rights.requiredVersion`, the aspect ratios.
+2. Brief: the song path, the cast pictures, the concept, the aspect ratio. Show the rights statement with the file names and get their agreement.
+3. `slopcannon_transcribe` with the song and `rights_version` (Hermes asks them to approve the sign-off). Read the excerpt.
+4. Write the production (canonical skill `references/agent-cli.md`, "The production file"): `title`, `song`, `references` (`name` in capitals, `path`), `singer`, `identityLock`, `transcript` (the path from step 3), `cuts`, `scenes` [{`shot`, `cast`}], `aspectRatio`. Apply the canonical skill's direction rules to every shot.
+5. `slopcannon_produce` with `production` and `rights_version`. It returns at the next human gate; `next` says exactly what to do:
+   - `approval`: show each scene's quote and the total; on agreement call again with `approve_credits` = the ceiling.
+   - `first_scene_review`: show the clip (its MEDIA line) and wait for their verdict before `review_first` = the sha256.
+   - `shot_review`: show each flagged issue at its second; pass the scenes they keep as `accept_checks`.
+6. Finished: the master arrives as a MEDIA line. Ask the person to judge identity, mouth timing and take quality.
+
+Every answer goes in through `slopcannon_produce` with the same `production_id`, and Hermes asks the person to approve it; never pass an answer they did not give. To change the direction after paid work began, start a new `production_id`; the old one stays recoverable.
+
+Every result carries `card`, a line such as `::slopcannon-film{id="..."}`. On Hermes desktop, put it alone on its own line in your reply: the desktop renders a live production card there (phase, scenes, the decision waiting, one-click answers). On every other surface leave it out. The desktop's SLOPCANNON studio page (sidebar) shows every production live.
+
+## A music video, tool by tool (when the person wants scene-level control)
 
 1. `slopcannon_account`: confirm connected and `submissionReady`; note `rights.requiredVersion` and `generation` limits.
 2. Brief: song, concept, cast pictures, aspect ratio (it fixes the project's frame).

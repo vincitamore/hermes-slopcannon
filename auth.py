@@ -44,6 +44,13 @@ class LoginError(RuntimeError):
 
 
 def get_token() -> Optional[str]:
+    """The token through Hermes's profile-scoped secret route (catalog rule 11)."""
+    try:
+        from agent.secret_scope import get_secret
+
+        return (get_secret(settings.TOKEN_ENV) or "").strip() or None
+    except ImportError:
+        pass  # an older Hermes, or tests
     value = os.environ.get(settings.TOKEN_ENV, "").strip()
     if value:
         return value

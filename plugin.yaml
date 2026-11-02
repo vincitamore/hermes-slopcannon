@@ -1,8 +1,9 @@
 name: slopcannon
-version: 0.1.0
+version: 0.2.0
 manifest_version: 2
 api_version: 1
-description: "SLOPCANNON inside Hermes: every SLOPCANNON tool (music videos, source-video remixes, the Ad Cannon, Character Lab, Slop TV) as native Hermes tools, plus uploads from disk, a human gate on every spend, and clips and finished films delivered as native video."
+requires_hermes: ">=0.22.5"
+description: "SLOPCANNON music videos inside Hermes: a whole film from a song in one call, a desktop studio with live production cards, every SLOPCANNON tool (music videos, remixes, the Ad Cannon, Character Lab, Slop TV) as native Hermes tools, uploads from disk, a human approval on every spend, and clips and finished films delivered as native video."
 author: SLOPCANNON
 kind: standalone
 homepage: https://slop.cc/for-agents
@@ -12,6 +13,10 @@ provides_tools:
   - slopcannon_upload
   - slopcannon_wait
   - slopcannon_download
+  - slopcannon_transcribe
+  - slopcannon_produce
+  - slopcannon_production_status
+  - slopcannon_production_stop
   - slopcannon_add_character_reference
   - slopcannon_add_reference
   - slopcannon_assembly_download_links
@@ -71,6 +76,11 @@ provides_tools:
 provides_hooks:
   - pre_tool_call
 config_schema:
+  agent_token:
+    type: secret
+    env: SLOPCANNON_AGENT_TOKEN
+    label: "Agent token"
+    description: "A SLOPCANNON agent token from slop.cc/account (Agent access). Not needed after signing in with /slop login."
   api_origin:
     type: str
     default: "https://api.slop.cc"

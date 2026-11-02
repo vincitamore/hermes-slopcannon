@@ -1,15 +1,17 @@
 """SLOPCANNON for Hermes Agent.
 
 Registers every hosted SLOPCANNON tool natively (``server_tools.py``), the local
-media-plane tools (``tools.py``), the spend/rights/irreversible-action gate,
-``/slop``, ``hermes slopcannon`` and the bundled skills.
+media-plane tools (``tools.py``), whole productions (``production_tools.py``),
+the spend/rights/irreversible-action gate, ``/slop``, ``hermes slopcannon`` and
+the bundled skills. The desktop studio is ``desktop/plugin.js`` with its backend
+in ``dashboard/plugin_api.py``.
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 
-from . import commands, gate, server_tools, settings, tools
+from . import commands, gate, production_tools, server_tools, settings, tools
 
 logger = logging.getLogger(__name__)
 _SKILLS = Path(__file__).parent / "skills"
@@ -18,8 +20,9 @@ TOOLSET = "slopcannon"
 
 def register(ctx) -> None:
     settings.bind(ctx)
-    local_names = {spec.name for spec in tools.TOOLS}
-    for spec in tools.TOOLS:
+    local = [*tools.TOOLS, *production_tools.TOOLS]
+    local_names = {spec.name for spec in local}
+    for spec in local:
         ctx.register_tool(name=spec.name, toolset=TOOLSET, schema=spec.schema, handler=spec.handler,
                           description=spec.schema["description"])
     for name, schema, handler in server_tools.specs(local_names):

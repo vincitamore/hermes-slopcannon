@@ -1,0 +1,7 @@
+{
+  "name": "slopcannon",
+  "label": "SLOPCANNON",
+  "description": "SLOPCANNON account, productions and media for the desktop studio.",
+  "tab": { "hidden": true },
+  "api": "plugin_api.py"
+}

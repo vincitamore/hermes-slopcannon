@@ -74,19 +74,9 @@ def _spend_directive(inner: str, inner_args: dict[str, Any]) -> Optional[dict[st
         return {"action": "block", "message": (
             f"BLOCKED: {inner} needs the exact person-approved Cannon Credit amount in "
             f"`{SPENDING[inner]}`. Quote first, show the person the price, then call again.")}
-    ceiling = settings.get_int("max_credits_per_action")
-    if ceiling and raw > ceiling:
-        return {"action": "block", "message": (
-            f"BLOCKED: {raw} Cannon Credits exceeds this seat's ceiling of {ceiling} "
-            f"(plugins.entries.slopcannon.settings.max_credits_per_action).")}
-    if _approvals_bypassed():
-        allowance = settings.get_int("auto_approve_max_credits")
-        if raw <= allowance:
-            return None
-        return {"action": "block", "message": (
-            f"BLOCKED: approvals are bypassed on this session and {raw} Cannon Credits exceeds the "
-            f"unattended allowance of {allowance} (settings.auto_approve_max_credits). "
-            "Ask the person to approve it in an attended session.")}
+    limited = _credit_limits(raw, inner)
+    if limited is not None:
+        return None if limited["action"] == "allow" else limited
     what = {
         "slopcannon_submit_generation": f"render quote {inner_args.get('quoteId', '?')}",
         "slopcannon_create_audio_spot": f"a {inner_args.get('lengthS', '?')} s audio spot",
@@ -112,9 +102,76 @@ def _rights_directive(label: str, version: Any, files: list[dict[str, Any]]) -> 
     }
 
 
+def _credit_limits(amount: int, what: str) -> Optional[dict[str, Any]]:
+    """Seat ceiling and unattended-allowance checks shared by every spend; None when a person must approve."""
+    ceiling = settings.get_int("max_credits_per_action")
+    if ceiling and amount > ceiling:
+        return {"action": "block", "message": (
+            f"BLOCKED: {amount} Cannon Credits for {what} exceeds this seat's ceiling of {ceiling} "
+            "(plugins.entries.slopcannon.settings.max_credits_per_action).")}
+    if _approvals_bypassed():
+        allowance = settings.get_int("auto_approve_max_credits")
+        if amount <= allowance:
+            return {"action": "allow"}
+        return {"action": "block", "message": (
+            f"BLOCKED: approvals are bypassed on this session and {amount} Cannon Credits exceeds the "
+            f"unattended allowance of {allowance} (settings.auto_approve_max_credits). "
+            "Ask the person to approve it in an attended session.")}
+    return None
+
+
+def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """One prompt for every human decision a slopcannon_produce call carries."""
+    from . import production
+
+    rights, credits = args.get("rights_version"), args.get("approve_credits")
+    review, accept = args.get("review_first"), args.get("accept_checks")
+    if all(v in (None, "", []) for v in (rights, credits, review, accept)):
+        return None
+    pid = str(args.get("production_id") or "")
+    if not pid:
+        return {"action": "block", "message": (
+            "BLOCKED: start the production first (without approvals), show the person what it needs, then call "
+            "again with its production_id and their answer.")}
+    state = production.load_state(pid) or {}
+    title = state.get("title") or pid
+    detail = state.get("needsDetail") or {}
+    parts: list[str] = []
+    if rights not in (None, ""):
+        files = production.inventory(pid)
+        inventory = ", ".join(f"{f['name']} ({f['bytes']:,} bytes)" for f in files) or "its media"
+        parts.append(f"rights sign-off {rights} for {inventory}: the person owns or is licensed to use it")
+    if credits is not None:
+        if not isinstance(credits, int) or isinstance(credits, bool) or credits < 0:
+            return {"action": "block", "message": "BLOCKED: approve_credits must be a whole number of Cannon Credits."}
+        total = detail.get("totalCannonCredits") if state.get("needs") == "approval" else None
+        limited = _credit_limits(credits, f'"{title}"')
+        if limited is not None and limited["action"] == "block":
+            return limited
+        parts.append(f"spend up to {credits:,} Cannon Credits on the whole film"
+                     + (f" (quoted total {total:,})" if isinstance(total, int) else ""))
+    if review not in (None, ""):
+        scene = detail.get("scene") or "the first scene"
+        parts.append(f"the person watched {scene} ({str(review)[:12]}) and approves rendering the rest")
+    if accept:
+        parts.append("keep flagged takes " + ", ".join(str(a) for a in accept))
+    return {
+        "action": "approve",
+        "message": f'SLOPCANNON "{title}": ' + "; ".join(parts),
+        "rule_key": _rule_key("produce", pid, rights, credits, review, accept),
+    }
+
+
 def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **_: Any) -> Optional[dict[str, Any]]:
     args = args or {}
     try:
+        if tool_name == "slopcannon_produce":
+            directive = _produce_directive(args)
+            return None if directive and directive["action"] == "allow" else directive
+        if tool_name == "slopcannon_transcribe" and args.get("rights_version"):
+            path = Path(str(args.get("song") or "")).expanduser()
+            files = [{"name": path.name, "bytes": path.stat().st_size}] if path.is_file() else []
+            return _rights_directive("song analysis", args.get("rights_version"), files)
         if tool_name == "slopcannon_upload":
             path = Path(str(args.get("path") or "")).expanduser()
             files = [{"name": path.name, "bytes": path.stat().st_size}] if path.is_file() else []
@@ -144,6 +201,6 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **
             }
     except Exception as exc:  # fail closed on a gate bug for anything that could spend
         inner, _ = _inner_tool(tool_name, args)
-        if tool_name == "slopcannon_upload" or (inner and (inner in SPENDING or inner in RIGHTS)):
+        if tool_name in ("slopcannon_upload", "slopcannon_produce") or (inner and (inner in SPENDING or inner in RIGHTS)):
             return {"action": "block", "message": f"BLOCKED: SLOPCANNON approval gate error: {exc}"}
     return None

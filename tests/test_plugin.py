@@ -39,6 +39,7 @@ sys.modules["slopcannon_plugin"] = plugin
 _spec.loader.exec_module(plugin)
 
 from slopcannon_plugin import auth, client as client_mod, gate, server_tools, settings, tools  # noqa: E402
+from slopcannon_plugin import production, production_tools  # noqa: E402
 
 ORIGIN = "https://api.slop.cc"
 
@@ -92,7 +93,9 @@ class RegistrationTest(unittest.TestCase):
     def test_register_wires_every_surface(self):
         ctx = FakeCtx()
         plugin.register(ctx)
-        local = {"slopcannon_account", "slopcannon_upload", "slopcannon_wait", "slopcannon_download"}
+        local = {"slopcannon_account", "slopcannon_upload", "slopcannon_wait", "slopcannon_download",
+                 "slopcannon_transcribe", "slopcannon_produce", "slopcannon_production_status",
+                 "slopcannon_production_stop"}
         server = {t["name"] for t in server_tools.load()}
         self.assertGreaterEqual(len(server), 50)
         self.assertEqual(set(ctx.tools), local | server)
@@ -412,3 +415,156 @@ class AuthTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- productions
+
+FAKE_DRIVER = r"""
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import path from "node:path";
+const args = process.argv.slice(2);
+const flag = (name) => { const i = args.indexOf(name); return i < 0 ? null : args[i + 1]; };
+const ledgerFile = flag("--ledger");
+const ledger = existsSync(ledgerFile) ? JSON.parse(readFileSync(ledgerFile, "utf8")) : { scenes: {} };
+const out = (value, code) => { process.stdout.write(JSON.stringify(value) + "\n"); process.exitCode = code; };
+if (process.env.SLOPCANNON_AGENT_TOKEN !== "slop_live_test") { out({ ok: false, needs: "origin", message: "no token" }, 2); }
+else if (flag("--rights-accepted") !== "v1") {
+  out({ ok: false, needs: "rights", requiredVersion: "v1", statement: "I own it.", files: [{ file: "/x/song.mp3", bytes: 10, role: "master" }] }, 2);
+} else if (!flag("--max-credits")) {
+  ledger.scenes.production = { projectId: "proj_1" };
+  ledger.scenes.sc01 = { quote: { id: "q1", amountUnits: 40, currency: "CANNON_CREDIT", creditUnit: "cannon-credit" } };
+  ledger.scenes.sc02 = { quote: { id: "q2", amountUnits: 56, currency: "CANNON_CREDIT", creditUnit: "cannon-credit" } };
+  writeFileSync(ledgerFile, JSON.stringify(ledger));
+  out({ ok: false, needs: "approval", quotes: [{ scene: "sc01", amountUnits: 40 }, { scene: "sc02", amountUnits: 56 }], totalCannonCredits: 96 }, 2);
+} else {
+  const clips = path.join(path.dirname(ledgerFile), "work", "clips"); mkdirSync(clips, { recursive: true });
+  const master = path.join(path.dirname(ledgerFile), "work", "Film.mp4"); writeFileSync(master, "mp4");
+  for (const id of ["sc01", "sc02"]) {
+    const clip = path.join(clips, id + ".mp4"); writeFileSync(clip, "mp4");
+    ledger.scenes[id].generation = { id: "gen_" + id, key: "k" + id, status: "succeeded", submission: { approval: { amountUnits: ledger.scenes[id].quote.amountUnits, currency: "CANNON_CREDIT", creditUnit: "cannon-credit" } } };
+    ledger.scenes[id].downloaded = { path: clip, sha256: "a".repeat(64), bytes: 3 };
+  }
+  writeFileSync(ledgerFile, JSON.stringify(ledger));
+  out({ ok: true, output: master, report: { ok: true, output: master, syncVerified: true }, steps: [{ step: "assemble", ok: true }] }, 0);
+}
+"""
+
+
+class ProductionTest(unittest.TestCase):
+    def setUp(self):
+        bind()
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.root = base / "productions"
+        self.root.mkdir()
+        self.song = base / "song.mp3"
+        self.song.write_bytes(b"ID3song")
+        self.transcript = base / "song.words.json"
+        self.transcript.write_text('{"segments": []}', encoding="utf-8")
+        driver = base / "fake-driver.mjs"
+        driver.write_text(FAKE_DRIVER, encoding="utf-8")
+        self.patches = [
+            mock.patch.object(production, "root", lambda: self.root),
+            mock.patch.object(production, "DRIVER", driver),
+            mock.patch.object(production, "_broadcast", lambda *a, **k: None),
+            mock.patch.object(production.auth, "get_token", lambda: "slop_live_test"),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        self.tmp.cleanup()
+
+    def spec(self, **extra):
+        return {"title": "Film", "song": str(self.song), "transcript": str(self.transcript),
+                "scenes": [{"shot": "LEAD sings", "cast": ["LEAD"]}], **extra}
+
+    def produce(self, **args):
+        return json.loads(production_tools.PRODUCE.handler({"wait_s": 30, **args}))
+
+    @unittest.skipUnless(production.node_status()["ok"], "Node.js 22.13+ not installed")
+    def test_gates_then_finishes_with_master_media(self):
+        first = self.produce(production=self.spec(approve=999, maxCredits=999))
+        self.assertTrue(first["ok"], first)
+        pid = first["production"]["id"]
+        self.assertEqual(first["production"]["needs"], "rights")
+        self.assertEqual(first["production"]["needsDetail"]["requiredVersion"], "v1")
+        self.assertIn("rights_version", first["next"])
+        self.assertEqual(first["card"], f'::slopcannon-film{{id="{pid}"}}')
+        stored = json.loads((self.root / pid / "production.json").read_text(encoding="utf-8"))
+        self.assertNotIn("approve", stored)  # gate answers never ride the production file
+        self.assertNotIn("maxCredits", stored)
+
+        quoted = self.produce(production_id=pid, rights_version="v1")
+        self.assertEqual(quoted["production"]["needs"], "approval")
+        self.assertEqual(quoted["production"]["needsDetail"]["totalCannonCredits"], 96)
+        self.assertEqual([s["quoteCredits"] for s in quoted["production"]["scenes"]], [40, 56])
+
+        done = self.produce(production_id=pid, approve_credits=100)
+        self.assertEqual(done["production"]["state"], "done", done)
+        self.assertEqual(done["production"]["spend"], {"approvedCredits": 100, "committedCredits": 96})
+        self.assertEqual(done["production"]["scenes"][0]["status"], "succeeded")
+        self.assertTrue(done["media"] and done["media"][0].startswith("MEDIA:") and done["media"][0].endswith("Film.mp4"))
+        listed = json.loads(production_tools.PRODUCTION_STATUS.handler({}))
+        self.assertEqual([p["id"] for p in listed["productions"]], [pid])
+
+    def test_changed_inputs_after_paid_state_need_a_new_revision(self):
+        production.write_production("film-1", self.spec())
+        ledger = self.root / "film-1" / "ledger.json"
+        ledger.write_text('{"productionFingerprint": "abc", "scenes": {}}', encoding="utf-8")
+        with self.assertRaises(production.ProductionError) as caught:
+            production.write_production("film-1", self.spec(concept="different"))
+        self.assertEqual(caught.exception.code, "new_revision")
+        production.write_production("film-1", self.spec())  # unchanged inputs are fine
+
+    def test_bad_inputs_are_refused_before_anything_runs(self):
+        result = self.produce(production={"title": "x", "song": "/no/such/song.mp3"})
+        self.assertFalse(result["ok"])
+        self.assertIn("song must be an existing local audio file", result["message"])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_production_ids_cannot_escape_the_folder(self):
+        for bad in ("../x", "A", "a/b", ""):
+            with self.assertRaises(production.ProductionError):
+                production.summary(bad)
+
+    def test_driver_args_carry_only_recorded_decisions(self):
+        folder = self.root / "f"
+        self.assertNotIn("--approve", production._driver_args(folder, {}, 4))
+        args = production._driver_args(folder, {"rights_version": "v1", "approved_credits": 120,
+                                                "review_first": "b" * 64, "accept_checks": ["sc03"]}, 40)
+        self.assertEqual(args[args.index("--max-credits") + 1], "120")
+        self.assertEqual(args[args.index("--concurrency") + 1], "16")
+        self.assertEqual(args[args.index("--accept-checks") + 1], "sc03")
+
+    def test_produce_gate(self):
+        production.write_production("film-1", self.spec())
+        self.assertIsNone(gate.pre_tool_call("slopcannon_produce", {"production": self.spec()}))
+        blocked = gate.pre_tool_call("slopcannon_produce", {"production": self.spec(), "approve_credits": 50})
+        self.assertEqual(blocked["action"], "block")  # an answer needs a production the person has seen
+        prompt = gate.pre_tool_call("slopcannon_produce", {"production_id": "film-1", "rights_version": "v1",
+                                                            "approve_credits": 120})
+        self.assertEqual(prompt["action"], "approve")
+        self.assertIn('"Film"', prompt["message"])
+        self.assertIn("song.mp3", prompt["message"])
+        self.assertIn("120 Cannon Credits", prompt["message"])
+        bind({"max_credits_per_action": 100})
+        over = gate.pre_tool_call("slopcannon_produce", {"production_id": "film-1", "approve_credits": 120})
+        self.assertEqual(over["action"], "block")
+        bind()
+        with mock.patch.object(gate, "_approvals_bypassed", return_value=True):
+            self.assertEqual(gate.pre_tool_call("slopcannon_produce", {"production_id": "film-1",
+                                                                       "approve_credits": 5})["action"], "block")
+        self.assertEqual(gate.pre_tool_call("slopcannon_transcribe", {"song": str(self.song),
+                                                                      "rights_version": "v1"})["action"], "approve")
+
+
+class TranscribeTest(unittest.TestCase):
+    def test_server_words_become_whisper_segments(self):
+        doc = production_tools.whisper_json([
+            {"word": "Hello", "start": 0.5, "end": 0.9}, {"word": "world", "start": 1.0, "end": 1.4},
+            {"word": "again", "start": 4.0, "end": 4.3}, {"word": "", "start": 5, "end": 6}, {"text": "x"}])
+        self.assertEqual([s["text"] for s in doc["segments"]], ["Hello world", "again"])
+        self.assertEqual(doc["segments"][0]["start"], 0.5)
