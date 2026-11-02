@@ -12,14 +12,15 @@ folder to `$HERMES_HOME/desktop-plugins/slopcannon/` and loads that copy
 | Studio page `/slopcannon` | `ROUTES_AREA` | account strip, productions list, production detail (phase stepper, needs banner, master player, scene grid, driver log), Stop with confirm |
 | Sidebar row `SLOPCANNON` | `SIDEBAR_NAV_AREA` | codicon `device-camera-video` |
 | Status bar item | `STATUSBAR_AREAS.right` | `443 cr`, a spinner and count while renders run, a bell when a production waits; `SLOPCANNON: sign in` when signed out; hidden when the backend is off |
-| Palette | `PALETTE_AREA` | SLOPCANNON: Open studio / Sign in / Refresh |
+| Palette | `PALETTE_AREA` | SLOPCANNON: Open studio / Copy sign-in command / Refresh |
 | Directive `slopcannon-film` | `TRANSCRIPT_DIRECTIVE_AREA` | `::slopcannon-film{id="<production id>"}`; ids must match `^[a-z0-9][a-z0-9-]{0,63}$`, anything else renders nothing |
 | Clip cards | `TOOL_MEDIA_RENDERER_AREA` | video MEDIA from `slopcannon_wait`, `slopcannon_download`, `slopcannon_produce`, `slopcannon_production_status` |
 
 ## Backend it reads
 
 `dashboard/plugin_api.py` through `ctx.rest`: `GET /status`, `GET /productions`,
-`GET /productions/{id}`, `POST /productions/{id}/stop`, `POST /login`. Live
+`GET /productions/{id}`, `POST /productions/{id}/stop`, `POST /login` (returns the
+`hermes auth add slopcannon:slop` command; it starts nothing). Live
 updates come from `plugin.slopcannon.production.updated` and
 `plugin.slopcannon.account.updated`; polling is the fallback (5 s while a
 production runs, 30 s otherwise). If the Python half is not loaded the page
