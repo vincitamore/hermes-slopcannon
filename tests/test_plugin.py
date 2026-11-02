@@ -433,6 +433,23 @@ class CheckRowTest(unittest.TestCase):
         entry = {"artifact": {"assetId": "take-2"}, "shotCheckError": {"assetId": "take-1", "message": "old"}}
         self.assertIsNone(production._check_row(entry))
 
+class BroadcastTest(unittest.TestCase):
+    def test_skipped_outside_the_gateway_process(self):
+        events = types.ModuleType("hermes_cli.plugin_events")
+        events.broadcast_plugin_event = mock.Mock()
+        with mock.patch.dict(sys.modules, {"hermes_cli.plugin_events": events}):
+            sys.modules.pop("tui_gateway.server", None)
+            production._broadcast("production.updated", {"id": "x"})
+        events.broadcast_plugin_event.assert_not_called()
+
+    def test_sent_inside_the_gateway_process(self):
+        events = types.ModuleType("hermes_cli.plugin_events")
+        events.broadcast_plugin_event = mock.Mock()
+        with mock.patch.dict(sys.modules, {"tui_gateway.server": types.ModuleType("tui_gateway.server"),
+                                           "hermes_cli.plugin_events": events}):
+            production._broadcast("production.updated", {"id": "x"})
+        events.broadcast_plugin_event.assert_called_once_with("slopcannon", "production.updated", {"id": "x"})
+
 if __name__ == "__main__":
     unittest.main()
 

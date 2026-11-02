@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -111,6 +112,11 @@ def list_ids() -> list[str]:
 
 
 def _broadcast(event: str, payload: dict[str, Any]) -> None:
+    # Only the gateway process has live transports to deliver to, and it has tui_gateway.server loaded. Anywhere
+    # else (a script driving the handlers, a CLI import) Hermes would import it just to log a dropped-event warning
+    # with a full traceback on every state write; the studio polls state.json, so nothing is lost by skipping.
+    if "tui_gateway.server" not in sys.modules:
+        return
     try:
         from hermes_cli.plugin_events import broadcast_plugin_event
 
