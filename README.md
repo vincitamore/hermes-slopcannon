@@ -2,7 +2,7 @@
 
 Music videos from a song, inside Hermes. Ask for a film; the agent writes the direction, SLOPCANNON renders it, and Hermes asks you before every credit is spent. Finished clips and films arrive as native video in the desktop app, the terminal and your messaging apps.
 
-[Install in Hermes](hermes://plugin/install?repo=slopcannon/hermes-slopcannon&enable=1)
+[Install in Hermes](hermes://plugin/install?repo=vincitamore/hermes-slopcannon&enable=1)
 
 ## What you get
 
@@ -13,7 +13,7 @@ Music videos from a song, inside Hermes. Ask for a film; the agent writes the di
 
 ## Setup
 
-1. Install and enable the plugin (the button above, or `hermes plugins install slopcannon`).
+1. Install and enable the plugin: the button above, or `hermes plugins install https://github.com/vincitamore/hermes-slopcannon` then `hermes plugins enable slopcannon`.
 2. Connect your account: `/slop login` in the desktop or terminal opens slop.cc in your browser. On a headless machine, create an agent token at [slop.cc/account](https://slop.cc/account) and enter it as **Agent token** in Capabilities, Plugins, SLOPCANNON (or `hermes slopcannon login --token-stdin`).
 3. `/slop status` shows the account, credits and service.
 4. Whole productions need [Node.js](https://nodejs.org) 22.13 or newer on the machine Hermes runs on. Everything else works without it.
