@@ -45,22 +45,35 @@ def write_snapshot(tools: list[dict[str, Any]]) -> None:
 
 
 def load() -> list[dict[str, Any]]:
-    """Newest known tool list: a synced copy in plugin state wins over the bundled snapshot."""
+    """The bundled tool set, with a synced copy's newer descriptions and schemas where it has them.
+
+    The set of tools is the bundled snapshot's, which ``plugin.yaml`` declares and the catalog
+    reviewed at the pinned commit (catalog rule 6). A synced copy can refresh those tools and drop
+    any the server has retired, but a tool it alone lists waits for a plugin release.
+    """
+    bundled = _bundled()
     cached = settings.state_get(_STATE_KEY)
-    if isinstance(cached, dict) and isinstance(cached.get("tools"), list) and cached["tools"]:
-        return cached["tools"]
+    if not (isinstance(cached, dict) and isinstance(cached.get("tools"), list) and cached["tools"]):
+        return bundled
+    declared = {tool["name"] for tool in bundled}
+    synced = [tool for tool in cached["tools"] if isinstance(tool, dict) and tool.get("name") in declared]
+    return synced or bundled
+
+
+def _bundled() -> list[dict[str, Any]]:
     if SNAPSHOT.is_file():
         return json.loads(SNAPSHOT.read_text(encoding="utf-8")).get("tools") or []
     return []
 
 
 def refresh() -> int:
-    """Fetch the live list into plugin state; takes effect in the next session."""
+    """Fetch the live list into plugin state; takes effect in the next session, for declared tools only."""
     tools = normalize(Client().list_tools())
     if not tools:
         raise SlopcannonError("the server listed no tools", code="empty_tool_list")
     settings.state_set(_STATE_KEY, {"tools": tools})
-    return len(tools)
+    declared = {tool["name"] for tool in _bundled()}
+    return sum(1 for tool in tools if tool["name"] in declared)
 
 
 def _handler(name: str) -> Callable[..., str]:

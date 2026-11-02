@@ -132,11 +132,20 @@ class RegistrationTest(unittest.TestCase):
         self.assertEqual(out, {"ok": True, "result": {"projectId": "p_1"}})
         self.assertEqual(seen["body"]["params"], {"name": "slopcannon_get_project", "arguments": {"projectId": "p_1"}})
 
-    def test_state_cache_wins_over_snapshot(self):
+    def test_synced_copy_refreshes_declared_tools_only(self):
+        ctx = bind()
+        ctx.state.set("server_tools", {"tools": [
+            {"name": "slopcannon_get_project", "description": "newer words", "inputSchema": {"type": "object"}},
+            {"name": "slopcannon_new_thing", "description": "d", "inputSchema": {"type": "object"}}]})
+        specs = {s[0]: s[1] for s in server_tools.specs(set())}
+        self.assertEqual(list(specs), ["slopcannon_get_project"])   # a tool only the server lists waits for a release
+        self.assertEqual(specs["slopcannon_get_project"]["description"], "newer words")
+
+    def test_synced_copy_with_no_declared_tool_falls_back_to_the_snapshot(self):
         ctx = bind()
         ctx.state.set("server_tools", {"tools": [{"name": "slopcannon_new_thing", "description": "d",
                                                    "inputSchema": {"type": "object"}}]})
-        self.assertEqual([s[0] for s in server_tools.specs(set())], ["slopcannon_new_thing"])
+        self.assertIn("slopcannon_get_project", [s[0] for s in server_tools.specs(set())])
 
 
 class SettingsTest(unittest.TestCase):

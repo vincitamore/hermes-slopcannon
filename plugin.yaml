@@ -5,6 +5,7 @@ api_version: 1
 requires_hermes: ">=0.22.5"
 description: "SLOPCANNON music videos inside Hermes: a whole film from a song in one call, a desktop studio with live production cards, every SLOPCANNON tool (music videos, remixes, the Ad Cannon, Character Lab, Slop TV) as native Hermes tools, uploads from disk, a human approval on every spend, and clips and finished films delivered as native video."
 author: SLOPCANNON
+license: MIT
 kind: standalone
 homepage: https://slop.cc/for-agents
 tags: [video, music-video, video-gen, media, slopcannon]

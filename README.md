@@ -26,7 +26,7 @@ Then ask: *"Make a music video for ~/Music/song.mp3 with my photo ~/Pictures/me.
 |---|---|
 | `/slop status` | account, credits, service |
 | `/slop login` / `/slop logout` | connect or forget this machine's token |
-| `/slop sync` | refresh the tool list from the server (next session) |
+| `/slop sync` | refresh the declared tools' descriptions from the server (next session); new server tools arrive with a plugin release |
 | `hermes slopcannon ...` | the same from a terminal |
 
 ## Settings
@@ -55,3 +55,7 @@ python -m unittest discover -s tests          # offline tests
 python scripts/sync_server_tools.py --check   # the tool snapshot matches the server
 hermes plugins validate .                     # the catalog check
 ```
+
+## License
+
+MIT (see [LICENSE](LICENSE)). This covers the plugin and the bundled skill copy, not the SLOPCANNON service, which has its own terms at [slop.cc](https://slop.cc).
