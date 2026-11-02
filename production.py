@@ -486,7 +486,6 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             row_status = "quoted"
         else:
             row_status = "unsubmitted"
-        check = entry.get("shotCheck")
         rows.append({
             "id": sid, "index": index,
             "startMs": planned.get("startMs"), "endMs": planned.get("endMs"),
@@ -495,9 +494,24 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             "quoteCredits": (entry.get("quote") or {}).get("amountUnits"),
             "generationId": generation.get("id"),
             "clip": {"path": downloaded["path"], "name": Path(downloaded["path"]).name} if downloaded.get("path") else None,
-            "check": {"verdict": check.get("verdict"), "issues": check.get("issues") or []} if isinstance(check, dict) else None,
+            "check": _check_row(entry),
         })
     return rows
+
+
+def _check_row(entry: dict[str, Any]) -> dict[str, Any] | None:
+    """The scene's character-check verdict, or, when the check could not run on the current take, `unchecked`
+    with the driver's reason, so a take nobody judged never reads as passed."""
+    check = entry.get("shotCheck")
+    if isinstance(check, dict):
+        return {"verdict": check.get("verdict"), "issues": check.get("issues") or []}
+    error = entry.get("shotCheckError")
+    take = (entry.get("artifact") or {}).get("assetId")
+    if isinstance(error, dict) and error.get("message") and (not take or error.get("assetId") in (None, take)):
+        return {"verdict": "unchecked", "issues": [],
+                "error": {"message": str(error["message"])[:300], "code": error.get("code"),
+                          "retryable": error.get("retryable") is True}}
+    return None
 
 
 def _assembly(ledger: dict[str, Any]) -> dict[str, Any] | None:

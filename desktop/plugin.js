@@ -209,7 +209,8 @@ function normIssue(raw) {
 function normCheck(raw) {
   if (!isObj(raw)) return null
   const verdict = ['pass', 'fail', 'unchecked'].includes(raw.verdict) ? raw.verdict : 'unchecked'
-  return { verdict, issues: arr(raw.issues).map(normIssue) }
+  const error = isObj(raw.error) && str(raw.error.message) ? { message: raw.error.message, retryable: raw.error.retryable === true } : null
+  return { verdict, issues: arr(raw.issues).map(normIssue), error }
 }
 
 function normScene(raw, i) {
@@ -1289,6 +1290,10 @@ function SceneCard({ scene, production, send }) {
   const check = scene.check
   const ref = filmRef(production)
   const showReroll = scene.status === 'failed' || (check && check.verdict === 'fail')
+  // A take the check never judged is not a pass: say so once the run has stopped waiting on it, or as soon as
+  // the driver recorded why the check could not run.
+  const notChecked = scene.clip && (!check || check.verdict === 'unchecked') &&
+    ((check && check.error) || production.state !== 'running')
   return h(
     'div',
     {
@@ -1312,13 +1317,19 @@ function SceneCard({ scene, production, send }) {
           h('span', null, icon(check.verdict === 'pass' ? 'pass' : 'warning'), check.verdict === 'pass' ? ' Check passed' : ' Check flagged'),
           check.issues.length ? h(IssueList, { issues: check.issues }) : null
         )
-      : null,
+      : notChecked
+        ? h(
+            'div',
+            { className: 'sc-check sc-check-fail' },
+            h('span', null, icon('warning'), ' Not checked'),
+            check && check.error ? h('div', { className: 'sc-muted' }, check.error.message) : null
+          )
+        : null,
     open && scene.clip ? h(BackendClip, { clip: scene.clip }) : null,
     h(
       'div',
       { className: 'sc-scene-foot' },
       scene.quoteCredits !== null ? h('span', { className: 'sc-num' }, `${fmtCredits(scene.quoteCredits)} cr`) : null,
-      check && check.verdict === 'unchecked' && scene.clip ? h('span', null, 'Not checked') : null,
       h('span', { className: 'sc-spacer' }),
       showReroll ? h(Btn, { label: 'Reroll', iconName: 'refresh', variant: 'ghost', onClick: () => send(`Reroll scene ${scene.id} of ${ref}.`) }) : null,
       scene.clip

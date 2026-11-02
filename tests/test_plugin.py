@@ -413,6 +413,26 @@ class AuthTest(unittest.TestCase):
             self.assertNotIn(settings.TOKEN_ENV, _FAKE_ENV)
 
 
+
+
+class CheckRowTest(unittest.TestCase):
+    def test_verdict_passes_through(self):
+        row = production._check_row({"shotCheck": {"verdict": "fail", "issues": [{"description": "x"}]}})
+        self.assertEqual(row, {"verdict": "fail", "issues": [{"description": "x"}]})
+
+    def test_check_that_could_not_run_reads_unchecked_with_its_reason(self):
+        entry = {"artifact": {"assetId": "take-2"},
+                 "shotCheckError": {"assetId": "take-2", "code": "SHOT_CHECK_PROVIDER_REJECTED",
+                                    "message": "The check model refused this take.", "retryable": False}}
+        row = production._check_row(entry)
+        self.assertEqual(row["verdict"], "unchecked")
+        self.assertEqual(row["error"]["message"], "The check model refused this take.")
+        self.assertFalse(row["error"]["retryable"])
+
+    def test_error_from_an_earlier_take_is_ignored(self):
+        entry = {"artifact": {"assetId": "take-2"}, "shotCheckError": {"assetId": "take-1", "message": "old"}}
+        self.assertIsNone(production._check_row(entry))
+
 if __name__ == "__main__":
     unittest.main()
 

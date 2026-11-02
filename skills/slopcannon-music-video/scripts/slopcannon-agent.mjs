@@ -419,7 +419,7 @@ let rpcId = 1;
  * and a line or sound edit renders it during the call. Every other tool answers well inside 30 s.
  */
 const MCP_TOOL_TIMEOUT_MS = {
-  slopcannon_check_take: 420_000,
+  slopcannon_check_take: 540_000,
   slopcannon_get_audio_spot: 180_000,
   // a pitch read can run the writer's stage, which thinks before it writes
   slopcannon_get_ad_pitch: 300_000,
@@ -1727,7 +1727,7 @@ async function verbReroll(options, ledgerFile) {
   }
   let check = null;
   if ((loadLedger(ledgerFile).generation?.mcpTools ?? []).includes("slopcannon_check_take")) {
-    try { check = await checkScene(ledgerFile, takeId, { plan, cast }); } catch (error) { check = { scene: takeId, verdict: "unchecked", reason: error instanceof Error ? error.message : String(error) }; }
+    try { check = await checkScene(ledgerFile, takeId, { plan, cast }); } catch (error) { check = uncheckedResult(takeId, error); }
   }
   return {
     ok: true, scene: takeId, rerollOf: root, path: downloaded.path, sha256: downloaded.sha256, ...(check ? { check } : {}),
@@ -1897,10 +1897,11 @@ async function verbCut(options, ledgerFile) {
   const request = await ensureCutRequest({ ledgerFile, cutId, takeIds });
   const endCard = card ? { assetId: cardAssetId, fromLocalMs: card.fromLocalMs } : null;
   const report = await finishServerProduction({ ledgerFile, plan, title, output, cut: { id: cutId, takeIds, ...(endCard ? { endCard } : {}), ...(graphicsSpot ? { graphics: { spotId: graphicsSpot } } : {}) } });
-  return { ...report, cut: cutId, takes: swaps, ...(request ? { cutRenderRequestId: request.id } : {}),
+  const unchecked = (ledger.generation?.mcpTools ?? []).includes("slopcannon_check_take") ? uncheckedTakes(loadLedger(ledgerFile), sceneIds, takeIds) : [];
+  return { ...report, cut: cutId, takes: swaps, ...(request ? { cutRenderRequestId: request.id } : {}), ...(unchecked.length > 0 ? { unchecked } : {}),
     ...(card ? { endCard: { ...endCard, fromMs: card.fromMs, sha256: card.sha256, dimensions: card.dimensions } } : {}),
     ...(graphicsSpot ? { graphics: { spotId: graphicsSpot } } : {}),
-    ...(report.ok ? { message: `Review the master for identity, mouth timing and take quality; sync verification does not judge those.${card ? " Check the end card's text on the last frames." : ""}${graphicsSpot ? " Check each on-screen graphic's words and placement." : ""} The original cut and its takes are unchanged.` } : {}) };
+    ...(report.ok ? { message: `Review the master for identity, mouth timing and take quality; sync verification does not judge those.${card ? " Check the end card's text on the last frames." : ""}${graphicsSpot ? " Check each on-screen graphic's words and placement." : ""} The original cut and its takes are unchanged.${uncheckedMessage(unchecked)}` } : {}) };
 }
 
 async function verbPoll(options, ledgerFile) {
@@ -2428,6 +2429,19 @@ export function shotCheckInputs(entry, plan, cast) {
   return { references, voiceOver };
 }
 
+/**
+ * Why a take has no check, kept with the scene beside (never in place of) `shotCheck`: a missing `shotCheck` still
+ * means unchecked everywhere (openReroll, cut), and this says why, so a report can name it instead of passing it.
+ */
+function recordShotCheckError(ledgerFile, id, assetId, { code, message, retryable }) {
+  const latest = loadLedger(ledgerFile);
+  const current = scene(latest, id);
+  current.shotCheckError = { assetId, code: code ?? null, message: String(message).slice(0, 500), retryable: retryable === true, at: new Date().toISOString() };
+  note(current, "check", `unchecked${code ? ` ${code}` : ""}`);
+  saveLedger(ledgerFile, latest, id);
+  return current.shotCheckError;
+}
+
 /** Check one delivered take on the server and keep the verdict with the scene. Spends no credits. */
 async function checkScene(ledgerFile, id, { plan, cast, voiceOver, force }) {
   const ledger = loadLedger(ledgerFile);
@@ -2435,18 +2449,60 @@ async function checkScene(ledgerFile, id, { plan, cast, voiceOver, force }) {
   const assetId = entry.artifact?.assetId;
   if (!assetId) throw new Error(`Scene ${id} has no delivered take yet. Run poll and content first.`);
   const inputs = shotCheckInputs(entry, plan, cast);
-  if (inputs.references.length === 0) return { scene: id, verdict: "unchecked", reason: "The scene casts no character or product with an uploaded reference." };
-  const result = await mcpCall(ledger, "slopcannon_check_take", {
-    assetId, references: inputs.references, voiceOver: voiceOver ?? inputs.voiceOver, ...(force ? { force: true } : {}),
-  });
+  if (inputs.references.length === 0) {
+    const reason = "The scene casts no character or product with an uploaded reference.";
+    recordShotCheckError(ledgerFile, id, assetId, { code: "no_references", message: reason, retryable: false });
+    return { scene: id, verdict: "unchecked", reason, code: "no_references", retryable: false };
+  }
+  let result;
+  try {
+    result = await mcpCall(ledger, "slopcannon_check_take", {
+      assetId, references: inputs.references, voiceOver: voiceOver ?? inputs.voiceOver, ...(force ? { force: true } : {}),
+    });
+  } catch (error) {
+    recordShotCheckError(ledgerFile, id, assetId, { code: error?.code, message: error instanceof Error ? error.message : String(error), retryable: error?.retryable });
+    throw error;
+  }
   const check = isRecord(result?.check) ? result.check : result;
-  if (!["pass", "fail"].includes(check?.verdict) || !Array.isArray(check.issues)) throw new Error("The server returned an unreadable character check.");
+  if (!["pass", "fail"].includes(check?.verdict) || !Array.isArray(check.issues)) {
+    const reason = "The server returned an unreadable character check.";
+    recordShotCheckError(ledgerFile, id, assetId, { code: "unreadable_check", message: reason, retryable: true });
+    throw Object.assign(new Error(reason), { code: "unreadable_check", retryable: true });
+  }
   const latest = loadLedger(ledgerFile);
   const current = scene(latest, id);
   current.shotCheck = { assetId, verdict: check.verdict, issues: check.issues, voiceOver: check.voiceOver, checkedAt: check.checkedAt };
+  delete current.shotCheckError;
   note(current, "check", `${check.verdict}${check.issues.length ? " " + check.issues.map((issue) => `${issue.kind}@${issue.atSeconds}s`).join(",") : ""}`);
   saveLedger(ledgerFile, latest, id);
   return { scene: id, verdict: check.verdict, issues: check.issues, cached: check.cached === true };
+}
+
+/** A check that could not run, as a run reports it: the scene, why, and whether asking again can help. */
+function uncheckedResult(id, error) {
+  return { scene: id, verdict: "unchecked", reason: error instanceof Error ? error.message : String(error),
+    code: error?.code ?? null, retryable: error?.retryable === true };
+}
+
+/**
+ * The takes of a film that carry no character check of their own bytes, and why (the scene's shotCheckError), so a
+ * report names them: a take that was never checked has not passed.
+ */
+export function uncheckedTakes(ledger, sceneIds, takeIds = sceneIds) {
+  return takeIds.flatMap((takeId, index) => {
+    const entry = ledger.scenes?.[takeId];
+    const assetId = entry?.artifact?.assetId;
+    if (!assetId || entry.shotCheck?.assetId === assetId) return [];
+    const error = entry.shotCheckError?.assetId === assetId ? entry.shotCheckError : null;
+    return [{ scene: sceneIds[index], take: takeId, reason: error?.message ?? "This take was never checked.", code: error?.code ?? null, retryable: error ? error.retryable === true : true }];
+  });
+}
+
+/** The sentence a report adds when some takes went unchecked. */
+export function uncheckedMessage(unchecked) {
+  if (unchecked.length === 0) return "";
+  const named = unchecked.map((item) => `${item.scene}${item.code ? ` (${item.code})` : ""}`).join(", ");
+  return ` ${unchecked.length} take${unchecked.length === 1 ? " was" : "s were"} not checked by the character check: ${named}. Not checked is not passed: show the person those takes to review by eye${unchecked.some((item) => item.retryable) ? ", or run check --scene <id> again for the ones marked retryable" : ""}.`;
 }
 
 async function verbCheck(options, ledgerFile) {
@@ -3319,7 +3375,7 @@ async function verbRun(options, ledgerFile) {
     try {
       return await checkScene(ledgerFile, id, { plan: scenePlan(id), cast });
     } catch (error) {
-      return { scene: id, verdict: "unchecked", reason: error instanceof Error ? error.message : String(error) };
+      return uncheckedResult(id, error);
     }
   });
   if (!review.accepted) {
@@ -3341,13 +3397,16 @@ async function verbRun(options, ledgerFile) {
     steps.push({ step: "check", checks });
     const accepted = acceptedChecks(options.get("--accept-checks"), sceneIds);
     const flagged = checks.filter((check) => check.verdict === "fail" && !accepted.has(check.scene));
+    const unchecked = checks.filter((check) => check.verdict === "unchecked")
+      .map(({ scene: id, reason, code, retryable }) => ({ scene: id, reason, code: code ?? null, retryable: retryable === true }));
     if (flagged.length > 0) {
       return {
-        ok: false, needs: "shot_review", steps, flagged,
-        message: "The character check flagged these takes. Show the person each issue at its second; nothing has been assembled. Resume with --accept-checks naming the scenes they accept, or reroll a scene with their approval (reroll --scene <id>, a new paid generation) and finish with cut.",
+        ok: false, needs: "shot_review", steps, flagged, ...(unchecked.length > 0 ? { unchecked } : {}),
+        message: "The character check flagged these takes. Show the person each issue at its second; nothing has been assembled. Resume with --accept-checks naming the scenes they accept, or reroll a scene with their approval (reroll --scene <id>, a new paid generation) and finish with cut." + uncheckedMessage(unchecked),
       };
     }
   }
+  const uncheckedAtAssembly = checkable ? uncheckedTakes(loadLedger(ledgerFile), sceneIds) : [];
 
   // 7. Assemble the already-owned selected takes on the server.
   const output = path.join(workDir, `${production.title.replace(/[^A-Za-z0-9._-]+/g, "-")}.mp4`);
@@ -3362,11 +3421,12 @@ async function verbRun(options, ledgerFile) {
     const report = await finishLocalProduction({ ledgerFile, manifest, manifestFile: path.join(workDir, "assembly-manifest.json"), song, clipsDir: path.join(workDir, "clips"), output,
       plan,title:production.title,rights:rightsVersion });
     steps.push({ step: "assemble", server: false, ok: report.ok });
-    return { ok: report.ok === true, steps, output: report.output, report };
+    return { ok: report.ok === true, steps, output: report.output, report, ...(uncheckedAtAssembly.length > 0 ? { unchecked: uncheckedAtAssembly, message: uncheckedMessage(uncheckedAtAssembly).trim() } : {}) };
   }
   const report = await finishServerProduction({ ledgerFile, plan, title: production.title, output });
   steps.push({ step: "assemble", server: true, ok: report.ok });
-  return { ok: report.ok === true, steps, output: report.output, report, message: "Review the master for identity, mouth timing and take quality; sync verification does not judge those." };
+  return { ok: report.ok === true, steps, output: report.output, report, ...(uncheckedAtAssembly.length > 0 ? { unchecked: uncheckedAtAssembly } : {}),
+    message: "Review the master for identity, mouth timing and take quality; sync verification does not judge those." + uncheckedMessage(uncheckedAtAssembly) };
 }
 
 // ---------------------------------------------------------------- main
