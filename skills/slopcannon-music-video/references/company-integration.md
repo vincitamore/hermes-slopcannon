@@ -8,6 +8,14 @@ The canonical API origin is `https://api.slop.cc` and every path below is relati
 
 Token creation is a signed-in browser action. A person opens `https://slop.cc/account`, creates a scoped token, and copies it once — it is never shown again. Store it in your server's secret manager and supply it to the worker as `SLOPCANNON_AGENT_TOKEN`. It never belongs in a browser bundle, a committed file, a prompt, or an MCP tool argument.
 
+Every authenticated example below sends that token as a bearer header. Build the header once in the worker's shell, from the environment variable, and pass it with `-H "$AUTH"`:
+
+```sh
+AUTH="Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+```
+
+The double quotes in `-H "$AUTH"` keep the header one argument. Examples with no `-H "$AUTH"` (capabilities, the rights statement, a signed download path) need no agent token; §15's organization calls send the organization's administration credential instead, as `-H "$ORG_AUTH"`.
+
 Scopes are what the token may do: `projects:read`, `projects:write`, `assets:read`, `assets:write`, `quotes:create`, `generations:create`, `generations:read`, `billing:read`, `billing:purchase`. Issue the narrowest set the worker needs.
 
 ## 2. Read the contract and branch on it
@@ -63,7 +71,7 @@ Possession, an earlier upload, project ownership, silence, or a general request 
 
 ```sh
 curl -X POST https://api.slop.cc/v1/projects \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: campaign-001-project' \
   -d '{
@@ -82,7 +90,7 @@ Assets are raw request bodies with the metadata in headers.
 
 ```sh
 curl -X POST "https://api.slop.cc/v1/assets?projectId=$PROJECT_ID&kind=song&filename=master.mp3" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: audio/mpeg' \
   -H 'Idempotency-Key: campaign-001-master-song' \
   -H "X-Slopcannon-Rights-Attestation: $ACCEPTED_POLICY_VERSION" \
@@ -90,7 +98,7 @@ curl -X POST "https://api.slop.cc/v1/assets?projectId=$PROJECT_ID&kind=song&file
   --data-binary @./master.mp3
 
 curl -X POST "https://api.slop.cc/v1/assets?projectId=$PROJECT_ID&kind=character_reference&filename=lead.webp" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: image/webp' \
   -H 'Idempotency-Key: campaign-001-lead-reference' \
   -H "X-Slopcannon-Rights-Attestation: $ACCEPTED_POLICY_VERSION" \
@@ -108,9 +116,13 @@ The key binds project, kind, sanitized filename, content type, exact byte count,
 SLOPCANNON generates a scene at a time: the hosted plane accepts one 5–15 second scene per quote, and its `sourceAudioAssetId` is the exact slice of the master it covers. **Where `contract.generation.serverSideSlicing` is true, that cut runs on the server.** Upload the master once, then ask for the slices:
 
 ```sh
-curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/scene-audio"   -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"   -H 'Content-Type: application/json'   -d '{"scenes":[{"id":0,"startMs":0,"endMs":10000},{"id":1,"startMs":10000,"endMs":20000}]}'
+curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/scene-audio" \
+  -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"scenes":[{"id":0,"startMs":0,"endMs":10000},{"id":1,"startMs":10000,"endMs":20000}]}'
 
-curl "https://api.slop.cc/v1/projects/$PROJECT_ID/scene-audio?ticketId=$TICKET_ID"   -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+curl "https://api.slop.cc/v1/projects/$PROJECT_ID/scene-audio?ticketId=$TICKET_ID" \
+  -H "$AUTH"
 ```
 
 The POST answers 202 with a ticket; read it until `phase` is `completed`, and every scene then carries its `assetId`, `bytes`, `sha256` and `durationMs`. Quote that scene by naming its chunk as the scene's `sourceAudioAssetId`. Scenes run from 0 without gaps, each 5000–15000 ms, and the same window of the same song always returns the same asset, so a retry costs nothing. The song's own length is decoded server-side, so a master uploaded without a declared duration gains one. The bundled CLI does all of this with `slopcannon video prepare --server $PROJECT_ID --plan plan.json`, and a worker on this path needs no media tool at all.
@@ -150,8 +162,10 @@ Use revision zero only when the read returned zero. For an existing production, 
 Choose a supplied timed plan or, when ready stored song analysis exists, use server cut planning. The `cuts` operation below cannot create missing word timing. When `songAnalysisControlReady` is false, the managed workflow can still use an agent-authored plan from supplied timing; do not repeatedly request transcription or claim it happened.
 
 ```sh
-curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/cuts"   -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"   -H 'Content-Type: application/json'   -d '{"pace":"music"}'
-
+curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/cuts" \
+  -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"pace":"music"}'
 ```
 
 `cuts` scores scene boundaries against the project's stored word timings and saves them as the timeline; a project with no ready analysis answers 409 `SONG_ANALYSIS_REQUIRED` and names the analysis endpoints. `director` drafts scene text and cast from the treatment and the film's references. Both write the same workspace document under an `expectedRevision`, and without one a project that already has a timeline gets its plan back with `written: false` instead of losing what it has. Neither debits Cannon Credits: direction calls a model and spends the account's producer fair-use budget, while cut planning reaches no provider and consumes no fair-use slot.
@@ -159,7 +173,10 @@ curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/cuts"   -H "Authorizat
 Uploading a reference makes its bytes addressable; putting it on the film makes it castable. A scene may only name references the film carries, and so may the director, so register each one against the project:
 
 ```sh
-curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/references"   -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"   -H 'Content-Type: application/json'   -d '{"assetId":"'$LEAD_ASSET_ID'","name":"LEAD","kind":"person","visualDescription":"A tall man in a soaked grey coat."}'
+curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/references" \
+  -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d '{"assetId":"'$LEAD_ASSET_ID'","name":"LEAD","kind":"person","visualDescription":"A tall man in a soaked grey coat."}'
 ```
 
 The film needs a saved timeline first. Save the validated plan or use ready analysis to plan cuts, register references, then call the director. Read the current workspace revision between these writes; the example revision is not reusable. A new entry answers 201 and a repeat of the same asset answers 200 with the entry that already exists, so this is safe to retry. `DELETE /v1/projects/$PROJECT_ID/references/$REFERENCE_ID` takes one off, and answers 409 `REFERENCE_IN_USE` with the scene ids that still cast it rather than leaving the saved film unable to validate.
@@ -168,7 +185,7 @@ After registration, read the workspace again and use that exact revision for dir
 
 ```sh
 curl -X POST "https://api.slop.cc/v1/projects/$PROJECT_ID/director" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -d "{\"expectedRevision\":$WORKSPACE_REVISION}"
 ```
@@ -179,7 +196,7 @@ A quote performs no generation and costs nothing. `price.customerTotal` is the e
 
 ```sh
 curl -X POST https://api.slop.cc/v1/quotes \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -d @quote.json
 ```
@@ -214,7 +231,7 @@ Show the customer the exact `price.customerTotal`, its expiry and the scene coun
 
 ```sh
 curl -X POST https://api.slop.cc/v1/generations \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: campaign-001-scene-01-generation' \
   -d '{
@@ -229,7 +246,7 @@ Write the idempotency key to your durable ledger **before** the call. A timeout 
 
 ```sh
 curl -X POST https://api.slop.cc/v1/generations/recover \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"idempotencyKey":"campaign-001-scene-01-generation"}'
 ```
@@ -240,7 +257,7 @@ Recovery is an owner-scoped read. It submits nothing, reserves nothing, and work
 
 ```sh
 curl "https://api.slop.cc/v1/generations/$GENERATION_ID" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 ```
 
 The status carries a `settlement` block — `reservedCredits`, `debitedCredits`, `refundedCredits`, an optional `providerCostMicros`, and a `state` of `unreserved`, `reserved`, `debited`, `partially_debited` or `refunded`. That is settled money read from the authorization row, distinct from the quote, which is exposure. `failed`, `submission_unknown` and `billing_unknown` are terminal for the poll loop; an unknown status is recovered, never resubmitted.
@@ -249,10 +266,10 @@ At `succeeded`, read the content metadata and take the bytes:
 
 ```sh
 curl "https://api.slop.cc/v1/generations/$GENERATION_ID/content" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 
 curl -L --output scene-01.mp4 "https://api.slop.cc/v1/generations/$GENERATION_ID/download" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 ```
 
 SLOPCANNON persists a completed generation as a `generated_take` asset. `/content` reports `bytes`, `sha256`, `assetId` and `workspaceAttachment` when available. Verify bytes and digest before delivery. Missing persistence metadata can mean the download is still proxied from the provider; do not claim storage or digest verification before they are present. A `workspaceAttachment` of `pending` is unresolved; `unattached` gives a terminal placement reason. Preserve the asset and inspect the workspace for a deliberate revision-guarded repair instead of regenerating. Refresh expired metadata using the same generation ID.
@@ -263,14 +280,14 @@ Check `workspaceAttachment.status` and read the workspace to confirm placement. 
 
 ```sh
 curl "https://api.slop.cc/v1/projects/$PROJECT_ID/producer-workspace" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 ```
 
 The response carries the scenes, every take under each, the current selection, and a `revision`. Every change must carry the revision it read. Over HTTP the write is the whole state:
 
 ```sh
 curl -X PUT "https://api.slop.cc/v1/projects/$PROJECT_ID/producer-workspace" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"expectedRevision":7,"state":{ … }}'
 ```
@@ -301,7 +318,7 @@ Where `contract.assembly.serverReady` is true, request server assembly from sele
 
 ```sh
 curl -X POST https://api.slop.cc/v1/assemblies \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN" \
+  -H "$AUTH" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: campaign-001-master' \
   -d '{
@@ -321,17 +338,17 @@ Every clip references an asset this account owns, so takes are persisted first. 
 
 ```sh
 curl "https://api.slop.cc/v1/assemblies/$ASSEMBLY_ID" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 
 curl "https://api.slop.cc/v1/assemblies?projectId=$PROJECT_ID" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 ```
 
 At `status: "completed"` the view carries `assetId`, `sizeBytes` and `sha256`. Issue a download session for the file:
 
 ```sh
 curl -X POST "https://api.slop.cc/v1/assemblies/$ASSEMBLY_ID/download-links" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 
 curl -L --output master.mp4 "https://api.slop.cc$DOWNLOAD_PATH"
 ```
@@ -348,7 +365,7 @@ Native status exposes `syncVerified: true` after successful presentation-clock v
 
 ```sh
 curl -X DELETE "https://api.slop.cc/v1/assemblies/$ASSEMBLY_ID" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 ```
 
 `DELETE /v1/assemblies/{id}` cancels a native attempt durably and returns after renderer shutdown is confirmed. Retry a 503 against the same assembly: cancellation may already be recorded. A completed output wins the race and answers `409 ASSEMBLY_ALREADY_TERMINAL`; repeated confirmed cancellation returns the same saved result. This requires the compatible private service. Assembly carries no new customer charge.
@@ -357,10 +374,10 @@ curl -X DELETE "https://api.slop.cc/v1/assemblies/$ASSEMBLY_ID" \
 
 ```sh
 curl https://api.slop.cc/v1/billing/balance \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 
 curl "https://api.slop.cc/v1/usage?limit=50" \
-  -H "Authorization: Bearer $SLOPCANNON_AGENT_TOKEN"
+  -H "$AUTH"
 ```
 
 `/v1/billing/balance` reports `availableCredits`, `reservedCredits` and `totalCredits`. It carries no email, profile, Stripe identifier or purchase history. The wallet cannot go negative.
@@ -381,30 +398,34 @@ People add credits at `https://slop.cc/account#buy-credits`. Read `/v1/billing/p
 
 An organization lets one account resell SLOPCANNON to its own end customers under one wallet. Each customer owns its own projects, assets, generations and workspaces; the organization owner's prepaid balance funds all of them; and a per-customer ceiling bounds what any one of them can spend. Branch on `contract.organizations.ready`.
 
-**Create the organization with an interactive session.** `POST https://slop.cc/api/v1/organizations` accepts `{ "name": "Your organization" }` from the signed-in account session; a personal bearer token cannot bootstrap it. This is an authenticated API action, not a promise of an organization form in the account page: it is where an account accepts that its wallet funds the organization. It returns the organization and one administration credential, plaintext once. That credential carries `organizations:manage` and reaches the rest of the surface. Keep it on your server — it can mint credentials that spend your balance.
+**Create the organization with an interactive session.** `POST https://slop.cc/api/v1/organizations` accepts `{ "name": "Your organization" }` from the signed-in account session; a personal bearer token cannot bootstrap it. This is an authenticated API action, not a promise of an organization form in the account page: it is where an account accepts that its wallet funds the organization. It returns the organization and one administration credential, plaintext once. That credential carries `organizations:manage` and reaches the rest of the surface. Keep it on your server — it can mint credentials that spend your balance. Supply it to your server as `SLOPCANNON_ORG_TOKEN` and build its header once, the way `AUTH` is built in §1; every call below sends it with `-H "$ORG_AUTH"`:
+
+```sh
+ORG_AUTH="Authorization: Bearer $SLOPCANNON_ORG_TOKEN"
+```
 
 ```sh
 # Create an end customer, idempotent on your own reference for it.
 curl -X POST "https://api.slop.cc/v1/organizations/$ORG_ID/customers" \
-  -H "Authorization: Bearer $SLOPCANNON_ORG_TOKEN" \
+  -H "$ORG_AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"externalRef":"acct-4417","displayName":"Northwind","spendCeilingUnits":5000}'
 
 # Issue that customer a credential. The plaintext token is returned once.
 curl -X POST "https://api.slop.cc/v1/organizations/$ORG_ID/customers/$CUSTOMER_USER_ID/tokens" \
-  -H "Authorization: Bearer $SLOPCANNON_ORG_TOKEN" \
+  -H "$ORG_AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"name":"Northwind production worker","expiresInDays":90}'
 
 # Raise, lower or remove a ceiling; suspend a customer.
 curl -X PATCH "https://api.slop.cc/v1/organizations/$ORG_ID/customers/$CUSTOMER_USER_ID" \
-  -H "Authorization: Bearer $SLOPCANNON_ORG_TOKEN" \
+  -H "$ORG_AUTH" \
   -H 'Content-Type: application/json' \
   -d '{"spendCeilingUnits":12000}'
 
 # Bill your customers from one call.
 curl "https://api.slop.cc/v1/organizations/$ORG_ID/usage?customer=acct-4417" \
-  -H "Authorization: Bearer $SLOPCANNON_ORG_TOKEN"
+  -H "$ORG_AUTH"
 ```
 
 The full administration surface:
