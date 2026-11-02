@@ -2,22 +2,17 @@
 from __future__ import annotations
 
 import argparse
-import getpass
 import sys
-import threading
 from typing import Any
 
-from . import auth, server_tools, settings
+from . import auth, server_tools
 from .client import Client, SlopcannonError
-
-_LOCAL_SURFACES = {"cli", "tui", "desktop", "acp"}
-_login_lock = threading.Lock()
 
 HELP = "\n".join([
     "SLOPCANNON",
     "  /slop status   account, credits and service",
-    "  /slop login    connect your account (opens slop.cc in your browser)",
-    "  /slop logout   forget this machine's SLOPCANNON token",
+    "  /slop login    how to connect your account (a terminal command)",
+    "  /slop logout   how to disconnect it",
     "  /slop sync     refresh the tool list from the server (applies next session)",
 ])
 
@@ -37,19 +32,25 @@ def _expiry(epoch: Any) -> str:
         return ""
     import datetime as _dt
 
-    return "expires " + _dt.datetime.fromtimestamp(epoch).strftime("%d %b %Y").lstrip("0")
+    return "session until " + _dt.datetime.fromtimestamp(epoch).strftime("%H:%M")
+
+
+_VIA = {auth.VIA_SIGN_IN: "Hermes sign-in", auth.VIA_PERSONAL: "personal token"}
 
 
 def _status_text() -> str:
     summary = auth.token_summary()
     rows = ["SLOPCANNON"]
     if summary["connected"]:
-        via = {"oauth": "signed in at slop.cc", "pasted": "account token", "environment": "token from environment"}
+        via = summary.get("via") or ""
         account = " · ".join(part for part in (
-            "connected", via.get(summary["via"] or "", summary["via"] or ""), _expiry(summary["expires_at"])) if part)
+            "connected", _VIA.get(via, via), _expiry(summary.get("expires_at"))) if part)
         rows.append(_row("account", account))
+    elif summary.get("error"):
+        rows.append(_row("account", f"not connected ({summary['error']})"))
+        rows.append(_row("why", str(summary.get("message") or "")))
     else:
-        rows.append(_row("account", "not connected · run /slop login"))
+        rows.append(_row("account", "not connected · /slop login shows how"))
 
     client = Client()
     if summary["connected"]:
@@ -80,29 +81,20 @@ def _status_text() -> str:
     return "\n".join(rows)
 
 
-def _surface() -> str:
-    ctx = settings.context()
-    try:
-        return str(ctx.session_surface()) if ctx is not None else "cli"
-    except Exception:
-        return "cli"
+def login_text() -> str:
+    """Sign-in is Hermes's, in a terminal: a plugin never runs an OAuth flow (catalog rule 11)."""
+    return "\n".join(["SLOPCANNON", *(_row(label, text) for label, text in auth.sign_in_help()),
+                      _row("then", "/slop status")])
 
 
-def _login_in_background() -> str:
-    if not _login_lock.acquire(blocking=False):
-        return "\n".join(["SLOPCANNON", _row("sign-in", "already waiting in your browser")])
-
-    def run() -> None:
-        try:
-            auth.login(say=lambda _msg: None)
-        except Exception:
-            pass
-        finally:
-            _login_lock.release()
-
-    threading.Thread(target=run, name="slopcannon-login", daemon=True).start()
-    return "\n".join(["SLOPCANNON", _row("sign-in", "opening slop.cc in your browser"),
-                      _row("next", "approve there, then /slop status")])
+def logout_text() -> str:
+    auth.reset()  # the in-memory session; nothing else is stored by the plugin
+    return "\n".join([
+        "SLOPCANNON",
+        _row("sign-out", f"run `{auth.SIGN_OUT_COMMAND}` in a terminal"),
+        _row("token", "clear the Agent token plugin setting if you entered one"),
+        _row("revoke", "slop.cc/account ends the connection everywhere"),
+    ])
 
 
 def slash(raw_args: str = "", **_: Any) -> str:
@@ -110,17 +102,9 @@ def slash(raw_args: str = "", **_: Any) -> str:
     if verb == "status":
         return _status_text()
     if verb == "login":
-        surface = _surface()
-        if surface not in _LOCAL_SURFACES:
-            return "\n".join(["SLOPCANNON", _row("sign-in", f"needs a browser on the Hermes machine, not {surface}"),
-                              _row("instead", "run `hermes slopcannon login` on that machine"),
-                              _row("headless", "`hermes slopcannon login --token-stdin` with a slop.cc/account token"),
-                              _row("never", "paste a token into chat")])
-        return _login_in_background()
+        return login_text()
     if verb == "logout":
-        auth.clear_token()
-        return "\n".join(["SLOPCANNON", _row("account", "disconnected on this machine"),
-                          _row("revoke", "slop.cc/account, to end the token everywhere")])
+        return logout_text()
     if verb == "sync":
         try:
             count = server_tools.refresh()
@@ -132,42 +116,32 @@ def slash(raw_args: str = "", **_: Any) -> str:
 
 # --------------------------------------------------------------------------- CLI
 
+_CLI_SESSION_TTL_S = 15 * 60  # a one-shot command: its session lapses soon after it exits
+
 
 def setup_cli(parser: argparse.ArgumentParser) -> None:
     sub = parser.add_subparsers(dest="slop_command")
-    login = sub.add_parser("login", help="Connect your SLOPCANNON account")
-    login.add_argument("--no-browser", action="store_true", help="Print the sign-in URL instead of opening it")
-    login.add_argument("--token-stdin", action="store_true",
-                       help="Store a token from slop.cc/account read from stdin (headless seats)")
-    sub.add_parser("logout", help="Forget the stored token")
+    sub.add_parser("login", help=f"How to connect your SLOPCANNON account (`{auth.SIGN_IN_COMMAND}`)")
+    sub.add_parser("logout", help=f"How to disconnect it (`{auth.SIGN_OUT_COMMAND}`)")
     sub.add_parser("status", help="Connection, balance and service readiness")
     sub.add_parser("sync", help="Refresh the server tool list into plugin state")
 
 
 def run_cli(args: argparse.Namespace) -> int:
     command = getattr(args, "slop_command", None) or "status"
+    if command == "login":
+        print(login_text())
+        return 0
+    if command == "logout":
+        print(logout_text())
+        return 0
+    auth.set_session_ttl(_CLI_SESSION_TTL_S)
     try:
-        if command == "login":
-            if getattr(args, "token_stdin", False):
-                token = sys.stdin.readline() if not sys.stdin.isatty() else getpass.getpass("SLOPCANNON token: ")
-                summary = auth.store_pasted_token(token)
-            else:
-                summary = auth.login(open_browser=not getattr(args, "no_browser", False))
-            print(f"Connected ({summary['token_prefix']}).")
-            print(_status_text())
-            return 0
-        if command == "logout":
-            auth.clear_token()
-            print("SLOPCANNON token removed.")
-            return 0
         if command == "sync":
             print(f"Synced {server_tools.refresh()} SLOPCANNON tools; they load in the next session.")
             return 0
         print(_status_text())
         return 0
-    except auth.LoginError as exc:
-        print(f"Sign-in failed: {exc}", file=sys.stderr)
-        return 1
     except SlopcannonError as exc:
         print(f"SLOPCANNON: {exc}", file=sys.stderr)
         return 1

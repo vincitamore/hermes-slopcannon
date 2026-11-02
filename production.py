@@ -264,9 +264,13 @@ class _Runner(threading.Thread):
             node = node_status()
             if not node["ok"]:
                 raise ProductionError(node["message"], "node_missing")
-            token = auth.get_token()
-            if not token:
-                raise ProductionError("SLOPCANNON is not connected; run /slop login.", "not_connected")
+            try:
+                # Its own twelve-hour session, so a long run never outlives the in-process one.
+                token = auth.driver_token(pid).token
+            except auth.NotSignedIn as exc:
+                raise ProductionError(str(exc), "not_connected") from None
+            except auth.CredentialError as exc:
+                raise ProductionError(str(exc), exc.code) from None
             env = {**os.environ, settings.TOKEN_ENV: token, "SLOPCANNON_AGENT_ORIGIN": settings.api_origin()}
             args = [node["node"], str(DRIVER), *_driver_args(folder, state.get("decisions") or {}, self.concurrency)]
             state.update(state="running", needs=None, message=None)

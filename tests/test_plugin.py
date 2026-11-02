@@ -5,6 +5,7 @@ Run: python -m unittest discover -s tests -v   (from the plugin root)
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import re
@@ -31,6 +32,46 @@ _fake_pkg = types.ModuleType("hermes_cli")
 _fake_pkg.config = _fake_config
 sys.modules["hermes_cli"] = _fake_pkg
 sys.modules["hermes_cli.config"] = _fake_config
+
+
+# Hermes's signed-in request helper and secret route, faked: no test reaches a real auth store.
+class ProviderNotSignedIn(RuntimeError):
+    pass
+
+
+class AuthError(RuntimeError):
+    def __init__(self, message, *, provider="", code=None, **_):
+        super().__init__(message)
+        self.provider, self.code = provider, code
+
+
+class ProviderResponse:
+    def __init__(self, status, payload):
+        self.status, self._payload = status, payload
+
+    def json(self):
+        return self._payload
+
+
+def _no_sign_in(*_a, **_k):
+    raise ProviderNotSignedIn("Not signed in to slop for plugin 'slopcannon' in this Hermes profile. "
+                              "Run `hermes auth add slopcannon:slop`.")
+
+
+_fake_requests = types.ModuleType("hermes_cli.plugin_provider_requests")
+_fake_requests.ProviderNotSignedIn = ProviderNotSignedIn
+_fake_requests.credentialed_provider_request = _no_sign_in
+_fake_auth_constants = types.ModuleType("hermes_cli.auth_constants")
+_fake_auth_constants.AuthError = AuthError
+sys.modules["hermes_cli.plugin_provider_requests"] = _fake_requests
+sys.modules["hermes_cli.auth_constants"] = _fake_auth_constants
+_SECRETS: dict[str, str] = {}
+_fake_agent = types.ModuleType("agent")
+_fake_secret_scope = types.ModuleType("agent.secret_scope")
+_fake_secret_scope.get_secret = lambda name, default=None: _SECRETS.get(name, default)
+_fake_agent.secret_scope = _fake_secret_scope
+sys.modules.setdefault("agent", _fake_agent)
+sys.modules["agent.secret_scope"] = _fake_secret_scope
 
 _spec = importlib.util.spec_from_file_location(
     "slopcannon_plugin", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
@@ -160,9 +201,8 @@ class SettingsTest(unittest.TestCase):
     def test_defaults_without_hermes(self):
         settings.bind(None)
         self.assertEqual(settings.api_origin(), ORIGIN)
-        self.assertEqual(settings.mcp_resource(), f"{ORIGIN}/mcp")
         bind({"api_origin": "http://localhost:8787"})
-        self.assertEqual(settings.mcp_resource(), "http://localhost:8787/mcp")
+        self.assertEqual(settings.api_origin(), "http://localhost:8787")
 
 
 SUBMIT = "slopcannon_submit_generation"
@@ -272,10 +312,12 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(err.exception.code, "unexpected_redirect")
 
     def test_not_connected(self):
+        auth.reset()
         c = client_mod.Client(origin=ORIGIN, transport=httpx.MockTransport(lambda r: httpx.Response(200)))
-        with mock.patch.object(auth, "get_token", return_value=None):
-            with self.assertRaises(client_mod.NotConnected):
+        with mock.patch.dict(_SECRETS, {}, clear=True):
+            with self.assertRaises(client_mod.NotConnected) as err:
                 c.balance()
+        self.assertIn("hermes auth add slopcannon:slop", str(err.exception))
 
     def test_tool_call_json_and_sse(self):
         def handler(request):
@@ -394,34 +436,279 @@ class AuthTest(unittest.TestCase):
         real = client_mod.Client
         with mock.patch.object(commands, "Client", lambda *a, **k: real(origin=ORIGIN, token="t", transport=transport)), \
                 mock.patch.object(auth, "token_summary", return_value={
-                    "connected": True, "via": "oauth", "expires_at": None, "token_prefix": "slop_live_x", "scopes": None}):
+                    "connected": True, "via": auth.VIA_SIGN_IN, "expires_at": 1_900_000_000, "scopes": None}):
             text = commands.slash("status")
         lines = text.splitlines()
         self.assertEqual(lines[0], "SLOPCANNON")
+        self.assertIn("connected · Hermes sign-in · session until", text)
         self.assertIn("4,430 available · 56 held for running work", text)
         self.assertIn("available · rendering open", text)
         self.assertNotIn("{", text)
         self.assertNotIn("slop_live", text)
         self.assertEqual(len({line.index(line.split()[1]) for line in lines[1:]}), 1)  # one value column
-    def test_pkce_pair(self):
-        verifier, challenge = auth._pkce_pair()
-        self.assertRegex(verifier, r"^[A-Za-z0-9._~-]{43,128}$")
-        self.assertRegex(challenge, r"^[A-Za-z0-9_-]{43}$")
 
-    def test_pasted_token_shape(self):
+
+def session_payload(token="slop_live_session_a", ttl_s=7200, scopes=("projects:read", "billing:read")):
+    now_ms = int(__import__("time").time() * 1000)
+    return {"data": {"object": "agent_session", "id": "tok_x", "token": token, "tokenType": "Bearer",
+                     "name": "Hermes - SLOPCANNON plugin", "scopes": list(scopes),
+                     "expiresAt": now_ms + ttl_s * 1000, "expiresIn": ttl_s, "createdAt": now_ms},
+            "requestId": "req_1"}
+
+
+class SessionTest(unittest.TestCase):
+    """Credentials come from Hermes: a minted session (memory only) or the personal token."""
+
+    def setUp(self):
+        self.ctx = bind()
+        auth.reset()
+        auth.set_session_ttl(auth.SESSION_TTL_S)
+        self.addCleanup(auth.reset)
+        self.calls = []
+        self.responses = []
+        self.secrets = mock.patch.dict(_SECRETS, {}, clear=True)
+        self.secrets.start()
+        self.addCleanup(self.secrets.stop)
+        self.env_before = dict(_FAKE_ENV)
+        self.process_env_before = os.environ.get(settings.TOKEN_ENV)
+
+    def helper(self, *responses):
+        self.responses = list(responses)
+
+        def fake(provider, method, url, *, json=None, headers=None, timeout=30.0):
+            self.calls.append({"provider": provider, "method": method, "url": url, "json": json, "timeout": timeout})
+            if not self.responses:
+                raise AssertionError("unexpected sign-in request")
+            item = self.responses.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
+        patch = mock.patch.object(_fake_requests, "credentialed_provider_request", fake)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def assert_nothing_stored(self):
+        self.assertEqual(_FAKE_ENV, self.env_before)  # no .env write
+        self.assertEqual(self.ctx.state.data, {})  # no plugin-state write
+        self.assertTrue(os.environ.get(settings.TOKEN_ENV) == self.process_env_before)  # no process-env write
+
+    def test_mints_through_hermes_and_caches_in_memory(self):
+        self.helper(ProviderResponse(201, session_payload()))
+        first = auth.credential()
+        second = auth.credential()
+        self.assertEqual(first.token, "slop_live_session_a")
+        self.assertIs(first, second)
+        self.assertEqual(len(self.calls), 1)
+        call = self.calls[0]
+        self.assertEqual((call["provider"], call["method"], call["url"]),
+                         ("slop", "POST", "https://api.slop.cc/v1/agent-sessions"))
+        self.assertEqual(call["json"]["ttlSeconds"], 7200)
+        self.assertNotIn("scopes", call["json"])  # the parent's scopes minus billing:purchase
+        self.assertTrue(1 <= len(call["json"]["name"]) <= 60)
+        self.assertEqual(call["timeout"], 20)
+        self.assertEqual(first.via, auth.VIA_SIGN_IN)
+        self.assertNotIn("slop_live", repr(first))
+        self.assert_nothing_stored()
+
+    def test_remints_when_less_than_ten_minutes_remain(self):
+        self.helper(ProviderResponse(201, session_payload("slop_live_short", ttl_s=300)),
+                    ProviderResponse(201, session_payload("slop_live_next")))
+        self.assertEqual(auth.get_token(), "slop_live_short")
+        self.assertEqual(auth.get_token(), "slop_live_next")
+        self.assertEqual(auth.get_token(), "slop_live_next")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_401_remints_and_retries_once(self):
+        self.helper(ProviderResponse(201, session_payload("slop_live_old")),
+                    ProviderResponse(201, session_payload("slop_live_new")))
+        seen = []
+
+        def api(request):
+            seen.append(request.headers["authorization"])
+            if request.headers["authorization"] == "Bearer slop_live_old":
+                return httpx.Response(401, json={"error": {"code": "INVALID_API_TOKEN", "message": "expired"}})
+            return httpx.Response(200, json={"data": {"availableCredits": 7}})
+        c = client_mod.Client(origin=ORIGIN, transport=httpx.MockTransport(api))
+        self.assertEqual(c.balance(), {"availableCredits": 7})
+        self.assertEqual(seen, ["Bearer slop_live_old", "Bearer slop_live_new"])
+        self.assertEqual(len(self.calls), 2)
+
+    def test_a_second_401_is_not_retried_again(self):
+        self.helper(ProviderResponse(201, session_payload("slop_live_a")),
+                    ProviderResponse(201, session_payload("slop_live_b")))
+        seen = []
+        c = client_mod.Client(origin=ORIGIN, transport=httpx.MockTransport(
+            lambda r: seen.append(1) or httpx.Response(401, json={"error": {"code": "INVALID_API_TOKEN"}})))
+        with self.assertRaises(client_mod.SlopcannonError) as err:
+            c.balance()
+        self.assertEqual(err.exception.status, 401)
+        self.assertEqual(len(seen), 2)
+
+    def test_mcp_401_also_remints(self):
+        self.helper(ProviderResponse(201, session_payload("slop_live_old")),
+                    ProviderResponse(201, session_payload("slop_live_new")))
+
+        def api(request):
+            if request.headers["authorization"] == "Bearer slop_live_old":
+                return httpx.Response(401, json={"error": "invalid_token"})
+            return rpc({"structuredContent": {"ok": 1}})
+        c = client_mod.Client(origin=ORIGIN, transport=httpx.MockTransport(api))
+        self.assertEqual(c.call_tool("get_workspace"), {"ok": 1})
+
+    def test_not_signed_in_names_the_hermes_command(self):
+        self.helper(ProviderNotSignedIn("Not signed in to slop for plugin 'slopcannon' in this Hermes profile. "
+                                        "Run `hermes auth add slopcannon:slop`."))
+        with self.assertRaises(auth.NotSignedIn) as err:
+            auth.credential()
+        self.assertIn("hermes auth add slopcannon:slop", str(err.exception))
+        self.assertIn("terminal", str(err.exception))
+        self.assertIn("Agent token", str(err.exception))
+        self.assert_nothing_stored()
+
+    def test_not_signed_in_status_is_truthful(self):
+        self.helper(ProviderNotSignedIn("Run `hermes auth add slopcannon:slop`."))
+        summary = auth.token_summary()
+        self.assertFalse(summary["connected"])
+        self.assertIsNone(summary["via"])
+        self.assertEqual(summary["sign_in"], "hermes auth add slopcannon:slop")
+
+    def test_auth_errors_are_explained(self):
+        self.helper(AuthError("slopcannon:slop: SLOPCANNON_OAUTH_CLIENT_ID is not set.",
+                              code="oauth_client_id_missing"))
+        with self.assertRaises(auth.CredentialError) as err:
+            auth.credential()
+        self.assertEqual(err.exception.code, "oauth_client_id_missing")
+        self.assertIn("SLOPCANNON_OAUTH_CLIENT_ID", str(err.exception))
+        self.assertIn("hermes-agent", str(err.exception))
+        self.helper(AuthError("refused", code="invalid_client"))
+        c = client_mod.Client(origin=ORIGIN, transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+        with self.assertRaises(client_mod.SlopcannonError) as err2:
+            c.balance()
+        self.assertEqual(err2.exception.code, "invalid_client")
+        self.assertNotIsInstance(err2.exception, client_mod.NotConnected)
+
+    def test_server_refusals_map_to_codes(self):
+        self.helper(ProviderResponse(429, {"error": {"code": "AGENT_SESSION_RATE_LIMITED", "message": "x"}}),
+                    ProviderResponse(503, {"error": {"code": "AGENT_SESSIONS_UNAVAILABLE", "message": "x"}}),
+                    ProviderResponse(401, {"error": {"code": "INVALID_API_TOKEN", "message": "x"}}))
+        with self.assertRaises(auth.CredentialError) as err:
+            auth.credential()
+        self.assertEqual(err.exception.code, "agent_session_rate_limited")
+        with self.assertRaises(auth.CredentialError) as err:
+            auth.credential()
+        self.assertEqual(err.exception.code, "agent_sessions_unavailable")
+        with self.assertRaises(auth.NotSignedIn):  # the grant was revoked at slop.cc
+            auth.credential()
+
+    def test_personal_token_when_not_signed_in(self):
+        self.helper(ProviderNotSignedIn("Run `hermes auth add slopcannon:slop`."),
+                    ProviderNotSignedIn("Run `hermes auth add slopcannon:slop`."))
+        _SECRETS[settings.TOKEN_ENV] = "slop_live_personal"
+        cred = auth.credential()
+        self.assertEqual((cred.token, cred.via, cred.session), ("slop_live_personal", auth.VIA_PERSONAL, False))
+        summary = auth.token_summary()
+        self.assertTrue(summary["connected"])
+        self.assertEqual(summary["via"], "personal token")
+        self.assertNotIn("slop_live", json.dumps(summary))
+        self.assert_nothing_stored()
+
+    def test_custom_origin_uses_the_personal_token_and_never_the_sign_in(self):
+        self.ctx = bind({"api_origin": "http://127.0.0.1:8787"})
+        self.helper()  # any call would pop from an empty list and fail
+        _SECRETS[settings.TOKEN_ENV] = "slop_live_local"
+        self.assertEqual(auth.get_token(), "slop_live_local")
+        self.assertEqual(self.calls, [])
+        _SECRETS.clear()
+        with self.assertRaises(auth.NotSignedIn) as err:
+            auth.credential()
+        self.assertIn("personal token", str(err.exception))
+        self.assertEqual(self.calls, [])
+
+    def test_driver_gets_its_own_twelve_hour_session(self):
+        self.helper(ProviderResponse(201, session_payload("slop_live_driver", ttl_s=43200)),
+                    ProviderResponse(201, session_payload("slop_live_inproc")))
+        cred = auth.driver_token("film-1")
+        self.assertEqual(cred.token, "slop_live_driver")
+        self.assertEqual(self.calls[0]["json"]["ttlSeconds"], 43200)
+        self.assertIn("film-1", self.calls[0]["json"]["name"])
+        self.assertEqual(auth.get_token(), "slop_live_inproc")  # never the cached in-process session
+        self.assert_nothing_stored()
+
+    def test_driver_with_a_personal_token_gets_a_session_minted_from_it(self):
+        self.helper(ProviderNotSignedIn("Run `hermes auth add slopcannon:slop`."))
+        _SECRETS[settings.TOKEN_ENV] = "slop_live_personal"
+        minted = auth.Credential(token="slop_live_child", via=auth.VIA_PERSONAL, expires_at=1.0, session=True)
+        with mock.patch.object(auth, "_mint_with_personal", return_value=minted) as mint:
+            self.assertEqual(auth.driver_token("film-2").token, "slop_live_child")
+        self.assertEqual(mint.call_args.args[0], "slop_live_personal")
+        self.assertEqual(mint.call_args.args[1], auth.DRIVER_TTL_S)
+        self.helper(ProviderNotSignedIn("x"))
+        with mock.patch.object(auth, "_mint_with_personal", side_effect=auth.CredentialError("down", "http_503")):
+            self.assertEqual(auth.driver_token("film-2").token, "slop_live_personal")
+
+    def test_cli_sessions_are_short(self):
+        self.helper(ProviderResponse(201, session_payload()))
+        auth.set_session_ttl(900)
+        auth.credential()
+        self.assertEqual(self.calls[0]["json"]["ttlSeconds"], 900)
+
+    def test_auth_module_runs_no_flow_and_touches_no_store(self):
+        source = (ROOT / "auth.py").read_text(encoding="utf-8")
+        for banned in ("webbrowser", "http.server", "save_env", "remove_env", "get_env_value", "os.environ",
+                       "register_client", "code_verifier", "/api/oauth/token", "state_set", "open("):
+            self.assertNotIn(banned, source, banned)
+
+
+class LoginCommandTest(unittest.TestCase):
+    def setUp(self):
         bind()
-        with self.assertRaises(auth.LoginError):
-            auth.store_pasted_token("sk-not-ours")
-        with mock.patch.dict(os.environ, {}, clear=False):
-            summary = auth.store_pasted_token("slop_live_abcdefghijkl\n")
-            self.assertTrue(summary["connected"])
-            self.assertEqual(os.environ[settings.TOKEN_ENV], "slop_live_abcdefghijkl")
-            self.assertEqual(_FAKE_ENV[settings.TOKEN_ENV], "slop_live_abcdefghijkl")
-            auth.clear_token()
-            self.assertNotIn(settings.TOKEN_ENV, os.environ)
-            self.assertNotIn(settings.TOKEN_ENV, _FAKE_ENV)
 
+    def test_login_shows_the_hermes_command_and_starts_nothing(self):
+        from slopcannon_plugin import commands
 
+        with mock.patch.object(_fake_requests, "credentialed_provider_request",
+                               side_effect=AssertionError("login must not mint")):
+            text = commands.slash("login")
+        self.assertIn("hermes auth add slopcannon:slop", text)
+        self.assertIn("hermes config set SLOPCANNON_OAUTH_CLIENT_ID hermes-agent", text)
+        self.assertIn("terminal", text)
+        self.assertIn("Agent token", text)
+        self.assertNotIn("slop_live", text)
+
+    def test_logout_points_at_hermes_and_drops_the_memory_session(self):
+        from slopcannon_plugin import commands
+
+        with mock.patch.object(auth, "reset") as reset:
+            text = commands.slash("logout")
+        reset.assert_called_once()
+        self.assertIn("hermes auth logout slopcannon:slop", text)
+
+    def test_cli_has_no_paste_path(self):
+        import argparse
+        from slopcannon_plugin import commands
+
+        parser = argparse.ArgumentParser()
+        commands.setup_cli(parser)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+            parser.parse_args(["login", "--token-stdin"])
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            self.assertEqual(commands.run_cli(parser.parse_args(["login"])), 0)
+        self.assertIn("hermes auth add slopcannon:slop", out.getvalue())
+
+    def test_manifest_oauth_entry_matches_the_plugin(self):
+        import yaml
+
+        manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+        (entry,) = manifest["oauth"]
+        self.assertEqual(entry["id"], auth.OAUTH_ID)
+        self.assertEqual(entry["scopes"], auth.DEFAULT_SCOPES.split())
+        self.assertNotIn("billing:purchase", entry["scopes"])
+        self.assertEqual(entry["client_id_env"], auth.CLIENT_ID_ENV)
+        self.assertEqual(entry["hosts"], ["api.slop.cc"])
+        self.assertEqual(manifest["name"], auth.PLUGIN_KEY)
+        self.assertIn(auth.CLIENT_ID_ENV, [e["name"] for e in manifest.get("optional_env") or []])
+        self.assertNotIn("requires_env", manifest)  # nothing gates loading for personal-token users
 
 
 class CheckRowTest(unittest.TestCase):
@@ -513,7 +800,8 @@ class ProductionTest(unittest.TestCase):
             mock.patch.object(production, "root", lambda: self.root),
             mock.patch.object(production, "DRIVER", driver),
             mock.patch.object(production, "_broadcast", lambda *a, **k: None),
-            mock.patch.object(production.auth, "get_token", lambda: "slop_live_test"),
+            mock.patch.object(production.auth, "driver_token",
+                              lambda pid: auth.Credential(token="slop_live_test", via=auth.VIA_PERSONAL)),
         ]
         for patch in self.patches:
             patch.start()

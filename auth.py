@@ -1,300 +1,341 @@
-"""SLOPCANNON account connection.
+"""SLOPCANNON credentials, all through Hermes (catalog rule 11).
 
-The plugin owns its own sign-in so the agent never sees a credential:
-OAuth 2.1 authorization code + PKCE (S256) against slop.cc, with dynamic client
-registration and a loopback redirect (RFC 8252), the same shape every MCP
-client uses. The resulting scoped bearer token is stored through Hermes's
-secret path (``.env``) under ``SLOPCANNON_AGENT_TOKEN``; a token minted at
-slop.cc/account can be stored the same way for headless seats.
+The plugin runs no sign-in, stores no token and reads no ``.env``:
+
+- **Hermes sign-in (preferred).** ``plugin.yaml`` declares the OAuth client
+  ``slop`` (slop.cc's public PKCE client ``hermes-agent``). The person signs in
+  once in a terminal with ``hermes auth add slopcannon:slop``; Hermes keeps the
+  90-day grant in its own store. The plugin never receives that grant: it asks
+  Hermes, through ``credentialed_provider_request``, to POST
+  ``/v1/agent-sessions`` with it, and gets back a short-lived, narrower agent
+  session token (two hours by default, never ``billing:purchase``). That session
+  lives in this process's memory only and is re-minted when it nears expiry or
+  the API answers 401.
+- **Personal token (alternative).** A token made at slop.cc/account, entered as
+  the plugin's **Agent token** setting (``SLOPCANNON_AGENT_TOKEN``) and read
+  through ``agent.secret_scope.get_secret``. It is also the only route when the
+  API origin is not ``https://api.slop.cc`` (the sign-in is bound to that host).
+
+A production's Node driver runs for hours as a child process, so it gets its own
+twelve-hour session in its environment instead of the in-process one.
 """
 from __future__ import annotations
 
-import base64
-import hashlib
-import http.server
-import os
-import secrets
-import socket
 import threading
 import time
-import webbrowser
-from typing import Any, Callable, Optional
-from urllib.parse import parse_qs, urlencode, urlsplit
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import httpx
 
 from . import settings
 
-# billing:purchase is deliberately not requested: buying credits stays in the
-# person's own browser at slop.cc/account.
+OAUTH_ID = "slop"
+PLUGIN_KEY = "slopcannon"
+SIGN_IN_COMMAND = f"hermes auth add {PLUGIN_KEY}:{OAUTH_ID}"
+SIGN_OUT_COMMAND = f"hermes auth logout {PLUGIN_KEY}:{OAUTH_ID}"
+CLIENT_ID_ENV = "SLOPCANNON_OAUTH_CLIENT_ID"
+PUBLIC_CLIENT_ID = "hermes-agent"
+CLIENT_ID_COMMAND = f"hermes config set {CLIENT_ID_ENV} {PUBLIC_CLIENT_ID}"
+HOSTED_API_ORIGIN = "https://api.slop.cc"
+SESSIONS_URL = f"{HOSTED_API_ORIGIN}/v1/agent-sessions"
+PERSONAL_TOKEN_HINT = "or enter a slop.cc/account token as the plugin's Agent token setting"
+
+# The scopes plugin.yaml's oauth entry asks for (kept equal by a test). billing:purchase is
+# deliberately absent: buying credits stays in the person's own browser at slop.cc/account.
 DEFAULT_SCOPES = (
     "projects:read projects:write assets:read assets:write "
     "quotes:create generations:create generations:read billing:read"
 )
-CLIENT_NAME = "Hermes Agent (SLOPCANNON plugin)"
-_CALLBACK_PATH = "/callback"
-_LOGIN_TIMEOUT_S = 300
+
+SESSION_TTL_S = 2 * 60 * 60
+DRIVER_TTL_S = 12 * 60 * 60  # the server's maximum: a production never loses its session mid-run
+_REMINT_MARGIN_S = 10 * 60
+_MINT_TIMEOUT_S = 20
+SESSION_NAME = "Hermes - SLOPCANNON plugin"
+
+VIA_SIGN_IN = "hermes sign-in"
+VIA_PERSONAL = "personal token"
 
 
-class LoginError(RuntimeError):
-    pass
+class NotSignedIn(RuntimeError):
+    """No usable credential: not signed in through Hermes and no personal token."""
 
 
-# --------------------------------------------------------------------------- token store
+class CredentialError(RuntimeError):
+    """A credential exists but could not be used (refused, rate limited, misconfigured)."""
+
+    def __init__(self, message: str, code: str = "credential_error"):
+        super().__init__(message)
+        self.code = code
 
 
-def get_token() -> Optional[str]:
-    """The token through Hermes's profile-scoped secret route (catalog rule 11)."""
+@dataclass(frozen=True)
+class Credential:
+    token: str
+    via: str
+    expires_at: Optional[float] = None  # epoch seconds; None for a personal token
+    scopes: Optional[tuple[str, ...]] = None
+    session: bool = False
+
+    def __repr__(self) -> str:  # never show the token
+        return f"Credential(via={self.via!r}, expires_at={self.expires_at!r}, session={self.session!r})"
+
+    def remaining(self) -> float:
+        return float("inf") if self.expires_at is None else self.expires_at - time.time()
+
+
+_lock = threading.Lock()
+_cached: Optional[Credential] = None
+_session_ttl_s = SESSION_TTL_S
+
+
+def set_session_ttl(seconds: int) -> None:
+    """Size this process's in-memory session to its use (a one-shot CLI command needs minutes)."""
+    global _session_ttl_s
+    _session_ttl_s = max(60, min(DRIVER_TTL_S, int(seconds)))
+
+
+def _remint_margin() -> float:
+    return min(_REMINT_MARGIN_S, _session_ttl_s / 4)
+
+
+def _not_signed_in_message(detail: str = "") -> str:
+    lead = detail.strip() or "SLOPCANNON is not connected."
+    if SIGN_IN_COMMAND in lead:  # Hermes's own message already names the command
+        return (f"{lead} Run it in a terminal on the Hermes machine (sign-in cannot start inside a chat or "
+                f"the gateway), {PERSONAL_TOKEN_HINT}. Never paste a token into chat.")
+    return (f"{lead} To connect, run `{SIGN_IN_COMMAND}` in a terminal on the Hermes machine "
+            f"(sign-in cannot start inside a chat or the gateway), {PERSONAL_TOKEN_HINT}. "
+            "Never paste a token into chat.")
+
+
+# --------------------------------------------------------------------------- sources
+
+
+def _hosted() -> bool:
+    try:
+        return settings.api_origin() == HOSTED_API_ORIGIN
+    except ValueError:
+        return False
+
+
+def _personal_token() -> Optional[str]:
+    """The personal token through Hermes's profile-scoped secret route; nothing else is read."""
     try:
         from agent.secret_scope import get_secret
-
+    except ImportError:
+        return None  # not inside Hermes: there is no secret route to read
+    try:
         return (get_secret(settings.TOKEN_ENV) or "").strip() or None
+    except Exception:  # an unscoped read under multiplexing fails closed
+        return None
+
+
+def _error_body(payload: Any) -> tuple[str, str]:
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        return str(error.get("code") or ""), str(error.get("message") or "")
+    return "", ""
+
+
+_REFUSALS = {
+    "AGENT_SESSION_RATE_LIMITED": "Too many SLOPCANNON sessions this hour; try again later.",
+    "AGENT_SESSIONS_UNAVAILABLE": "SLOPCANNON agent sessions are not available yet; try again later.",
+    "PERSONAL_TOKEN_REQUIRED": "An organization credential cannot start agent sessions; sign in with your own account.",
+    "AGENT_SESSION_CANNOT_DELEGATE": "This credential is itself an agent session and cannot start another.",
+    "INVALID_SCOPES": "SLOPCANNON refused the requested session scopes.",
+}
+
+
+def _session_from(status: int, payload: Any, *, via: str) -> Credential:
+    """A minted session, or the server's refusal as a NotSignedIn / CredentialError."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if status == 201 and isinstance(data, dict) and isinstance(data.get("token"), str) and data["token"]:
+        expires_ms, expires_in = data.get("expiresAt"), data.get("expiresIn")
+        if isinstance(expires_ms, (int, float)):
+            expires_at = float(expires_ms) / 1000.0
+        elif isinstance(expires_in, (int, float)):
+            expires_at = time.time() + float(expires_in)
+        else:
+            expires_at = time.time() + 60.0  # unknown: treat as nearly spent so it is re-minted soon
+        scopes = data.get("scopes")
+        return Credential(token=data["token"], via=via, expires_at=expires_at,
+                          scopes=tuple(str(s) for s in scopes) if isinstance(scopes, list) else None, session=True)
+    code, message = _error_body(payload)
+    if status == 401:
+        if via == VIA_SIGN_IN:
+            raise NotSignedIn(_not_signed_in_message(
+                "slop.cc no longer accepts this Hermes sign-in (revoked or expired)."))
+        raise CredentialError("slop.cc refused the personal token (invalid, revoked or expired). "
+                              "Make a new one at slop.cc/account.", "invalid_token")
+    text = _REFUSALS.get(code) or message or f"SLOPCANNON could not start an agent session (HTTP {status})."
+    raise CredentialError(text, (code or f"http_{status}").lower())
+
+
+def _session_body(ttl_s: int, name: str) -> dict[str, Any]:
+    # scopes omitted: the session gets the parent's scopes minus billing:purchase.
+    return {"name": name[:60], "ttlSeconds": max(60, min(DRIVER_TTL_S, int(ttl_s)))}
+
+
+def _auth_error_message(code: str, exc: BaseException) -> str:
+    if code == "oauth_client_id_missing":
+        return (f"{CLIENT_ID_ENV} is not set. Set it to slop.cc's public client id `{PUBLIC_CLIENT_ID}` "
+                f"(`{CLIENT_ID_COMMAND}`), then run `{SIGN_IN_COMMAND}` in a terminal.")
+    if code in ("invalid_client", "unauthorized_client"):
+        return (f"slop.cc rejected the OAuth client. Check that {CLIENT_ID_ENV} is `{PUBLIC_CLIENT_ID}`, "
+                f"then run `{SIGN_IN_COMMAND}` again in a terminal.")
+    if code == "invalid_scope":
+        return f"slop.cc rejected the requested scopes; run `{SIGN_IN_COMMAND}` again in a terminal."
+    return f"The SLOPCANNON sign-in could not be used ({code}): {exc}"
+
+
+def _mint_with_sign_in(ttl_s: int, name: str) -> Credential:
+    """Ask Hermes to mint a session with the person's grant; the grant never reaches this code."""
+    try:
+        from hermes_cli.plugin_provider_requests import ProviderNotSignedIn, credentialed_provider_request
     except ImportError:
-        pass  # an older Hermes, or tests
-    value = os.environ.get(settings.TOKEN_ENV, "").strip()
-    if value:
-        return value
+        raise NotSignedIn(_not_signed_in_message(
+            "This Hermes has no plugin sign-in (update Hermes).")) from None
     try:
-        from hermes_cli.config import get_env_value
-
-        value = (get_env_value(settings.TOKEN_ENV) or "").strip()
-    except Exception:
-        value = ""
-    return value or None
-
-
-def save_token(token: str) -> None:
-    token = token.strip()
-    if not token:
-        raise LoginError("refusing to store an empty token")
+        from hermes_cli.auth_constants import AuthError
+    except ImportError:  # pragma: no cover - present wherever the helper is
+        AuthError = None  # type: ignore[assignment,misc]
     try:
-        from hermes_cli import config as hermes_config
-
-        saver = getattr(hermes_config, "save_env_value_secure", None) or hermes_config.save_env_value
-        saver(settings.TOKEN_ENV, token)
-    except ImportError:
-        pass  # outside Hermes (tests): the process environment is the store
-    os.environ[settings.TOKEN_ENV] = token
-
-
-def clear_token() -> None:
-    os.environ.pop(settings.TOKEN_ENV, None)
+        response = credentialed_provider_request(
+            OAUTH_ID, "POST", SESSIONS_URL, json=_session_body(ttl_s, name), timeout=_MINT_TIMEOUT_S)
+    except ProviderNotSignedIn as exc:
+        raise NotSignedIn(_not_signed_in_message(str(exc))) from None
+    except PermissionError as exc:
+        raise CredentialError(f"Hermes refused the SLOPCANNON sign-in request: {exc}", "sign_in_refused") from None
+    except httpx.HTTPError as exc:
+        raise CredentialError(f"Could not reach SLOPCANNON ({type(exc).__name__}).", "network") from None
+    except Exception as exc:
+        if AuthError is not None and isinstance(exc, AuthError):
+            code = str(getattr(exc, "code", "") or "oauth_error")
+            raise CredentialError(_auth_error_message(code, exc), code) from None
+        # Anything else is Hermes's helper failing, not a refusal: say so, never with a traceback.
+        raise CredentialError(f"Hermes could not make the signed-in request ({type(exc).__name__}).",
+                              "sign_in_unavailable") from None
     try:
-        from hermes_cli.config import remove_env_value
+        payload = response.json()
+    except ValueError:
+        payload = None
+    return _session_from(response.status, payload, via=VIA_SIGN_IN)
 
-        remove_env_value(settings.TOKEN_ENV)
-    except Exception:
+
+def _mint_with_personal(token: str, ttl_s: int, name: str) -> Credential:
+    """A session whose parent is the personal token (for the driver child process)."""
+    try:
+        with httpx.Client(timeout=_MINT_TIMEOUT_S, follow_redirects=False,
+                          headers={"User-Agent": settings.USER_AGENT}) as http:
+            response = http.post(SESSIONS_URL, json=_session_body(ttl_s, name),
+                                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    except httpx.HTTPError as exc:
+        raise CredentialError(f"Could not reach SLOPCANNON ({type(exc).__name__}).", "network") from None
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    return _session_from(response.status_code, payload, via=VIA_PERSONAL)
+
+
+# --------------------------------------------------------------------------- resolution
+
+
+def credential(*, fresh: bool = False) -> Credential:
+    """The bearer for in-process API calls: a cached sign-in session, else the personal token.
+
+    Raises NotSignedIn when neither exists, and CredentialError when the sign-in exists but
+    cannot be used and there is no personal token to fall back on.
+    """
+    global _cached
+    with _lock:  # one mint at a time: the server limits sessions per hour
+        problem: Optional[RuntimeError] = None
+        if _hosted():
+            cached = _cached
+            if cached is not None and not fresh and cached.remaining() > _remint_margin():
+                return cached
+            try:
+                _cached = _mint_with_sign_in(_session_ttl_s, SESSION_NAME)
+                return _cached
+            except (NotSignedIn, CredentialError) as exc:
+                _cached = None
+                problem = exc
+        personal = _personal_token()
+        if personal:
+            return Credential(token=personal, via=VIA_PERSONAL)
+        if problem is not None:
+            raise problem
+        raise NotSignedIn(
+            f"SLOPCANNON is not connected. The API origin {settings.api_origin()} takes a personal token only: "
+            "enter a token from that service as the plugin's Agent token setting. Never paste a token into chat.")
+
+
+def get_token() -> str:
+    return credential().token
+
+
+def invalidate(token: str) -> bool:
+    """Forget the cached session if *token* is it (the API answered 401); True when a retry can help."""
+    global _cached
+    with _lock:
+        if _cached is not None and _cached.token == token:
+            _cached = None
+            return True
+    return False
+
+
+def reset() -> None:
+    """Drop the in-memory session (nothing is stored anywhere else)."""
+    global _cached
+    with _lock:
+        _cached = None
+
+
+def driver_token(production_id: str) -> Credential:
+    """A dedicated long session for a production driver child, never the in-process one."""
+    name = f"Hermes - SLOPCANNON production {production_id}"
+    problem: Optional[RuntimeError] = None
+    if _hosted():
         try:
-            from hermes_cli.config import save_env_value
-
-            save_env_value(settings.TOKEN_ENV, "")
-        except Exception:
-            pass
-    settings.state_set("session", None)
+            return _mint_with_sign_in(DRIVER_TTL_S, name)
+        except (NotSignedIn, CredentialError) as exc:
+            problem = exc
+    personal = _personal_token()
+    if personal:
+        if _hosted():
+            try:
+                return _mint_with_personal(personal, DRIVER_TTL_S, name)
+            except CredentialError:
+                pass  # sessions unavailable or rate limited: the personal token itself, as before
+        return Credential(token=personal, via=VIA_PERSONAL)
+    if problem is not None:
+        raise problem
+    raise NotSignedIn(_not_signed_in_message())
 
 
 def token_summary() -> dict[str, Any]:
-    token = get_token()
-    session = settings.state_get("session") or {}
-    return {
-        "connected": bool(token),
-        "token_prefix": (token[:13] + "...") if token else None,
-        "expires_at": session.get("expires_at"),
-        "scopes": session.get("scope"),
-        "via": session.get("via") or ("environment" if token else None),
-    }
+    """What the status surfaces show: how the plugin is connected, never a token or any part of one."""
+    base: dict[str, Any] = {"connected": False, "via": None, "expires_at": None, "scopes": None,
+                            "session": False, "sign_in": SIGN_IN_COMMAND, "message": None, "error": None}
+    try:
+        cred = credential()
+    except NotSignedIn as exc:
+        return {**base, "message": str(exc)}
+    except CredentialError as exc:
+        return {**base, "message": str(exc), "error": exc.code}
+    return {**base, "connected": True, "via": cred.via,
+            "expires_at": int(cred.expires_at) if cred.expires_at is not None else None,
+            "scopes": list(cred.scopes) if cred.scopes is not None else None, "session": cred.session}
 
 
-# --------------------------------------------------------------------------- OAuth
-
-
-def _b64url(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _pkce_pair() -> tuple[str, str]:
-    verifier = _b64url(secrets.token_bytes(48))  # 64 chars of [A-Za-z0-9_-]
-    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-    return verifier, challenge
-
-
-def _discover(auth_origin: str, http: httpx.Client) -> dict[str, Any]:
-    response = http.get(f"{auth_origin}/.well-known/oauth-authorization-server")
-    response.raise_for_status()
-    meta = response.json()
-    if settings.validated_origin(meta.get("issuer")) != auth_origin:
-        raise LoginError(f"authorization server issuer {meta.get('issuer')!r} does not match {auth_origin}")
-    for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint"):
-        endpoint = meta.get(key) or ""
-        if urlsplit(endpoint).scheme + "://" + urlsplit(endpoint).netloc != auth_origin:
-            raise LoginError(f"{key} {endpoint!r} is not on {auth_origin}")
-    if "S256" not in (meta.get("code_challenge_methods_supported") or []):
-        raise LoginError("authorization server does not offer PKCE S256")
-    return meta
-
-
-def _reserve_port(preferred: Optional[int]) -> socket.socket:
-    for port in ([preferred] if preferred else []) + [0]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind(("127.0.0.1", port))
-            return sock
-        except OSError:
-            sock.close()
-    raise LoginError("could not bind a loopback port for the sign-in callback")
-
-
-def _register_client(meta: dict[str, Any], redirect_uri: str, http: httpx.Client) -> str:
-    response = http.post(
-        meta["registration_endpoint"],
-        json={
-            "client_name": CLIENT_NAME,
-            "redirect_uris": [redirect_uri],
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "none",
-        },
-    )
-    if response.status_code >= 400:
-        raise LoginError(f"client registration refused: HTTP {response.status_code} {response.text[:300]}")
-    client_id = response.json().get("client_id")
-    if not client_id:
-        raise LoginError("client registration returned no client_id")
-    return str(client_id)
-
-
-class _CallbackServer(http.server.HTTPServer):
-    result: dict[str, str]
-
-
-class _CallbackHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 (stdlib API)
-        parts = urlsplit(self.path)
-        if parts.path != _CALLBACK_PATH:
-            self.send_response(404)
-            self.end_headers()
-            return
-        query = {k: v[0] for k, v in parse_qs(parts.query).items()}
-        self.server.result.update(query)  # type: ignore[attr-defined]
-        ok = "code" in query
-        body = (
-            "<html><body style='font-family:sans-serif;padding:2em'>"
-            + ("<h2>SLOPCANNON is connected to Hermes.</h2><p>You can close this tab.</p>" if ok
-               else "<h2>Sign-in did not complete.</h2><p>Return to Hermes for details.</p>")
-            + "</body></html>"
-        ).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - silence stdlib access log
-        return
-
-
-def login(
-    *,
-    open_browser: bool = True,
-    timeout_s: int = _LOGIN_TIMEOUT_S,
-    say: Callable[[str], None] = print,
-) -> dict[str, Any]:
-    """Run the browser sign-in and store the token. Returns a token summary."""
-    auth_origin = settings.auth_origin()
-    resource = settings.mcp_resource()
-    with httpx.Client(timeout=20.0, follow_redirects=False, headers={"User-Agent": settings.USER_AGENT}) as http:
-        meta = _discover(auth_origin, http)
-
-        cached = settings.state_get("oauth_client") or {}
-        cached_port = None
-        if cached.get("auth_origin") == auth_origin and cached.get("client_id"):
-            cached_port = urlsplit(cached.get("redirect_uri", "")).port
-        sock = _reserve_port(cached_port)
-        port = sock.getsockname()[1]
-        redirect_uri = f"http://127.0.0.1:{port}{_CALLBACK_PATH}"
-        if cached_port == port:
-            client_id = cached["client_id"]
-        else:
-            client_id = _register_client(meta, redirect_uri, http)
-            settings.state_set("oauth_client", {
-                "auth_origin": auth_origin, "client_id": client_id, "redirect_uri": redirect_uri,
-            })
-
-        verifier, challenge = _pkce_pair()
-        state = _b64url(secrets.token_bytes(24))
-        authorize_url = meta["authorization_endpoint"] + "?" + urlencode({
-            "response_type": "code",
-            "client_id": client_id,
-            "redirect_uri": redirect_uri,
-            "state": state,
-            "code_challenge": challenge,
-            "code_challenge_method": "S256",
-            "scope": DEFAULT_SCOPES,
-            "resource": resource,
-        })
-
-        server = _CallbackServer(("127.0.0.1", port), _CallbackHandler, bind_and_activate=False)
-        server.socket.close()
-        server.socket = sock
-        server.server_activate()
-        server.result = {}
-        server.timeout = 1.0
-        thread = threading.Thread(target=lambda: _serve_until_result(server, timeout_s), daemon=True)
-        thread.start()
-
-        say("Opening slop.cc to connect SLOPCANNON to Hermes. If no browser opens, visit:\n" + authorize_url)
-        if open_browser:
-            try:
-                webbrowser.open(authorize_url)
-            except Exception:
-                pass
-        thread.join(timeout_s + 5)
-        server.server_close()
-
-        result = dict(server.result)
-        if not result:
-            raise LoginError("sign-in timed out; run the login again")
-        if result.get("error"):
-            raise LoginError(f"sign-in refused: {result.get('error')}: {result.get('error_description', '')}")
-        if not secrets.compare_digest(result.get("state", ""), state):
-            raise LoginError("sign-in state mismatch; the callback was not for this request")
-
-        response = http.post(meta["token_endpoint"], data={
-            "grant_type": "authorization_code",
-            "code": result.get("code", ""),
-            "redirect_uri": redirect_uri,
-            "client_id": client_id,
-            "code_verifier": verifier,
-            "resource": resource,
-        })
-        if response.status_code >= 400:
-            raise LoginError(f"token exchange refused: HTTP {response.status_code} {response.text[:300]}")
-        payload = response.json()
-        token = payload.get("access_token")
-        if not token:
-            raise LoginError("token exchange returned no access_token")
-
-    save_token(token)
-    expires_in = payload.get("expires_in")
-    settings.state_set("session", {
-        "via": "oauth",
-        "scope": payload.get("scope"),
-        "expires_at": int(time.time()) + int(expires_in) if isinstance(expires_in, (int, float)) else None,
-    })
-    return token_summary()
-
-
-def _serve_until_result(server: _CallbackServer, timeout_s: int) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline and "code" not in server.result and "error" not in server.result:
-        server.handle_request()
-
-
-def store_pasted_token(token: str) -> dict[str, Any]:
-    """Store a token minted at slop.cc/account (headless seats)."""
-    token = token.strip()
-    if not token.startswith("slop_"):
-        raise LoginError("that does not look like a SLOPCANNON token (expected slop_...)")
-    save_token(token)
-    settings.state_set("session", {"via": "pasted", "scope": None, "expires_at": None})
-    return token_summary()
+def sign_in_help() -> list[tuple[str, str]]:
+    """(label, text) rows explaining how to connect; shared by /slop and the CLI."""
+    return [
+        ("sign-in", f"run `{SIGN_IN_COMMAND}` in a terminal on the Hermes machine"),
+        ("why", "it opens your browser, so it cannot start inside a chat or the gateway"),
+        ("once", f"first set the client id: `{CLIENT_ID_COMMAND}`"),
+        ("or", "enter a slop.cc/account token as the plugin's Agent token setting"),
+        ("never", "paste a token into chat"),
+    ]

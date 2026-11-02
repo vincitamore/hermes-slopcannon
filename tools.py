@@ -99,7 +99,7 @@ def _account(args: dict[str, Any]) -> str:
         except SlopcannonError as exc:
             out["balance"] = exc.to_dict()
     else:
-        out["next"] = NotConnected().args[0]
+        out["next"] = summary.get("message") or NotConnected().args[0]
     return _ok(**out)
 
 
@@ -108,8 +108,8 @@ ACCOUNT = ToolSpec("slopcannon_account", {
     "description": (
         "SLOPCANNON (music videos from a song) connection state, Cannon Credit balance, service "
         "readiness, generation limits and the current rights statement and version. Call "
-        "slopcannon_account first. If not connected, tell the person to run /slop login; never ask "
-        "for a token in chat. Before producing anything, load skill_view('slopcannon:hermes-workflow')."),
+        "slopcannon_account first. If not connected, tell the person to run `hermes auth add slopcannon:slop` "
+        "in a terminal (or set a personal token in the plugin settings); never ask for a token in chat. Before producing anything, load skill_view('slopcannon:hermes-workflow')."),
     "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
 }, _guard(_account))
 

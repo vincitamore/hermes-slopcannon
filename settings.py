@@ -12,13 +12,11 @@ from typing import Any, Optional
 from urllib.parse import urlsplit
 
 DEFAULT_API_ORIGIN = "https://api.slop.cc"
-DEFAULT_AUTH_ORIGIN = "https://slop.cc"
 TOKEN_ENV = "SLOPCANNON_AGENT_TOKEN"
-USER_AGENT = "hermes-slopcannon/0.2.0"
+USER_AGENT = "hermes-slopcannon/0.3.0"
 
 _DEFAULTS: dict[str, Any] = {
     "api_origin": DEFAULT_API_ORIGIN,
-    "auth_origin": DEFAULT_AUTH_ORIGIN,
     "download_dir": "",
     "max_credits_per_action": 0,
     "auto_approve_max_credits": 0,
@@ -74,15 +72,6 @@ def validated_origin(raw: Optional[str]) -> str:
 
 def api_origin() -> str:
     return validated_origin(get("api_origin") or DEFAULT_API_ORIGIN)
-
-
-def auth_origin() -> str:
-    return validated_origin(get("auth_origin") or DEFAULT_AUTH_ORIGIN)
-
-
-def mcp_resource() -> str:
-    """The OAuth protected-resource identifier the token is minted for."""
-    return f"{api_origin()}/mcp"
 
 
 def download_dir() -> Path:

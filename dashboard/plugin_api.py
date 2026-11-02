@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-import threading
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -45,7 +44,6 @@ def _mod(name: str) -> Any:
 
 
 router = APIRouter()
-_login_lock = threading.Lock()
 
 
 @router.get("/status")
@@ -55,8 +53,9 @@ def status() -> dict[str, Any]:
     out: dict[str, Any] = {
         "connected": bool(summary.get("connected")), "via": summary.get("via"),
         "expiresAt": summary.get("expires_at"), "credits": None,
-        "service": {"status": None, "submissionReady": None}, "error": None,
-        "node": _mod("production").node_status(),
+        "service": {"status": None, "submissionReady": None},
+        "error": None if summary.get("connected") or not summary.get("error") else summary.get("message"),
+        "node": _mod("production").node_status(), "signIn": _sign_in(auth),
     }
     client = client_mod.Client()
     try:
@@ -107,27 +106,15 @@ def production_stop(production_id: str) -> dict[str, Any]:
 
 @router.post("/login")
 def login() -> dict[str, Any]:
-    """Start the browser sign-in on this machine (the one Hermes runs on)."""
+    """How to connect. Sign-in is Hermes's own and runs in a terminal; the plugin never starts one."""
     auth = _mod("auth")
-    if not _login_lock.acquire(blocking=False):
-        return {"started": False, "reason": "a sign-in is already waiting in your browser"}
+    return {"started": False, **_sign_in(auth)}
 
-    def run() -> None:
-        try:
-            auth.login(say=lambda _msg: None)
-        except Exception:
-            pass
-        finally:
-            _login_lock.release()
-            try:
-                from hermes_cli.plugin_events import broadcast_plugin_event
 
-                broadcast_plugin_event("slopcannon", "account.updated", {})
-            except Exception:
-                pass
-
-    threading.Thread(target=run, name="slopcannon-login", daemon=True).start()
-    return {"started": True}
+def _sign_in(auth: Any) -> dict[str, Any]:
+    return {"command": auth.SIGN_IN_COMMAND, "clientIdCommand": auth.CLIENT_ID_COMMAND,
+            "signOutCommand": auth.SIGN_OUT_COMMAND,
+            "alternative": "Or enter a slop.cc/account token as the plugin's Agent token setting."}
 
 
 @router.get("/media")

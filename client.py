@@ -16,7 +16,7 @@ import hashlib
 import json
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -45,11 +45,12 @@ class SlopcannonError(RuntimeError):
 
 
 class NotConnected(SlopcannonError):
-    def __init__(self) -> None:
+    def __init__(self, message: Optional[str] = None) -> None:
         super().__init__(
-            "SLOPCANNON is not connected. Ask the person to run `/slop login` (or "
-            "`hermes slopcannon login` in a terminal) and sign in at slop.cc; never ask them "
-            "to paste a token into chat.",
+            message or (
+                f"SLOPCANNON is not connected. Ask the person to run `{auth.SIGN_IN_COMMAND}` in a terminal "
+                "on the Hermes machine, or to enter a slop.cc/account token as the plugin's Agent token "
+                "setting; never ask them to paste a token into chat."),
             code="not_connected",
         )
 
@@ -84,13 +85,23 @@ class Client:
                             headers={"User-Agent": settings.USER_AGENT})
 
     def token(self) -> str:
-        token = self._token or auth.get_token()
-        if not token:
-            raise NotConnected()
-        return token
+        if self._token:
+            return self._token
+        try:
+            return auth.get_token()
+        except auth.NotSignedIn as exc:
+            raise NotConnected(str(exc)) from None
+        except auth.CredentialError as exc:
+            raise SlopcannonError(str(exc), code=exc.code) from None
 
-    def _auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.token()}"}
+    def _authed(self, send: Callable[[dict[str, str]], httpx.Response]) -> httpx.Response:
+        """``send`` with the bearer; a 401 on a cached session re-mints it and retries once."""
+        token = self.token()
+        response = send({"Authorization": f"Bearer {token}"})
+        if response.status_code == 401 and not self._token and auth.invalidate(token):
+            response.close()
+            response = send({"Authorization": f"Bearer {self.token()}"})
+        return response
 
     def _url(self, path: str) -> str:
         url = path if path.startswith(("http://", "https://")) else f"{self.origin}{path}"
@@ -112,9 +123,14 @@ class Client:
     # ----------------------------------------------------------------- REST
 
     def get_json(self, path: str, *, authenticated: bool = True) -> Any:
-        headers = {"Accept": "application/json", **(self._auth_headers() if authenticated else {})}
+        url = self._url(path)
         with self._http() as http:
-            response = self._check(http.get(self._url(path), headers=headers))
+            if authenticated:
+                response = self._authed(lambda auth_headers: http.get(
+                    url, headers={"Accept": "application/json", **auth_headers}))
+            else:
+                response = http.get(url, headers={"Accept": "application/json"})
+            response = self._check(response)
         payload = response.json()
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             return payload["data"]
@@ -135,7 +151,6 @@ class Client:
         data = path.read_bytes()
         query = urlencode({"projectId": project_id, "kind": kind, "filename": path.name})
         headers = {
-            **self._auth_headers(),
             "Content-Type": content_type,
             "Idempotency-Key": idempotency_key,
             "X-Slopcannon-Rights-Attestation": rights_version,
@@ -143,8 +158,10 @@ class Client:
         }
         if duration_ms:
             headers["X-Media-Duration-Ms"] = str(int(duration_ms))
+        url = self._url(f"/v1/assets?{query}")
         with self._http(_UPLOAD_TIMEOUT) as http:
-            response = self._check(http.post(self._url(f"/v1/assets?{query}"), headers=headers, content=data))
+            response = self._check(self._authed(
+                lambda auth_headers: http.post(url, headers={**headers, **auth_headers}, content=data)))
         return response.json()
 
     def download(self, url: str, dest: Path) -> dict[str, Any]:
@@ -153,21 +170,28 @@ class Client:
         if parts.scheme != "https" and not (parts.scheme == "http" and parts.hostname in {"127.0.0.1", "localhost"}):
             raise SlopcannonError("download URL is not HTTPS", code="insecure_url")
         own = f"{parts.scheme}://{parts.netloc}" == self.origin
-        headers = {"Accept": "video/mp4,application/octet-stream", **(self._auth_headers() if own else {})}
         dest.parent.mkdir(parents=True, exist_ok=True)
         partial = dest.with_suffix(dest.suffix + ".part")
-        digest = hashlib.sha256()
-        size = 0
-        with self._http(_DOWNLOAD_TIMEOUT) as http:
-            with http.stream("GET", url, headers=headers) as response:
-                if response.status_code >= 300:
-                    response.read()
-                    self._check(response)
-                with partial.open("wb") as handle:
-                    for chunk in response.iter_bytes(1 << 20):
-                        handle.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
+        for attempt in range(2):
+            token = self.token() if own else None
+            headers = {"Accept": "video/mp4,application/octet-stream",
+                       **({"Authorization": f"Bearer {token}"} if token else {})}
+            digest = hashlib.sha256()
+            size = 0
+            with self._http(_DOWNLOAD_TIMEOUT) as http:
+                with http.stream("GET", url, headers=headers) as response:
+                    if response.status_code == 401 and token and attempt == 0 and not self._token \
+                            and auth.invalidate(token):
+                        continue  # the session lapsed: re-mint once
+                    if response.status_code >= 300:
+                        response.read()
+                        self._check(response)
+                    with partial.open("wb") as handle:
+                        for chunk in response.iter_bytes(1 << 20):
+                            handle.write(chunk)
+                            digest.update(chunk)
+                            size += len(chunk)
+            break
         partial.replace(dest)
         return {"path": str(dest), "bytes": size, "sha256": digest.hexdigest()}
 
@@ -177,13 +201,14 @@ class Client:
             timeout: httpx.Timeout = _TIMEOUT) -> Any:
         body = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params or {}}
         headers = {
-            **self._auth_headers(),
             "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json",
             "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         }
+        url, content = self._url("/api/mcp"), json.dumps(body)
         with self._http(timeout) as http:
-            response = http.post(self._url("/api/mcp"), headers=headers, content=json.dumps(body))
+            response = self._authed(
+                lambda auth_headers: http.post(url, headers={**headers, **auth_headers}, content=content))
         if 300 <= response.status_code < 400:
             self._check(response)
         envelope = _parse_rpc(response)

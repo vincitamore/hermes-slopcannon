@@ -1,5 +1,5 @@
 name: slopcannon
-version: 0.2.0
+version: 0.3.0
 manifest_version: 2
 api_version: 1
 requires_hermes: ">=0.22.5"
@@ -76,20 +76,40 @@ provides_tools:
   - slopcannon_update_character
 provides_hooks:
   - pre_tool_call
+# Sign-in is Hermes's own (catalog rule 11): `hermes auth add slopcannon:slop` in a terminal. Hermes keeps
+# the grant; the plugin only asks Hermes to mint short-lived agent sessions with it.
+oauth:
+  - id: slop
+    authorize_url: https://slop.cc/oauth/authorize
+    token_url: https://slop.cc/api/oauth/token
+    scopes:
+      - projects:read
+      - projects:write
+      - assets:read
+      - assets:write
+      - quotes:create
+      - generations:create
+      - generations:read
+      - billing:read
+    client_id_env: SLOPCANNON_OAUTH_CLIENT_ID
+    hosts: [api.slop.cc]
+# optional_env, not requires_env: a missing value must not disable the plugin for people who use a
+# personal token instead of the Hermes sign-in.
+optional_env:
+  - name: SLOPCANNON_OAUTH_CLIENT_ID
+    description: "slop.cc's public OAuth client id for Hermes: set it to hermes-agent (`hermes config set SLOPCANNON_OAUTH_CLIENT_ID hermes-agent`), then run `hermes auth add slopcannon:slop`. Not a secret. Not needed with a personal Agent token."
+    url: "https://slop.cc/for-agents"
+    password: false
 config_schema:
   agent_token:
     type: secret
     env: SLOPCANNON_AGENT_TOKEN
     label: "Agent token"
-    description: "A SLOPCANNON agent token from slop.cc/account (Agent access). Not needed after signing in with /slop login."
+    description: "Optional: a personal SLOPCANNON token from slop.cc/account (Agent access). Not needed after `hermes auth add slopcannon:slop`; required when api_origin is not https://api.slop.cc."
   api_origin:
     type: str
     default: "https://api.slop.cc"
     description: "SLOPCANNON API origin (HTTPS, or loopback HTTP for local development)."
-  auth_origin:
-    type: str
-    default: "https://slop.cc"
-    description: "OAuth authorization server origin used by `hermes slopcannon login`."
   download_dir:
     type: str
     default: ""

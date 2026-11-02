@@ -20,7 +20,7 @@ The plugin registers every SLOPCANNON server tool under its own name (`slopcanno
 
 ## Rules that differ from other hosts
 
-- **Never handle a credential.** The plugin holds the token. If `slopcannon_account` says not connected, tell the person to run `/slop login` (desktop or terminal) and stop. Never ask for a token in chat and never put one in a file.
+- **Never handle a credential.** Hermes holds the sign-in and the plugin holds only short-lived sessions. If `slopcannon_account` says not connected, tell the person to run `hermes auth add slopcannon:slop` in a terminal on the Hermes machine (it cannot start from a chat), or to enter a slop.cc/account token as the plugin's Agent token setting, and stop. Never ask for a token in chat and never put one in a file.
 - **Uploads go from disk.** Use `slopcannon_upload`, not upload links, when the file is on this machine. Use `slopcannon_create_upload_link` only when the person has the file somewhere Hermes cannot read (their phone).
 - **Rights sign-off.** Present the statement from `slopcannon_account` verbatim with the exact files, wait for their explicit agreement, then pass `rights_version`. Hermes also shows an approval prompt for the upload; both are needed. One sign-off covers the session for that version (canonical skill, "Gather the production brief").
 - **Spend.** Quote with `slopcannon_create_quote`, tell the person the exact Cannon Credits, and on their go-ahead call `slopcannon_submit_generation` with `approval.amountUnits` equal to the quote. Hermes shows its own approval prompt with that figure; the server refuses any figure other than the quote. A refusal is final for that call: do not retry it with a different amount.
