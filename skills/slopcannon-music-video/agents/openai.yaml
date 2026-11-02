@@ -1,0 +1,4 @@
+interface:
+  display_name: "SLOPCANNON Music Video"
+  short_description: "Direct and generate complete AI music videos"
+  default_prompt: "Use $slopcannon-music-video to turn this song, cast, and concept into a finished music video."

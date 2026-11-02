@@ -1,0 +1,93 @@
+name: slopcannon
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: "SLOPCANNON inside Hermes: every SLOPCANNON tool (music videos, source-video remixes, the Ad Cannon, Character Lab, Slop TV) as native Hermes tools, plus uploads from disk, a human gate on every spend, and clips and finished films delivered as native video."
+author: SLOPCANNON
+kind: standalone
+homepage: https://slop.cc/for-agents
+tags: [video, music-video, video-gen, media, slopcannon]
+provides_tools:
+  - slopcannon_account
+  - slopcannon_upload
+  - slopcannon_wait
+  - slopcannon_download
+  - slopcannon_add_character_reference
+  - slopcannon_add_reference
+  - slopcannon_assembly_download_links
+  - slopcannon_audio_spot_options
+  - slopcannon_cancel_assembly
+  - slopcannon_cancel_generation
+  - slopcannon_cancel_source_video
+  - slopcannon_capabilities
+  - slopcannon_check_take
+  - slopcannon_create_ad_pitch
+  - slopcannon_create_audio_spot
+  - slopcannon_create_character
+  - slopcannon_create_project
+  - slopcannon_create_publish_link
+  - slopcannon_create_quote
+  - slopcannon_create_render_request
+  - slopcannon_create_upload_link
+  - slopcannon_delete_take
+  - slopcannon_direct_scenes
+  - slopcannon_edit_audio_spot_line
+  - slopcannon_edit_audio_spot_sound
+  - slopcannon_get_ad_pitch
+  - slopcannon_get_assembly
+  - slopcannon_get_audio_spot
+  - slopcannon_get_character
+  - slopcannon_get_generation
+  - slopcannon_get_generation_content
+  - slopcannon_get_project
+  - slopcannon_get_project_local_assembly
+  - slopcannon_get_publish_link
+  - slopcannon_get_render_request
+  - slopcannon_get_scene_audio
+  - slopcannon_get_song_analysis
+  - slopcannon_get_source_video
+  - slopcannon_get_upload_link
+  - slopcannon_get_workspace
+  - slopcannon_import_character
+  - slopcannon_list_audio_spots
+  - slopcannon_list_characters
+  - slopcannon_list_generations
+  - slopcannon_list_publishable_films
+  - slopcannon_load_audio_spot
+  - slopcannon_plan_cuts
+  - slopcannon_prepare_source_video
+  - slopcannon_publish_character
+  - slopcannon_recover_generation
+  - slopcannon_remove_reference
+  - slopcannon_report_local_assembly
+  - slopcannon_save_workspace
+  - slopcannon_select_take
+  - slopcannon_slice_scene_audio
+  - slopcannon_start_assembly
+  - slopcannon_start_song_analysis
+  - slopcannon_submit_generation
+  - slopcannon_unpublish_character
+  - slopcannon_update_character
+provides_hooks:
+  - pre_tool_call
+config_schema:
+  api_origin:
+    type: str
+    default: "https://api.slop.cc"
+    description: "SLOPCANNON API origin (HTTPS, or loopback HTTP for local development)."
+  auth_origin:
+    type: str
+    default: "https://slop.cc"
+    description: "OAuth authorization server origin used by `hermes slopcannon login`."
+  download_dir:
+    type: str
+    default: ""
+    description: "Where clips and masters are saved. Empty means <hermes home>/cache/videos/slopcannon."
+  max_credits_per_action:
+    type: int
+    default: 0
+    description: "Hard ceiling in Cannon Credits for any one spending call; above it the call is blocked before the approval prompt. 0 means no ceiling."
+  auto_approve_max_credits:
+    type: int
+    default: 0
+    description: "When approvals are bypassed (YOLO / approvals.mode off), spending calls at or under this many credits proceed; anything larger is blocked. 0 blocks every unattended spend."
