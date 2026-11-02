@@ -500,6 +500,16 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _assembly(ledger: dict[str, Any]) -> dict[str, Any] | None:
+    """The server assembly the driver has submitted, once there is one: the studio's Assembly step reads it."""
+    entry = ledger.get("serverAssembly")
+    if not isinstance(entry, dict) or not entry.get("id"):
+        return None
+    receipt = entry.get("trackingReceipt") or {}
+    return {"id": entry["id"], "status": entry.get("lastStatus") or receipt.get("state"),
+            "acceptedAt": receipt.get("acceptedAt")}
+
+
 def _committed_credits(ledger: dict[str, Any]) -> int:
     """Credits already bound to submitted attempts, counted the way the driver's ceiling counts them."""
     total = 0
@@ -546,6 +556,7 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
                   "committedCredits": committed},
         "master": state.get("master"),
         "sessionId": state.get("sessionId"),
+        "assembly": _assembly(ledger),
     }
     if detail:
         out.update(needsDetail=state.get("needsDetail") if state.get("state") == "needs" else None,

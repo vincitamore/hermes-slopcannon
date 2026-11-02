@@ -272,6 +272,7 @@ function normProduction(raw) {
     rows,
     spend: { approvedCredits: int(spend.approvedCredits), committedCredits: int(spend.committedCredits) },
     master: normClip(o.master),
+    assembly: o.assembly && typeof o.assembly === 'object' && str(o.assembly.id) ? { id: str(o.assembly.id), status: str(o.assembly.status) } : null,
     needsDetail: isObj(o.needsDetail) ? o.needsDetail : null,
     log: arr(o.log).filter(l => typeof l === 'string')
   }
@@ -510,6 +511,9 @@ function phaseOf(p) {
   if (!total) return 'rights'
   if (!downloaded) return p.spend.approvedCredits !== null ? 'first' : 'approve'
   if (downloaded < total) return 'render'
+  // Once the driver has submitted the server assembly, checks are behind it: a scene the server never
+  // checked keeps no verdict for good, so its missing verdict must not hold the stepper on Checks.
+  if (p.assembly) return 'assembly'
   if (Array.isArray(p.rows) && p.rows.some(r => r.clip && (!r.check || r.check.verdict === 'unchecked'))) return 'checks'
   return 'assembly'
 }
