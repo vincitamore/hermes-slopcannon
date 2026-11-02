@@ -427,30 +427,65 @@ const MCP_TOOL_TIMEOUT_MS = {
   slopcannon_edit_audio_spot_sound: 180_000,
 };
 
+/**
+ * A tool call that got no reply the CLI could read: a timeout, a network failure, or a page that is not the MCP's JSON
+ * (a gateway's 502). The server never refused the call, so it carries a code saying which and is retryable (unless a
+ * 4xx page answered it): a character check stores both in the scene's `shotCheckError`, and `run`'s message says to
+ * ask again.
+ */
+export function mcpTransportError(tool, error, status = null) {
+  const timeout = error?.name === "TimeoutError" || error?.name === "AbortError";
+  const code = timeout ? "mcp_timeout" : status !== null ? `mcp_http_${status}` : "mcp_unreachable";
+  const retryable = status === null || status < 400 || status >= 500 || status === 408 || status === 429;
+  const what = timeout ? "timed out" : status !== null ? `answered HTTP ${status} without a readable reply` : `could not be reached (${error?.message ?? String(error)})`;
+  const failure = new Error(`MCP ${tool}: ${what}.`, { cause: error ?? undefined });
+  // a timeout keeps its name: the generation pollers retry a TimeoutError
+  if (timeout) failure.name = "TimeoutError";
+  return Object.assign(failure, { code, retryable });
+}
+
 export async function mcpCall(ledger, tool, params) {
   const url = endpoint(ledger, "mcp", "/api/mcp");
-  const response = await fetch(url, {
-    method: "POST",
-    redirect: "manual",
-    signal: AbortSignal.timeout(MCP_TOOL_TIMEOUT_MS[tool] ?? 30_000),
-    headers: {
-      Authorization: `Bearer ${token(url)}`,
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-    },
-    body: JSON.stringify({ jsonrpc: "2.0", id: rpcId++, method: "tools/call", params: { name: tool, arguments: params } }),
-  });
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      redirect: "manual",
+      signal: AbortSignal.timeout(MCP_TOOL_TIMEOUT_MS[tool] ?? 30_000),
+      headers: {
+        Authorization: `Bearer ${token(url)}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: rpcId++, method: "tools/call", params: { name: tool, arguments: params } }),
+    });
+  } catch (error) {
+    throw mcpTransportError(tool, error);
+  }
   if (response.status >= 300 && response.status < 400) {
     throw new Error("Unexpected MCP redirect; the account token was not forwarded.");
   }
-  const text = await response.text();
-  let body;
-  if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) {
-    body = JSON.parse(text.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join(""));
-  } else {
-    body = JSON.parse(text);
+  let text;
+  try {
+    text = await response.text();
+  } catch (error) {
+    throw mcpTransportError(tool, error);
   }
-  if (body.error) throw new Error(`MCP ${tool}: rpc error ${body.error.code} ${body.error.message}`);
+  let body;
+  try {
+    if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      body = JSON.parse(text.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join(""));
+    } else {
+      body = JSON.parse(text);
+    }
+  } catch {
+    throw mcpTransportError(tool, null, response.status);
+  }
+  if (!body || typeof body !== "object") throw mcpTransportError(tool, null, response.status);
+  if (body.error) {
+    // -32603 is the server's own internal error, which may pass on a later try; the others are the call's
+    throw Object.assign(new Error(`MCP ${tool}: rpc error ${body.error.code} ${body.error.message}`), { code: "mcp_rpc_error", retryable: body.error.code === -32603 });
+  }
   const result = body.result;
   if (result?.isError) {
     const error = result.structuredContent?.error ?? {};
