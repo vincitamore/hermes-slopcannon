@@ -216,6 +216,13 @@ def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str,
     return current
 
 
+def remember_session(production_id: str, session_id: str) -> None:
+    state = load_state(production_id)
+    if state is not None and state.get("sessionId") != session_id:
+        state["sessionId"] = session_id
+        _save_state(production_id, state)
+
+
 def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> list[str]:
     args = ["run", "--production", str(folder / "production.json"), "--ledger", str(folder / "ledger.json"),
             "--concurrency", str(max(1, min(16, concurrency)))]
@@ -538,6 +545,7 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
         "spend": {"approvedCredits": (state.get("decisions") or {}).get("approved_credits"),
                   "committedCredits": committed},
         "master": state.get("master"),
+        "sessionId": state.get("sessionId"),
     }
     if detail:
         out.update(needsDetail=state.get("needsDetail") if state.get("state") == "needs" else None,

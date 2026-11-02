@@ -16,7 +16,17 @@ from typing import Any
 
 from . import production
 from .client import Client, SlopcannonError
-from .tools import _CONTENT_TYPES, ToolSpec, _guard
+from .tools import _CONTENT_TYPES, ToolSpec, _fail
+
+
+def _guard(fn):
+    """Like tools._guard, but hands the chat's session_id on so the studio can answer in that chat."""
+    def handler(args: dict[str, Any], session_id: str = "", **_: Any) -> str:
+        try:
+            return fn(args or {}, session_id=str(session_id or ""))
+        except Exception as exc:  # every failure is a structured result, never a crash
+            return _fail(exc)
+    return handler
 
 _DEFAULT_WAIT_S = 240
 _MAX_WAIT_S = 840
@@ -61,7 +71,7 @@ def _result(info: dict[str, Any]) -> str:
     return json.dumps(out, default=str)
 
 
-def _produce(args: dict[str, Any]) -> str:
+def _produce(args: dict[str, Any], session_id: str = "") -> str:
     spec = args.get("production")
     pid = str(args.get("production_id") or "")
     if not pid:
@@ -80,6 +90,8 @@ def _produce(args: dict[str, Any]) -> str:
     }
     if any(v not in (None, "", []) for v in decisions.values()):
         production.record_decisions(pid, decisions)
+    if session_id:
+        production.remember_session(pid, session_id)
     production.start(pid, concurrency=int(args.get("concurrency") or 4))
     raw_wait = args.get("wait_s")
     wait_s = min(max(_DEFAULT_WAIT_S if raw_wait is None else int(raw_wait), 0), _MAX_WAIT_S)
@@ -87,7 +99,7 @@ def _produce(args: dict[str, Any]) -> str:
     return _result(production.summary(pid, detail=True))
 
 
-def _status(args: dict[str, Any]) -> str:
+def _status(args: dict[str, Any], session_id: str = "") -> str:
     pid = args.get("production_id")
     if not pid:
         return json.dumps({"ok": True, "productions": [production.summary(i) for i in production.list_ids()[:20]]},
@@ -99,7 +111,7 @@ def _status(args: dict[str, Any]) -> str:
     return _result(production.summary(pid, detail=True))
 
 
-def _stop(args: dict[str, Any]) -> str:
+def _stop(args: dict[str, Any], session_id: str = "") -> str:
     pid = str(args.get("production_id") or "")
     stopped = production.stop(pid)
     return json.dumps({"ok": True, "stopped": stopped, "note": (
@@ -223,7 +235,7 @@ def whisper_json(words: list[dict[str, Any]]) -> dict[str, Any]:
     return {"segments": segments}
 
 
-def _transcribe(args: dict[str, Any]) -> str:
+def _transcribe(args: dict[str, Any], session_id: str = "") -> str:
     song = Path(str(args.get("song") or "")).expanduser()
     if not song.is_file():
         raise SlopcannonError(f"no file at {song}", code="file_not_found")
