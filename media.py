@@ -49,6 +49,8 @@ STRIP_H = 135
 WAVE_BUCKETS = 480
 FILM_CANDIDATES = 15
 EDGE_MARGIN = 0.05
+CLIP_CANDIDATES = 5
+CLIP_MARGIN = 0.1
 SCORE_W, SCORE_H = 160, 90
 WORKERS = 2
 RETRY_S = 600
@@ -101,6 +103,14 @@ def source_key(path: Path, kind: str) -> str:
     st = path.stat()
     ident = f"{VERSION}|{kind}|{os.path.normcase(str(path.resolve()))}|{st.st_size}|{st.st_mtime_ns}"
     return hashlib.sha1(ident.encode("utf-8")).hexdigest()[:24]
+
+
+def artefact_key(path: Path, kind: str, at_ms: Optional[int] = None) -> str:
+    """The cache key of one source's artefacts. A picture's key carries POSTER_VERSION (a better poster
+    heuristic re-picks old posters) and, for a film, the poster time the person chose."""
+    if kind == "wave":
+        return source_key(path, kind)
+    return source_key(path, f"{kind}@{at_ms}" if at_ms is not None else f"{kind}.v{POSTER_VERSION}")
 
 
 def _media_file(value: Any, exts: set[str]) -> Optional[Path]:
@@ -258,18 +268,18 @@ def frame_score(rgb: bytes, w: int = SCORE_W) -> float:
     return f["appeal"] * max(0.05, 1.0 - f["ui"]) * (0.5 + 0.5 * f["tonal"])
 
 
-def candidate_times(dur: float) -> list[float]:
-    """FILM_CANDIDATES evenly spaced timestamps, leaving out the first and last EDGE_MARGIN of the film
-    (title cards and end slates live there)."""
-    lo, span = dur * EDGE_MARGIN, dur * (1 - 2 * EDGE_MARGIN)
-    return [lo + span * (i + 0.5) / FILM_CANDIDATES for i in range(FILM_CANDIDATES)]
+def candidate_times(dur: float, count: int = FILM_CANDIDATES, margin: float = EDGE_MARGIN) -> list[float]:
+    """``count`` evenly spaced timestamps, leaving out the first and last ``margin`` of the film (title
+    cards and end slates live there; a take's first and last frames are often a fade)."""
+    lo, span = dur * margin, dur * (1 - 2 * margin)
+    return [lo + span * (i + 0.5) / count for i in range(count)]
 
 
-def best_frame_time(path: Path, dur: float) -> float:
-    """The candidate timestamp whose frame scores highest; the middle of the film if none decodes."""
+def best_frame_time(path: Path, dur: float, count: int = FILM_CANDIDATES, margin: float = EDGE_MARGIN) -> float:
+    """The candidate timestamp whose frame scores highest; the middle if none decodes."""
     ffmpeg = _ffmpeg()
     best_t, best = dur / 2, -1.0
-    for t in candidate_times(dur):
+    for t in candidate_times(dur, count, margin):
         try:
             raw = _run([ffmpeg, "-v", "error", "-nostdin", "-ss", f"{t:.3f}", "-i", str(path), "-frames:v", "1",
                         "-vf", f"scale={SCORE_W}:{SCORE_H}:flags=area,format=rgb24", "-f", "rawvideo", "-"],
@@ -322,10 +332,12 @@ def _make(kind: str, src: Path, key: str, at_ms: Optional[int] = None) -> None:
     root = cache_dir()
     dur = duration_s(src)
     if kind == "clip":
-        _atomic(root / f"{key}-poster.jpg", lambda t: _frame(src, dur / 2, t, POSTER_W))
-        _atomic(root / f"{key}-thumb.jpg", lambda t: _frame(src, dur / 2, t, THUMB_W, 5))
+        at = best_frame_time(src, dur, CLIP_CANDIDATES, CLIP_MARGIN)  # a take that opens on black still shows
+        _atomic(root / f"{key}-poster.jpg", lambda t: _frame(src, at, t, POSTER_W))
+        _atomic(root / f"{key}-thumb.jpg", lambda t: _frame(src, at, t, THUMB_W, 5))
         _atomic(root / f"{key}-strip.jpg", lambda t: _strip(src, dur, t))
-        _write_json(root / f"{key}.json", {"durationMs": int(dur * 1000), "frames": STRIP_FRAMES})
+        _write_json(root / f"{key}.json", {"durationMs": int(dur * 1000), "frames": STRIP_FRAMES,
+                                           "posterAtMs": int(at * 1000)})
     elif kind == "film":
         chosen = at_ms is not None
         at = min(max(0.0, at_ms / 1000), max(0.0, dur - 0.05)) if chosen else best_frame_time(src, dur)
@@ -376,7 +388,7 @@ def artefact(src: Optional[Path], kind: str, *, schedule: bool = True, at_ms: Op
     if kind != "film":
         at_ms = None
     try:
-        key = source_key(src, kind if kind != "film" else f"film@{at_ms}" if at_ms is not None else f"film.v{POSTER_VERSION}")
+        key = artefact_key(src, kind, at_ms)
     except OSError:
         return {"state": "missing"}
     root = cache_dir()

@@ -142,7 +142,7 @@ class NoFfmpegTest(MediaTestBase):
         clip = self.base / "c.mp4"
         clip.write_bytes(b"not really a video")
         with mock.patch.object(media, "available", lambda: True):
-            key = media.source_key(clip.resolve(), "clip")
+            key = media.artefact_key(clip.resolve(), "clip")
             (media.cache_dir() / f"{key}.err").write_text("boom", encoding="utf-8")
             self.assertEqual(media.artefact(clip.resolve(), "clip")["state"], "error")
 
@@ -246,6 +246,15 @@ class FfmpegTest(MediaTestBase):
     def test_poster_prefers_a_picture_to_an_interface(self):
         film = _lavfi(self.base / "film.mp4", UI_THEN_PICTURE, "-pix_fmt", "yuv420p").resolve()
         self.assertGreater(media.best_frame_time(film, media.duration_s(film)), 2.0)
+
+    def test_a_scene_poster_skips_a_black_opening(self):
+        clip = _lavfi(self.base / "clip.mp4",
+                      "color=c=black:s=160x90:d=3:r=10[a];testsrc=s=160x90:d=3:r=10[b];[a][b]concat=n=2:v=1",
+                      "-pix_fmt", "yuv420p").resolve()
+        self.make_production("p1", clips={"sc01": clip})
+        scene = self.settle("p1")["scenes"]["sc01"]
+        self.assertEqual(scene["state"], "ready", scene)
+        self.assertGreater(scene["posterAtMs"], 3000)
 
     def test_a_chosen_poster_persists_and_automatic_comes_back(self):
         film = _lavfi(self.base / "film.mp4", UI_THEN_PICTURE, "-pix_fmt", "yuv420p").resolve()
