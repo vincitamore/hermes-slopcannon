@@ -887,6 +887,10 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual([p["id"] for p in listed["productions"]], [pid])
 
         # A reroll runs inside the production: asked for, quoted, approved in a prompt, then cut into the film.
+        state = production.load_state(pid)
+        production._save_state(pid, {**state, "state": "error", "message": "fetch failed"})
+        self.assertIsNone(production.reroll_problem(pid, "sc01"))  # a stopped film's delivered scene can be rerolled
+        production._save_state(pid, state)
         self.assertIsNone(gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "reroll": {"scene": "sc01"},
                                                                     "rights_version": "v1"}))  # already signed
         quote = self.produce(production_id=pid, reroll={"scene": "sc01", "direction": "keep the helmet"})

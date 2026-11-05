@@ -279,8 +279,8 @@ def reroll_problem(production_id: str, scene: Any) -> Optional[str]:
     state = load_state(production_id) or {}
     if state.get("state") == "running" or is_running(production_id):
         return "the production is still running; wait for it to stop at a gate or finish"
-    if not (state.get("state") == "done" or state.get("needs") in ("shot_review", "review", "reroll_approval")):
-        return "a scene can be rerolled once the film's takes are delivered (at the take check or when it is done)"
+    if state.get("needs") in ("rights", "approval", "budget", "first_scene_review"):
+        return "a scene can be rerolled once the film's takes are delivered; answer the production's current gate first"
     entry = ((_read_json(_dir(production_id) / "ledger.json") or {}).get("scenes") or {}).get(str(scene))
     if not isinstance(entry, dict) or str(scene) == "production" or entry.get("rerollOf"):
         return f"{scene} is not one of this film's scenes (use the scene id, such as sc03)"
