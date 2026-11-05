@@ -256,6 +256,11 @@ def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str,
     for key in ("rights_version", "approved_credits", "review_first", "accept_checks"):
         if decisions.get(key) not in (None, "", []):
             current[key] = decisions[key]
+    # chain continuity: every take the person kept, by its bytes (a later reroll of a scene is a new take to keep)
+    kept = decisions.get("reviewed")
+    kept = [kept] if isinstance(kept, str) else kept if isinstance(kept, list) else []
+    if kept:
+        current["reviewed"] = sorted(set(current.get("reviewed") or []) | {str(k) for k in kept if k})
     rerolls = current.setdefault("rerolls", {})
     for asked in _reroll_list(decisions.get("reroll")):
         # A new take of a delivered scene: quoted first, bought only on the person's approve_reroll.
@@ -281,7 +286,7 @@ def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str,
 
 # The gates a person answers. On Hermes desktop the film card answers them (decide); elsewhere the agent passes the
 # answer to slopcannon_produce and Hermes asks in an approval prompt.
-DECISION_GATES = ("rights", "approval", "budget", "first_scene_review", "shot_review", "reroll_approval")
+DECISION_GATES = ("rights", "approval", "budget", "first_scene_review", "scene_review", "shot_review", "reroll_approval")
 
 
 def _derived_direction(production_id: str, scene: str) -> str:
@@ -339,8 +344,13 @@ def decide(production_id: str, answer: dict[str, Any]) -> dict[str, Any]:
             raise ProductionError("the first scene changed; watch the new take", "stale_decision")
         decisions["review_first"] = detail["sha256"]
         said = f"approved the first scene {detail.get('scene') or ''}".strip()
+    elif gate == "scene_review":  # chain continuity: keep this take; the next scene starts from its last frame
+        if not detail.get("sha256") or answer.get("sha256") != detail.get("sha256"):
+            raise ProductionError("the scene changed; watch the new take", "stale_decision")
+        decisions["reviewed"] = [detail["sha256"]]
+        said = f"kept {detail.get('take') or detail.get('scene') or 'the scene'}"
     elif gate in ("shot_review", "reroll"):
-        if gate == "reroll" and needs in DECISION_GATES and needs != "shot_review":
+        if gate == "reroll" and needs in DECISION_GATES and needs not in ("shot_review", "scene_review"):
             raise ProductionError(f"answer the production's current step ({needs}) first", "stale_decision")
         flagged = {str(f.get("scene")) for f in detail.get("flagged") or [] if isinstance(f, dict)}
         keep = [str(x) for x in answer.get("keep") or [] if str(x) in flagged]
@@ -357,7 +367,10 @@ def decide(production_id: str, answer: dict[str, Any]) -> dict[str, Any]:
         kept = before if before == "all" else sorted(set(before or []) | set(keep))
         if kept:
             decisions["accept_checks"] = kept
-        decisions["reroll"] = [{"scene": s, "direction": _derived_direction(production_id, s)} for s in asked]
+        given = {str(x.get("scene")): str(x.get("direction") or "").strip() for x in answer.get("reroll") or []
+                 if isinstance(x, dict) and x.get("direction")}
+        decisions["reroll"] = [{"scene": s, "direction": given.get(s) or _derived_direction(production_id, s)}
+                               for s in asked]
         said = "; ".join(x for x in (f"kept {', '.join(keep)}" if keep else "",
                                      f"asked for new takes of {', '.join(asked)}" if asked else "") if x)
     elif gate == "reroll_approval":
@@ -428,10 +441,17 @@ def remember_session(production_id: str, session_id: str) -> None:
         _save_state(production_id, state)
 
 
+def _chain(folder: Path) -> bool:
+    return (_read_json(folder / "production.json") or {}).get("continuity") == "chain"
+
+
 def _reroll_args(folder: Path, scene: str, ask: dict[str, Any]) -> list[str]:
+    # A chained scene is rerolled from what it was bought from: its plan and cast with the frame it continues from.
+    plans = folder / "work" / "scene-audio" / "scene-plans"
+    chained = (plans / f"{scene}.chain.json").is_file() and (plans / f"{scene}.chain-cast.json").is_file()
     args = ["reroll", "--ledger", str(folder / "ledger.json"), "--scene", scene,
-            "--plan", str(folder / "work" / "scene-audio" / "scene-plans" / f"{scene}.json"),
-            "--cast", str(folder / "work" / "cast.json")]
+            "--plan", str(plans / (f"{scene}.chain.json" if chained else f"{scene}.json")),
+            "--cast", str(plans / f"{scene}.chain-cast.json") if chained else str(folder / "work" / "cast.json")]
     if ask.get("direction"):
         args += ["--direction", str(ask["direction"])]
     return args
@@ -461,7 +481,8 @@ def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> l
             return _reroll_args(folder, scene, ask) + ["--approve-units", str(ask["approved"]),
                                                        "--max-credits", str(ceiling)]
     takes = {scene: ask["take"] for scene, ask in rerolls.items() if ask.get("take")}
-    if takes:
+    chain = _chain(folder)
+    if takes and not chain:
         title = _film_title(folder)
         args = ["cut", "--ledger", ledger, "--plan", str(folder / "work" / "timed-plan.json"),
                 "--takes", ",".join(f"{scene}={take}" for scene, take in takes.items()),
@@ -474,9 +495,14 @@ def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> l
     if decisions.get("rights_version"):
         args += ["--rights-accepted", str(decisions["rights_version"])]
     if isinstance(decisions.get("approved_credits"), int):
-        args += ["--approve", "all", "--max-credits", str(decisions["approved_credits"])]
+        # chained, the run itself buys the scenes after a reroll, so the ceiling carries the approved rerolls
+        args += ["--approve", "all", "--max-credits", str(ceiling if chain else decisions["approved_credits"])]
     if decisions.get("review_first"):
         args += ["--review-first", str(decisions["review_first"])]
+    if chain and decisions.get("reviewed"):
+        args += ["--reviewed", ",".join(decisions["reviewed"])]
+    if chain and takes:
+        args += ["--takes", ",".join(f"{scene}={take}" for scene, take in sorted(takes.items()))]
     checks = decisions.get("accept_checks")
     if checks:
         args += ["--accept-checks", "all" if checks == "all" else ",".join(checks)]
@@ -675,6 +701,13 @@ def _needs_detail(result: dict[str, Any]) -> dict[str, Any]:
         return {"scene": result.get("scene"), "sha256": result.get("sha256"),
                 "clip": {"path": path, "name": Path(path).name} if path else None,
                 "shotCheck": result.get("shotCheck"), "directionWarnings": result.get("directionWarnings")}
+    if needs == "scene_review":
+        artifact = result.get("artifact") or {}
+        path = artifact.get("path")
+        return {"scene": result.get("scene"), "take": result.get("take"), "index": result.get("index"),
+                "total": result.get("total"), "next": result.get("next"), "continuesFrom": result.get("continuesFrom"),
+                "sha256": result.get("sha256"), "clip": {"path": path, "name": Path(path).name} if path else None,
+                "shotCheck": result.get("shotCheck")}
     if needs == "reroll_approval":
         quotes = [q for q in result.get("quotes") or [] if isinstance(q, dict)]
         return {"scenes": [q.get("scene") for q in quotes], "quotes": quotes,
@@ -913,6 +946,7 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
         "sessionId": _live_session(state.get("sessionId")),
         "sessionChecked": True,
         "assembly": _assembly(ledger),
+        "continuity": "chain" if _chain(folder) else None,
     }
     if detail:
         out.update(needsDetail=state.get("needsDetail") if state.get("state") == "needs" else None,
@@ -924,7 +958,7 @@ def media_lines(info: dict[str, Any]) -> list[str]:
     lines = []
     detail = info.get("needsDetail") or {}
     clip = detail.get("clip") if isinstance(detail, dict) else None
-    if info.get("needs") == "first_scene_review" and clip and clip.get("path"):
+    if info.get("needs") in ("first_scene_review", "scene_review") and clip and clip.get("path"):
         lines.append(f"MEDIA:{Path(clip['path']).resolve().as_posix()}")
     master = info.get("master")
     if master and master.get("path") and Path(master["path"]).is_file():

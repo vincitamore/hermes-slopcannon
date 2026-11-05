@@ -303,6 +303,7 @@ function normProduction(raw) {
     message: str(o.message),
     updatedAt: num(o.updatedAt),
     aspectRatio: str(o.aspectRatio),
+    continuity: str(o.continuity),
     durationMs: num(o.durationMs),
     quotedCredits: int(o.quotedCredits),
     projectId: str(o.projectId),
@@ -592,6 +593,8 @@ function phaseOf(p) {
       return 'approve'
     case 'first_scene_review':
       return 'first'
+    case 'scene_review':
+      return int(obj(p.needsDetail).index) === 1 ? 'first' : 'render'
     case 'shot_review':
       return 'checks'
     default:
@@ -627,6 +630,7 @@ const NEED_SHORT = {
   approval: 'Approve',
   budget: 'Budget',
   first_scene_review: 'Review',
+  scene_review: 'Review',
   shot_review: 'Checks',
   review: 'Review',
   new_revision: 'Revision',
@@ -692,7 +696,11 @@ function needsModel(p, extra = {}) {
       const parts = []
       if (scenes) parts.push(plural(scenes, 'scene'))
       if (have !== null) parts.push(n !== null && have < n ? `you have ${fmtCredits(have)}, top up first` : `you have ${fmtCredits(have)}`)
-      parts.push('the first scene renders and waits for your look before the rest')
+      parts.push(
+        p.continuity === 'chain'
+          ? 'one scene at a time, each starting from the last frame of the one before, each waiting for your look'
+          : 'the first scene renders and waits for your look before the rest'
+      )
       return {
         tone: 'attention',
         icon: 'credit-card',
@@ -736,6 +744,30 @@ function needsModel(p, extra = {}) {
           : { label: 'Looks good, continue', text: `I reviewed the first scene; continue the film ${ref}.` },
         secondary: [{ label: 'Change the direction', text: `I want to change the direction of the first scene of ${ref}.` }]
       }
+    case 'scene_review': {
+      const index = int(d.index)
+      const total = int(d.total)
+      const scene = str(d.scene)
+      const check = obj(d.shotCheck)
+      const issues = arr(check.issues).length
+      const verdict =
+        check.verdict === 'pass'
+          ? 'The character check passed it.'
+          : check.verdict === 'fail'
+            ? `The character check flagged ${plural(issues || 1, 'issue')}.`
+            : 'The character check did not run on it.'
+      const next = str(d.next)
+      return {
+        tone: 'attention',
+        icon: 'eye',
+        headline: index !== null && total !== null ? `Scene ${index} of ${total} is ready` : 'A scene is ready',
+        body: `${verdict} ${next ? `Keep it and scene ${index !== null ? index + 1 : 'next'} starts from its last frame.` : 'Keep it and the film is cut.'}${str(d.continuesFrom) ? ' It picks up from the last frame of the scene before.' : ''}`,
+        primary: str(d.sha256)
+          ? { label: next ? `Keep it, render scene ${index !== null ? index + 1 : 'next'}` : 'Keep it, cut the film', decide: { gate: 'scene_review', sha256: str(d.sha256) } }
+          : null,
+        secondary: scene ? [{ label: 'Reroll this scene', decide: { gate: 'reroll', reroll: [scene] } }] : []
+      }
+    }
     case 'shot_review': {
       const flagged = arr(d.flagged).length
       return {
@@ -2128,7 +2160,7 @@ function latestClip(p) {
 // first-scene review, that scene. Nothing (no empty black box) otherwise.
 function filmSubject(p) {
   if (p.master) return { kind: 'film', path: p.master.path }
-  if (p.needs === 'first_scene_review') {
+  if (p.needs === 'first_scene_review' || p.needs === 'scene_review') {
     const d = obj(p.needsDetail)
     const clip = normClip(d.clip)
     const row = (p.rows || []).find(r => r.id === str(d.scene)) || (p.rows || [])[0]
@@ -2534,7 +2566,7 @@ function clipContext(toolName, args, result, file) {
       out.needs = p.needs
       const d = obj(p.needsDetail)
       if (p.master && samePath(p.master.path, file.path)) out.kind = 'master'
-      else if (p.needs === 'first_scene_review') {
+      else if (p.needs === 'first_scene_review' || p.needs === 'scene_review') {
         out.kind = 'first'
         if (typeof d.scene === 'string') out.sceneId = d.scene
       } else if (p.state === 'done' && !p.needs) out.kind = 'master'

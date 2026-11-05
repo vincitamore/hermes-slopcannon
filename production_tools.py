@@ -53,6 +53,10 @@ NEXT: dict[str, str] = {
                            "the file yourself. " + _ON_CARD + "call slopcannon_produce with review_first = "
                            "needsDetail.sha256 (Hermes asks them in an approval prompt); if they want a different "
                            "direction, start a new production_id with it."),
+    "scene_review": ("A chained scene is delivered (needsDetail.scene, take needsDetail.take; the character check has "
+                     "already watched it: do not inspect the file yourself). The next scene is bought only after the "
+                     "person keeps this take, and starts from its last frame. " + _ON_CARD + "call slopcannon_produce "
+                     "with keep_scene = needsDetail.sha256 to keep it, or reroll = [{scene, direction}] to replace it."),
     "shot_review": ("The character check flagged takes (needsDetail.flagged); each flagged clip is in `show`. If "
                     "needsDetail.unchecked lists takes the check could not reach, first call slopcannon_produce with "
                     "the production_id: it checks them again (never check, quote or look up a scene by hand). "
@@ -88,7 +92,7 @@ def _result(info: dict[str, Any]) -> str:
     # The cards are how the person sees the film in chat, and the agent only shows them by writing these lines in
     # its reply; stated once in the skill they were skipped, so every result leads with them.
     show = [out["card"]]
-    if state == "needs" and needs == "first_scene_review" and out["media"]:
+    if state == "needs" and needs in ("first_scene_review", "scene_review") and out["media"]:
         show.append(out["media"][0])
     elif state == "needs" and needs == "shot_review":
         # The person decides keep-or-reroll per flagged take, so each one is shown, not only described.
@@ -147,6 +151,7 @@ def _produce(args: dict[str, Any], session_id: str = "") -> str:
         "rights_version": args.get("rights_version"),
         "approved_credits": args.get("approve_credits"),
         "review_first": args.get("review_first"),
+        "reviewed": args.get("keep_scene"),
         "accept_checks": args.get("accept_checks"),
         "reroll": args.get("reroll"),
         "approve_reroll": args.get("approve_reroll"),
@@ -210,6 +215,10 @@ _PRODUCTION_SCHEMA = {
             "required": ["name"],
         }},
         "transcript": {"type": "string"},
+        "continuity": {"type": "string", "enum": ["chain"], "description": (
+            "chain: scenes render one at a time, each continuing from the last frame of the scene before (one "
+            "world, one look), and each waits for the person's keep or reroll before the next is bought. Omit to "
+            "render every scene at once after the first.")},
         "scenes": {"type": "array", "items": {"type": "object"}},
         "aspectRatio": {"type": "string", "description": "One of the ratios slopcannon_account lists; default 16:9."},
     },
@@ -239,6 +248,9 @@ PRODUCE = ToolSpec("slopcannon_produce", {
             "approve_credits": {"type": "integer", "minimum": 0,
                                 "description": "The whole-film Cannon Credit ceiling the person approved."},
             "review_first": {"type": "string", "description": "sha256 of the first scene the person reviewed."},
+            "keep_scene": {"type": "string", "description": (
+                "Chain continuity: needsDetail.sha256 of the delivered scene the person keeps; the next scene "
+                "starts from its last frame.")},
             "accept_checks": {"type": "array", "items": {"type": "string"},
                               "description": "Flagged scene ids (sc03) the person accepts as they are."},
             "reroll": {"type": "array", "description": (

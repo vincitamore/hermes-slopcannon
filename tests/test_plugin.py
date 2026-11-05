@@ -811,6 +811,33 @@ else if (flag("--rights-accepted") !== "v1") {
   ledger.scenes.sc02 = { quote: { id: "q2", amountUnits: 56, currency: "CANNON_CREDIT", creditUnit: "cannon-credit" } };
   writeFileSync(ledgerFile, JSON.stringify(ledger));
   out({ ok: false, needs: "approval", quotes: [{ scene: "sc01", amountUnits: 40 }, { scene: "sc02", amountUnits: 56 }], totalCannonCredits: 96 }, 2);
+} else if (JSON.parse(readFileSync(flag("--production"), "utf8")).continuity === "chain") {
+  // chain continuity: one scene at a time, each kept (by its bytes) before the next is bought
+  const log = path.join(path.dirname(ledgerFile), "chain-calls.log");
+  writeFileSync(log, (existsSync(log) ? readFileSync(log, "utf8") : "") + [flag("--max-credits"), flag("--reviewed"), flag("--takes")].join(" ") + "\n");
+  const clips = path.join(path.dirname(ledgerFile), "work", "clips"); mkdirSync(clips, { recursive: true });
+  const reviewed = (flag("--reviewed") || "").split(",");
+  const takes = Object.fromEntries((flag("--takes") || "").split(",").filter(Boolean).map((p) => p.split("=")));
+  let stopped = false;
+  for (const [i, id] of ["sc01", "sc02"].entries()) {
+    const take = takes[id] || id;
+    const entry = ledger.scenes[take];
+    if (!entry.downloaded) {
+      const clip = path.join(clips, take + ".mp4"); writeFileSync(clip, "mp4");
+      entry.generation = { id: "gen_" + take, key: "k" + take, status: "succeeded", submission: { approval: { amountUnits: entry.quote.amountUnits, currency: "CANNON_CREDIT", creditUnit: "cannon-credit" } } };
+      entry.downloaded = { path: clip, sha256: (i ? "c" : "a").repeat(64), bytes: 3 };
+    }
+    writeFileSync(ledgerFile, JSON.stringify(ledger));
+    if (!reviewed.includes(entry.downloaded.sha256)) {
+      out({ ok: false, needs: "scene_review", scene: id, take, index: i + 1, total: 2, next: i ? null : "sc02", continuesFrom: i ? (takes.sc01 || "sc01") : null,
+            sha256: entry.downloaded.sha256, artifact: entry.downloaded, shotCheck: { scene: take, verdict: "pass", issues: [] } }, 2);
+      stopped = true; break;
+    }
+  }
+  if (!stopped) {
+    const master = path.join(path.dirname(ledgerFile), "work", "Film.mp4"); writeFileSync(master, "chain " + (flag("--takes") || ""));
+    out({ ok: true, output: master, report: { ok: true, output: master, syncVerified: true } }, 0);
+  }
 } else {
   const clips = path.join(path.dirname(ledgerFile), "work", "clips"); mkdirSync(clips, { recursive: true });
   const master = path.join(path.dirname(ledgerFile), "work", "Film.mp4"); writeFileSync(master, "mp4");
@@ -998,6 +1025,62 @@ class ProductionTest(unittest.TestCase):
         with mock.patch.object(settings, "get", lambda key: False if key == "protect_production_files" else None):
             agent = gate.pre_tool_call("terminal", {"command": "curl -X POST http://127.0.0.1:9119/api/plugins/slopcannon/productions/x/decide"})
         self.assertEqual(agent["action"], "block")
+
+    @unittest.skipUnless(production.node_status()["ok"], "Node.js 22.13+ not installed")
+    def test_chain_continuity_keeps_or_rerolls_each_scene_before_the_next(self):
+        def card(pid, **answer):
+            production.decide(pid, answer)
+            production.wait(pid, 30)
+            return production.summary(pid, detail=True)
+
+        pid = self.produce(production=self.spec(continuity="chain"))["production"]["id"]
+        self.assertEqual(production.summary(pid)["continuity"], "chain")
+        card(pid, gate="rights", version="v1")
+        first = card(pid, gate="approval", credits=96)
+        self.assertEqual(first["needs"], "scene_review", first)
+        detail = first["needsDetail"]
+        self.assertEqual((detail["scene"], detail["index"], detail["total"], detail["next"]), ("sc01", 1, 2, "sc02"))
+        self.assertTrue(detail["clip"]["path"].endswith("sc01.mp4"))
+        self.assertEqual(production.media_lines(first), [f"MEDIA:{Path(detail['clip']['path']).resolve().as_posix()}"])
+        with self.assertRaises(production.ProductionError) as stale:
+            production.decide(pid, {"gate": "scene_review", "sha256": "f" * 64})
+        self.assertEqual(stale.exception.code, "stale_decision")
+        second = card(pid, gate="scene_review", sha256="a" * 64)
+        self.assertEqual((second["needs"], second["needsDetail"]["continuesFrom"]), ("scene_review", "sc01"))
+        # Rerolled from the card with a direction: quoted, approved, rendered, then kept like any take.
+        asked = card(pid, gate="reroll", reroll=[{"scene": "sc02", "direction": "same blue sky"}])
+        self.assertEqual((asked["needs"], asked["needsDetail"]["amountUnits"]), ("reroll_approval", 50), asked)
+        self.assertEqual(production.load_state(pid)["decisions"]["rerolls"]["sc02"]["direction"], "same blue sky")
+        again = card(pid, gate="reroll_approval", credits=50)
+        self.assertEqual((again["needs"], again["needsDetail"]["take"]), ("scene_review", "sc02.r1"), again)
+        # In a chained film the reroll goes back through the run (not straight to a cut), under the raised ceiling.
+        self.assertEqual(production.load_state(pid)["state"], "needs")
+        done = card(pid, gate="scene_review", sha256="b" * 64)
+        self.assertEqual(done["state"], "done", done)
+        self.assertEqual(Path(done["master"]["path"]).read_text(), "chain sc02=sc02.r1")
+        calls = (production._dir(pid) / "chain-calls.log").read_text().splitlines()
+        self.assertEqual(calls[-1].split(" "), ["146", ",".join(sorted(["a" * 64, "b" * 64])), "sc02=sc02.r1"])
+        # The chat path answers the same gate through Hermes's prompt.
+        state = production.load_state(pid)
+        production._save_state(pid, {**state, "state": "needs", "needs": "scene_review",
+                                     "needsDetail": {"scene": "sc02", "take": "sc02.r1", "sha256": "d" * 64}})
+        ask = gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "keep_scene": "d" * 64})
+        self.assertEqual(ask["action"], "approve")
+        self.assertIn("keep sc02.r1", ask["message"])
+        self.assertEqual(gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "keep_scene": "e" * 64})["action"],
+                         "block")
+
+    def test_a_chained_reroll_keeps_the_frame_it_continues_from(self):
+        folder = self.root / "f"
+        plans = folder / "work" / "scene-audio" / "scene-plans"
+        plans.mkdir(parents=True)
+        (folder / "production.json").write_text('{"continuity": "chain"}', encoding="utf-8")
+        self.assertTrue(production._reroll_args(folder, "sc02", {})[6].endswith("sc02.json"))
+        (plans / "sc02.chain.json").write_text("{}", encoding="utf-8")
+        (plans / "sc02.chain-cast.json").write_text("[]", encoding="utf-8")
+        args = production._reroll_args(folder, "sc02", {})
+        self.assertTrue(args[args.index("--plan") + 1].endswith("sc02.chain.json"))
+        self.assertTrue(args[args.index("--cast") + 1].endswith("sc02.chain-cast.json"))
 
     def test_changed_inputs_after_paid_state_need_a_new_revision(self):
         production.write_production("film-1", self.spec())

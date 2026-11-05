@@ -38,6 +38,8 @@ The plugin registers every SLOPCANNON server tool under its own name (`slopcanno
 
 `slopcannon_produce` runs SLOPCANNON's own production driver in the background: project, uploads, server scene audio, the timed plan, quotes, one first scene for review, parallel renders, character checks and server assembly. It is resumable and never buys a scene twice.
 
+Set `production.continuity` to `"chain"` when the film must read as one world (one sky, one light, one camera journey): scenes then render one at a time, each continuing from the last frame of the scene before, and each stops at `scene_review` for keep (`keep_scene` = its sha256 in chat) or reroll before the next scene is bought. Write each scene's beat so it ends on a frame the next can pick up (direction of travel, where everyone stands). It takes about one scene's render per scene, so tell the person the wait.
+
 1. `slopcannon_account`: connected, `submissionReady`, `rights.requiredVersion`, the aspect ratios.
 2. Brief: the song path, the cast pictures, the concept, the aspect ratio. If the person already supplied a timed plan, pass it as `timed_plan` unchanged (the production validates it; do not run node or the skill's scripts, which belong to the plugin) and skip steps 3 and 4's cuts and scenes.
 3. Otherwise `slopcannon_transcribe` with the song and `rights_version` (Hermes shows the person the rights prompt). Read the excerpt.

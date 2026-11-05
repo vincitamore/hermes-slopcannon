@@ -193,6 +193,7 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
 
     rights, credits = args.get("rights_version"), args.get("approve_credits")
     review, accept = args.get("review_first"), args.get("accept_checks")
+    keep = args.get("keep_scene")
     reroll, reroll_units = args.get("reroll"), args.get("approve_reroll")
     pid = str(args.get("production_id") or "")
     spec = args.get("production")
@@ -205,7 +206,7 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
             problems.append("reroll needs scene ids, such as [{\"scene\": \"sc03\"}]")
         if problems:
             return {"action": "block", "message": f"BLOCKED: cannot reroll now: {'; '.join(problems)}."}
-    if all(v in (None, "", []) for v in (rights, credits, review, accept, reroll_units)):
+    if all(v in (None, "", []) for v in (rights, credits, review, accept, reroll_units, keep)):
         return None
     starting = not pid and isinstance(spec, dict)
     if not pid and not starting:
@@ -219,7 +220,7 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
             return {"action": "block", "message": (
                 "BLOCKED: fix the production before it starts (nothing was signed or uploaded): "
                 + "; ".join(problems))}
-    if starting and any(v not in (None, "", []) for v in (credits, review, accept, reroll_units)):
+    if starting and any(v not in (None, "", []) for v in (credits, review, accept, reroll_units, keep)):
         return {"action": "block", "message": (
             "BLOCKED: a new production can carry only rights_version. Credits, reviews and accepted takes "
             "answer a gate the production has reached; start it, then answer with its production_id.")}
@@ -263,6 +264,12 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
                      "Deny to stop and change the direction")
     if accept:
         parts.append("keep flagged takes " + ", ".join(str(a) for a in accept))
+    if keep not in (None, ""):
+        if state.get("needs") != "scene_review" or keep != detail.get("sha256"):
+            return {"action": "block", "message": (
+                "BLOCKED: keep_scene answers a delivered scene: pass needsDetail.sha256 of the scene it waits on.")}
+        scene = detail.get("take") or detail.get("scene") or "this scene"
+        parts.append(f"keep {scene} above ({str(keep)[:12]}); the next scene is bought from its last frame")
     message = f'SLOPCANNON "{title}": ' + "; ".join(parts) if parts else ""
     if rights_block:
         message = (message + "\n\n" if message else f'SLOPCANNON "{title}"\n') + rights_block
@@ -271,7 +278,7 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     return {
         "action": "approve",
         "message": message,
-        "rule_key": _rule_key("produce", pid or title, rights, credits, review, accept, reroll_units,
+        "rule_key": _rule_key("produce", pid or title, rights, credits, review, accept, reroll_units, keep,
                               detail.get("quoteIds") if reroll_units is not None else None),
     }
 

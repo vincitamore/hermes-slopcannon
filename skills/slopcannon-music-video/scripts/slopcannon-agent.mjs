@@ -1397,7 +1397,7 @@ async function verbQuote(options, ledgerFile) {
   const total = quote.price.customerTotal;
   // The output shape and look a take was bought with, so a later reroll of the scene matches the film (verbReroll).
   entry.quote = { id: quote.id, amountUnits: total.amountUnits, currency: total.currency, creditUnit: total.creditUnit, expiresAt: quote.expiresAt, lineItems: quote.price.lineItems ?? null,
-    aspectRatio, bibleSha256: bible !== null ? sha256(bible) : null };
+    aspectRatio, bibleSha256: bible !== null ? sha256(bible) : null, inputsSha256: quoteInputsDigest(params) };
   note(entry, "quote", `${quote.id} ${total.amountUnits} ${total.creditUnit} expires ${quote.expiresAt}`);
   saveLedger(ledgerFile, ledger, id);
   return { ok: true, scene: id, quoteId: quote.id, amountUnits: total.amountUnits, currency: total.currency, creditUnit: total.creditUnit, cannonCredits: total.amountUnits, expiresAt: quote.expiresAt, lineItems: entry.quote.lineItems };
@@ -2494,7 +2494,7 @@ async function verbSelect(options, ledgerFile) {
  * is checked as a product (identity, not shape); a character is sent without a kind, as before.
  */
 export function shotCheckInputs(entry, plan, cast) {
-  const references = referencedCastForPlan(cast, plan).map((member) => {
+  const references = referencedCastForPlan(cast, plan).filter((member) => member.continuity !== true).map((member) => {
     const asset = entry.assets?.[member.label];
     if (!asset?.id || !castAssetKinds(member).includes(asset.kind)) return null;
     return { assetId: asset.id, name: member.name, ...(member.kind === "product" ? { kind: "product" } : {}) };
@@ -3204,6 +3204,182 @@ function verbStatus(ledgerFile) {
  *   "workDir": "./production"
  * }
  */
+// ---------------------------------------------------------------- chain continuity
+
+/**
+ * Chain continuity (`"continuity": "chain"` in the production file). SLOPCANNON takes no start frame, so a scene
+ * continues from the one before it through a picture: the last frame of the previous scene's chosen take, uploaded as
+ * a set picture and cast as PREVIOUS SHOT, with the beat told to pick up exactly where it ends. Scenes are therefore
+ * bought one at a time, in order, and each delivered take stops for the person's keep-or-reroll before the next scene
+ * is bought, so a rerolled scene hands its own last frame on.
+ */
+export const CHAIN_NAME = "PREVIOUS SHOT";
+export const CHAIN_LEAD = "Continue exactly from the PREVIOUS SHOT picture, the last frame of the scene before: the same sky colour, light, palette, drawing style and camera framing, with everyone where it left them; never restyle or recolour. Then: ";
+
+/** What a quote was made from, so a quote of other scene text or cast is never submitted as this one. */
+export function quoteInputsDigest(params) {
+  return sha256(stableJson({ cast: params.cast, timedPlan: params.timedPlan, output: params.output, creativeBible: params.creativeBible ?? null }));
+}
+
+/** The scene's plan and cast continuing from a picture uploaded under `label`. */
+export function chainInputs(plan, cast, label) {
+  if (plan?.schemaVersion !== 1 || !Array.isArray(plan.scenes) || plan.scenes.length !== 1) throw new Error("A chained scene needs its own one-scene plan.");
+  const continued = structuredClone(plan);
+  const shot = continued.scenes[0];
+  shot.cast = [...(shot.cast ?? []).filter((name) => name !== CHAIN_NAME), CHAIN_NAME];
+  if (!shot.beat.includes(CHAIN_LEAD)) {
+    // after a leading shot marker ([Shot 1]), which stays first
+    const marker = /^\s*\[Shot \d+\]\s*/i.exec(shot.beat)?.[0] ?? "";
+    shot.beat = `${marker}${CHAIN_LEAD}${shot.beat.slice(marker.length)}`;
+  }
+  if (shot.beat.length > MAX_SCENE_TEXT) throw new Error(`Scene text plus the continuity lead is over ${MAX_SCENE_TEXT} characters.`);
+  const member = { id: "cast-chain", name: CHAIN_NAME, label, kind: "product", continuity: true };
+  return { plan: continued, cast: [...cast.filter((m) => m.name !== CHAIN_NAME), member] };
+}
+
+/** The take each scene uses: the scene itself, or a reroll of it the person chose (--takes sc03=sc03.r1,...). */
+export function chainTakes(ledger, sceneIds, value) {
+  const takes = new Map(sceneIds.map((id) => [id, id]));
+  for (const pair of String(value ?? "").split(",").map((part) => part.trim()).filter(Boolean)) {
+    const [sceneId, takeId, extra] = pair.split("=");
+    if (extra !== undefined || !sceneId || !takeId) throw new Error(`--takes entry ${pair} must be scene=take.`);
+    if (!takes.has(sceneId)) throw new Error(`--takes names unknown scene ${sceneId}.`);
+    if (takeId !== sceneId && ledger.scenes[takeId]?.rerollOf !== sceneId) throw new Error(`${takeId} is not a reroll of ${sceneId}.`);
+    takes.set(sceneId, takeId);
+  }
+  return takes;
+}
+
+/** The last frame of a take (a few frames before its end, clear of any fade), as a set picture under the upload cap. */
+export async function lastFrame(clip, out, { maxBytes = 786_432, run = runMediaTool } = {}) {
+  mkdirSync(path.dirname(out), { recursive: true });
+  for (const [from, quality] of [["-0.12", "3"], ["-0.4", "3"], ["-0.4", "7"], ["-1", "9"]]) {
+    rmSync(out, { force: true });
+    try {
+      await run("ffmpeg", ["-v", "error", "-nostdin", "-y", "-sseof", from, "-i", clip, "-frames:v", "1", "-vf", "scale=1280:-2", "-q:v", quality, out]);
+    } catch { continue; }
+    if (existsSync(out) && statSync(out).size > 0 && statSync(out).size <= maxBytes) return out;
+  }
+  throw new Error(`Could not take the last frame of ${clip} for the next scene. Is FFmpeg installed?`);
+}
+
+async function runChain({ options, ledgerFile, production, sceneIds, prepDir, castFile, cast, bibleFile, workDir, plan, planFile, steps, pending, total, projectId, rightsVersion, gateNote }) {
+  const approve = options.get("--approve") ?? null;
+  const maxCredits = options.get("--max-credits");
+  const cap = approve === "all" ? Infinity : Number(approve);
+  if (pending.length > 0 && (!approve || pending.some((quote) => !(quote.amountUnits <= cap)) || maxCredits === undefined)) {
+    return { ok: false, needs: "approval", steps, quotes: pending, totalCannonCredits: total, creditUnit: "cannon-credit", continuity: "chain",
+      message: `Present all quotes and the production total. Scenes render one at a time, each continuing from the last frame of the one before, and each waits for the person's keep or reroll before the next is bought. Set --max-credits to the approved ceiling and --approve all.${gateNote}` };
+  }
+  if (pending.length > 0) {
+    const spending = productionSpend(loadLedger(ledgerFile), pending, maxCredits);
+    if (!spending.withinLimit) return { ok: false, needs: "budget", steps, ...spending, message: "This production would exceed the approved ceiling, including previous and uncertain attempts. No new submissions were made." };
+    const runLedger = loadLedger(ledgerFile);
+    runLedger.spendCapCredits = Number(maxCredits);
+    saveLedger(ledgerFile, runLedger);
+  }
+  const renderRequest = await ensureProductionRenderRequest({ ledgerFile, projectId, members: productionRequestMembers(sceneIds, prepDir, cast) });
+  if (renderRequest) steps.push({ step: "render-request", ...renderRequest });
+  const takes = chainTakes(loadLedger(ledgerFile), sceneIds, options.get("--takes"));
+  const reviewed = new Set(String(options.get("--reviewed") ?? "").split(",").map((x) => x.trim()).filter(Boolean));
+  const checkable = (loadLedger(ledgerFile).generation?.mcpTools ?? []).includes("slopcannon_check_take");
+  const scenePlanFile = (id) => path.join(prepDir, "scene-plans", `${id}.json`);
+  for (const [index, id] of sceneIds.entries()) {
+    const takeId = takes.get(id);
+    const before = index > 0 ? takes.get(sceneIds[index - 1]) : null;
+    let entry = loadLedger(ledgerFile).scenes[takeId];
+    if (takeId === id && entry.generation?.key && !entry.generation?.id) {
+      try { await verbRecover(new Map([["--scene", id]]), ledgerFile); }
+      catch { throw new Error(`Scene ${id} has an unresolved submission. Run recover --scene ${id} to find its original job without spending; never obtain a replacement quote.`); }
+      entry = loadLedger(ledgerFile).scenes[id];
+    }
+    if (takeId === id && !entry.generation?.key && !entry.generation?.id) {
+      // 1. what this scene is bought from: its own plan, continuing from the chosen take before it
+      let quotePlan = scenePlanFile(id);
+      let quoteCast = castFile;
+      if (before) {
+        const previous = loadLedger(ledgerFile).scenes[before];
+        if (!await verifiedLocalArtifact(previous?.downloaded)) throw new Error(`${before} has no verified take to continue from.`);
+        const frame = await lastFrame(previous.downloaded.path, path.join(workDir, "chain", `${before}-last.jpg`));
+        const label = `chain-${before}`;
+        await verbUpload(new Map([["--scene", id], ["--kind", "set_reference"], ["--file", frame], ["--label", label], ["--rights", rightsVersion]]), ledgerFile);
+        const continued = chainInputs(JSON.parse(readFileSync(scenePlanFile(id), "utf8")), cast, label);
+        quotePlan = path.join(prepDir, "scene-plans", `${id}.chain.json`);
+        quoteCast = path.join(prepDir, "scene-plans", `${id}.chain-cast.json`);
+        writeFileSync(quotePlan, `${JSON.stringify(continued.plan, null, 2)}\n`, "utf8");
+        writeFileSync(quoteCast, `${JSON.stringify(continued.cast, null, 2)}\n`, "utf8");
+        const seeded = loadLedger(ledgerFile);
+        seeded.scenes[id].chain = { from: before, label, frame, frameSha256: seeded.scenes[id].assets[label]?.sha256 ?? null };
+        saveLedger(ledgerFile, seeded, id);
+      }
+      // 2. a quote of exactly those inputs (the film's up-front quote was of the scene alone)
+      const quoteOptions = new Map([["--scene", id], ["--plan", quotePlan], ["--cast", quoteCast], ["--aspect", production.aspectRatio ?? "16:9"]]);
+      if (bibleFile) quoteOptions.set("--bible", bibleFile);
+      entry = loadLedger(ledgerFile).scenes[id];
+      const fresh = entry.quote?.currency === "CANNON_CREDIT" && new Date(entry.quote.expiresAt) > new Date(Date.now() + 60_000)
+        && entry.quote.inputsSha256 && entry.quote.inputsSha256 === entry.chainQuoteInputs;
+      if (!fresh) {
+        await verbQuote(quoteOptions, ledgerFile);
+        const quoted = loadLedger(ledgerFile);
+        quoted.scenes[id].chainQuoteInputs = quoted.scenes[id].quote.inputsSha256;
+        saveLedger(ledgerFile, quoted, id);
+      }
+      // 3. bought under the film's approval and ceiling
+      const quote = loadLedger(ledgerFile).scenes[id].quote;
+      if (!(quote.amountUnits <= cap)) return { ok: false, needs: "approval", steps, quotes: [{ scene: id, quoteId: quote.id, amountUnits: quote.amountUnits }], totalCannonCredits: quote.amountUnits, creditUnit: "cannon-credit", continuity: "chain", message: `Scene ${id} is quoted above the approved per-scene cap.` };
+      const spending = productionSpend(loadLedger(ledgerFile), [quote], maxCredits);
+      if (!spending.withinLimit) return { ok: false, needs: "budget", steps, ...spending, message: `Scene ${id} would exceed the approved ceiling, including previous and uncertain attempts. Nothing was submitted.` };
+      await verbSubmit(new Map([["--scene", id], ["--approve-units", String(quote.amountUnits)], ["--reference", `${production.title} ${id}`]]), ledgerFile);
+      steps.push({ step: "submit", scene: id, continuesFrom: before });
+    }
+    // 4. delivered
+    entry = loadLedger(ledgerFile).scenes[takeId];
+    if (!await verifiedLocalArtifact(entry.downloaded)) {
+      const polled = TERMINAL.has(entry.generation?.status) ? { status: entry.generation.status, errorCode: entry.generation.errorCode ?? null } : await verbPoll(new Map([["--scene", takeId]]), ledgerFile);
+      if (polled.status !== "succeeded") {
+        return { ok: false, needs: "review", steps, failed: [{ scene: takeId, status: polled.status, errorCode: polled.errorCode ?? null }],
+          message: `Scene ${id} did not deliver. Keep this ledger for recovery; a failed scene is retried with retry-failed, never re-quoted.` };
+      }
+      const outDir = path.join(workDir, "clips");
+      await verbContent(new Map([["--scene", takeId], ["--out", outDir], ["--name", takeId === id ? `slopcannon-scene-${id.slice(2)}-take-01.mp4` : `${takeId}.mp4`]]), ledgerFile);
+      steps.push({ step: "content", scene: takeId });
+    }
+    // 5. the character check (free; the frame it continues from is not a character)
+    entry = loadLedger(ledgerFile).scenes[takeId];
+    let check = entry.shotCheck?.assetId === entry.artifact?.assetId ? { scene: takeId, verdict: entry.shotCheck.verdict, issues: entry.shotCheck.issues, cached: true } : null;
+    if (!check && checkable) {
+      check = await checkWithRetry(takeId, () => checkScene(ledgerFile, takeId, { plan: JSON.parse(readFileSync(scenePlanFile(id), "utf8")), cast }));
+      steps.push({ step: "check", checks: [check] });
+    }
+    // 6. the person keeps it (or rerolls it) before the next scene is bought
+    const current = loadLedger(ledgerFile);
+    const downloaded = current.scenes[takeId].downloaded;
+    const kept = current.chainReviews?.[id];
+    if (!(kept?.take === takeId && kept.sha256 === downloaded.sha256)) {
+      if (!reviewed.has(downloaded.sha256)) {
+        return { ok: false, needs: "scene_review", steps, scene: id, take: takeId, index: index + 1, total: sceneIds.length,
+          next: sceneIds[index + 1] ?? null, continuesFrom: before, sha256: downloaded.sha256, artifact: downloaded, continuity: "chain",
+          ...(check ? { shotCheck: check } : {}),
+          message: `Scene ${index + 1} of ${sceneIds.length} is delivered. The person keeps it (resume with --reviewed <its sha256>) or rerolls it (reroll --scene ${id}); ${sceneIds[index + 1] ? `${sceneIds[index + 1]} is bought only after that and starts from this take's last frame` : "the film is assembled after that"}.` };
+      }
+      current.chainReviews = { ...(current.chainReviews ?? {}), [id]: { take: takeId, sha256: downloaded.sha256, reviewedAt: new Date().toISOString() } };
+      saveLedger(ledgerFile, current);
+    }
+  }
+  // 7. every scene kept: the film, cut with the takes the person kept
+  const output = path.join(workDir, `${production.title.replace(/[^A-Za-z0-9._-]+/g, "-")}.mp4`);
+  const swaps = [...takes].filter(([sceneId, takeId]) => sceneId !== takeId).map(([sceneId, takeId]) => `${sceneId}=${takeId}`).join(",");
+  if (swaps) {
+    const report = await verbCut(new Map([["--plan", planFile], ["--takes", swaps], ["--title", production.title], ["--output", output], ["--accept-checks", "all"]]), ledgerFile);
+    steps.push({ step: "assemble", server: true, ok: report.ok, takes: swaps });
+    return { ...report, steps, output: report.output, report };
+  }
+  const report = await finishServerProduction({ ledgerFile, plan, title: production.title, output });
+  steps.push({ step: "assemble", server: true, ok: report.ok });
+  return { ok: report.ok === true, steps, output: report.output, report,
+    message: "Review the master for identity, continuity and take quality; sync verification does not judge those." };
+}
+
 async function verbRun(options, ledgerFile) {
   const productionFile = path.resolve(need(options, "--production"));
   const production = JSON.parse(readFileSync(productionFile, "utf8"));
@@ -3427,6 +3603,10 @@ async function verbRun(options, ledgerFile) {
     runLedger.spendCapCredits = Number(maxCredits);
   }
   saveLedger(ledgerFile, runLedger);
+  if (production.continuity === "chain") {
+    if (assemblyMode !== "server") throw new Error("Chain continuity assembles on the server; leave --assembly at server.");
+    return runChain({ options, ledgerFile, production, sceneIds, prepDir, castFile, cast, bibleFile, workDir, plan, planFile, steps, pending, total, projectId, rightsVersion, gateNote });
+  }
   if (pending.length > 0) {
     const cap = approve === "all" ? Infinity : Number(approve);
     const over = pending.filter((quote) => !(quote.amountUnits <= cap));
