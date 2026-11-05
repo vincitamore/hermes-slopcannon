@@ -914,6 +914,10 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-facts{display:flex;gap:4px 14px;flex-wrap:wrap;margin-bottom:12px;font-size:.75rem;color:var(--ui-text-tertiary)}
 .sc-verdict{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--ui-stroke-tertiary)}
 .sc-verdict>.codicon{flex:none;margin-top:2px;line-height:1}
+.sc-verdict>.codicon,.sc-line>.codicon,.sc-step .codicon{align-self:flex-start}
+/* A spinning glyph turns about its own box; a box stretched by a flex row is taller than the glyph, so it
+   would swing the arc around an off-centre point instead of turning it in place. */
+[class^='sc-'] .codicon-modifier-spin,[class*=' sc-'] .codicon-modifier-spin{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;line-height:1;transform-origin:50% 50%}
 .sc-verdict b{display:block;margin-bottom:2px;font-weight:600}
 .sc-verdict span{color:var(--ui-text-secondary);overflow-wrap:anywhere}
 .sc-warn{color:var(--ui-yellow)}
