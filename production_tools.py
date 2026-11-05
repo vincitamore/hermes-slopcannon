@@ -136,6 +136,8 @@ def _status(args: dict[str, Any], session_id: str = "") -> str:
         return json.dumps({"ok": True, "productions": [production.summary(i) for i in production.list_ids()[:20]]},
                           default=str)
     pid = str(pid)
+    if session_id and production.load_state(pid) is not None:
+        production.remember_session(pid, session_id)  # the chat talking about a film is the one the studio answers
     wait_s = min(max(int(args.get("wait_s") or 0), 0), _MAX_WAIT_S)
     if wait_s:
         production.wait(pid, wait_s)

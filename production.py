@@ -749,7 +749,8 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
         "durationMs": duration,
         "quotedCredits": sum(quoted) if quoted else None,
         "master": state.get("master"),
-        "sessionId": state.get("sessionId"),
+        "sessionId": _live_session(state.get("sessionId")),
+        "sessionChecked": True,
         "assembly": _assembly(ledger),
     }
     if detail:
@@ -802,3 +803,26 @@ def managing(project_id: Any) -> Optional[str]:
         if ((ledger.get("scenes") or {}).get("production") or {}).get("projectId") == project_id:
             return pid
     return None
+
+
+def _live_session(session_id: Any) -> Optional[str]:
+    """The chat a production came from, or None once that chat is deleted: the studio then sends to a new chat
+    instead of opening one that can no longer load. Unknown (no readable session store) keeps the id."""
+    if not session_id:
+        return None
+    try:
+        import sqlite3
+
+        from hermes_constants import get_hermes_home
+
+        db = Path(get_hermes_home()) / "state.db"
+        if not db.is_file():
+            return str(session_id)
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("select 1 from sessions where id = ?", (str(session_id),)).fetchone()
+        finally:
+            con.close()
+        return str(session_id) if row else None
+    except Exception:
+        return str(session_id)

@@ -1007,6 +1007,24 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(gate.pre_tool_call("slopcannon_transcribe", {"song": str(self.song),
                                                                       "rights_version": "v1"})["action"], "approve")
 
+    def test_a_deleted_chat_is_not_reported_as_the_films_chat(self):
+        try:
+            import hermes_constants  # noqa: F401
+        except ImportError:
+            self.skipTest("hermes_constants is not importable here")
+        import sqlite3
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        con = sqlite3.connect(home / "state.db")
+        con.execute("create table sessions (id text primary key)")
+        con.execute("insert into sessions values ('local-alive')")
+        con.commit()
+        con.close()
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+            self.assertEqual(production._live_session("local-alive"), "local-alive")
+            self.assertIsNone(production._live_session("local-deleted"))
+            self.assertIsNone(production._live_session(None))
+
     def test_production_is_checked_before_the_rights_prompt(self):
         pic = Path(self.song).with_name("cloudsea.jpg")
         pic.write_bytes(b"jpg")

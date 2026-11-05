@@ -307,6 +307,7 @@ function normProduction(raw) {
     quotedCredits: int(o.quotedCredits),
     projectId: str(o.projectId),
     sessionId: str(o.sessionId),
+    sessionChecked: o.sessionChecked === true,
     counts,
     rows,
     spend: { approvedCredits: int(spend.approvedCredits), committedCredits: int(spend.committedCredits) },
@@ -494,28 +495,44 @@ function sendFromCard(sessionId, text) {
   return sent
 }
 
-// From the studio page: the chat the production came from when known, else
-// the composer the person is using; failing both, open the remembered chat
-// and retry once; failing that, the clipboard.
+// From the studio page: the chat the production came from when it still exists, else the composer the person is
+// using, else that chat opened, else a new chat in this profile (a deleted chat is never opened: it cannot load),
+// and failing all of those, the clipboard.
 async function sendFromStudio(production, text) {
-  const target = (production && (production.sessionId || rememberedSession(production.id))) || null
+  const remembered = production && production.sessionChecked ? null : rememberedSession(production && production.id)
+  const target = (production && production.sessionId) || remembered || null
   if (target && trySubmit(target, text)) return notify('success', 'Sent to the chat.')
   if (trySubmit(null, text)) return notify('success', 'Sent to the chat.')
   if (target && typeof host.openSession === 'function') {
+    let opened = true
     try {
       await host.openSession(target)
     } catch {
-      return copyFallback(text)
+      opened = false
     }
-    const retry = () => {
-      if (trySubmit(target, text) || trySubmit(null, text)) notify('success', 'Sent to the chat.')
-      else void copyFallback(text)
+    if (opened) return later(() => trySubmit(target, text) || trySubmit(null, text), text)
+  }
+  if (typeof host.newChat === 'function') {
+    try {
+      host.newChat()
+      return later(() => trySubmit('new', text) || trySubmit(null, text), text)
+    } catch {
+      // fall through to the clipboard
     }
-    if (CTX && typeof CTX.setTimeout === 'function') CTX.setTimeout(retry, 900)
-    else retry()
-    return undefined
   }
   return copyFallback(text)
+}
+
+// Retry a send while the chat it opened mounts its composer (about two seconds), then the clipboard.
+function later(attempt, text, tries = 0) {
+  const tick = () => {
+    if (attempt()) return notify('success', 'Sent to the chat.')
+    if (tries >= 7) return void copyFallback(text)
+    later(attempt, text, tries + 1)
+  }
+  if (CTX && typeof CTX.setTimeout === 'function') CTX.setTimeout(tick, 300)
+  else setTimeout(tick, 300)
+  return undefined
 }
 
 function filmRef(p) {
