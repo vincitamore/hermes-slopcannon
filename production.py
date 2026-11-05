@@ -260,11 +260,12 @@ class _Runner(threading.Thread):
         # Hermes keeps the served profile (its home, secrets and the plugin's sign-in) in context
         # variables, and a new thread starts with none of them: without this copy a run started from a
         # chat in a second profile writes its state into the primary profile's folder and Hermes refuses
-        # the sign-in. Taken here, on the tool call's own thread.
-        self._context = contextvars.copy_context()
+        # the sign-in. Taken here, on the tool call's own thread. (Not ``_context``: Python 3.14's Thread
+        # keeps its own context under that name and enters it before ``run``.)
+        self._caller_context = contextvars.copy_context()
 
     def run(self) -> None:
-        self._context.run(self._run)
+        self._caller_context.run(self._run)
 
     def _run(self) -> None:
         pid = self.production_id
