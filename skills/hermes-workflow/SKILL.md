@@ -50,7 +50,7 @@ The plugin registers every SLOPCANNON server tool under its own name (`slopcanno
 
 Every answer goes in through `slopcannon_produce` with the same `production_id`, and Hermes asks the person to approve it in a prompt; never pass an answer they did not give or would not see. To change the direction after paid work began, start a new `production_id`; the old one stays recoverable.
 
-Every result carries `card`, a line such as `::slopcannon-film{id="..."}`. On Hermes desktop, put it alone on its own line in your reply: the desktop renders a live production card there (phase, scenes, the decision waiting, one-click answers). On every other surface leave it out. The desktop's SLOPCANNON studio page (sidebar) shows every production live.
+Every production result carries `show`: the film card line (`::slopcannon-film{id="..."}`) and, at the first-scene review or the finish, the clip's MEDIA line. Write those lines in your message text as soon as you get them, in the same message as your next tool call when you answer a gate in the same turn, so the person sees the card and the clip before the approval prompt asks about them. On surfaces without the desktop keep only the MEDIA lines. The desktop's SLOPCANNON studio page (sidebar) shows every production live.
 
 ## A music video, tool by tool (when the person wants scene-level control)
 

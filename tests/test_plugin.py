@@ -881,8 +881,17 @@ class ProductionTest(unittest.TestCase):
         self.assertTrue(done["media"] and done["media"][0].startswith("MEDIA:") and done["media"][0].endswith("Film.mp4"))
         # Every result leads with what the reply must show: the film card, and here the master.
         self.assertEqual(done["show"], [f'::slopcannon-film{{id="{pid}"}}', done["media"][0]])
-        self.assertTrue(done["next"].startswith("Your reply must start with each line in `show`"))
+        self.assertTrue(done["next"].startswith("Write each line in `show` alone on its own line"))
         self.assertEqual(quoted["show"], [quoted["card"]])
+        # A turn that answered every gate without a reply still ends on the card and the master.
+        production_tools._PENDING_SHOW.clear()
+        production_tools._owe("chat-1", json.dumps(done))
+        reply = production_tools.show_in_reply(response_text="The film is done.", session_id="chat-1")
+        self.assertEqual(reply.split("\n\n"), done["show"] + ["The film is done."])
+        self.assertIsNone(production_tools.show_in_reply(response_text="Next turn.", session_id="chat-1"))
+        production_tools._owe("chat-2", json.dumps(done))
+        self.assertIsNone(production_tools.show_in_reply(response_text="\n".join(done["show"]) + "\nDone.",
+                                                         session_id="chat-2"))  # already shown: untouched
         listed = json.loads(production_tools.PRODUCTION_STATUS.handler({}))
         self.assertEqual([p["id"] for p in listed["productions"]], [pid])
 

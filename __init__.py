@@ -29,6 +29,7 @@ def register(ctx) -> None:
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler,
                           description=schema["description"])
     ctx.register_hook("pre_tool_call", gate.pre_tool_call)
+    ctx.register_hook("transform_llm_output", production_tools.show_in_reply)
     ctx.register_command("slop", commands.slash, description="SLOPCANNON: status, login, logout, sync",
                          args_hint="[status|login|logout|sync]")
     ctx.register_cli_command("slopcannon", "SLOPCANNON account connection", commands.setup_cli,

@@ -76,6 +76,7 @@ provides_tools:
   - slopcannon_update_character
 provides_hooks:
   - pre_tool_call
+  - transform_llm_output
 # Sign-in is Hermes's own (catalog rule 11): `hermes auth add slopcannon:slop` in a terminal. Hermes keeps
 # the grant; the plugin only asks Hermes to mint short-lived agent sessions with it.
 oauth:

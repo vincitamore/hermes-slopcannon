@@ -12,7 +12,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from . import production
 from .client import Client, SlopcannonError
@@ -90,10 +90,36 @@ def _result(info: dict[str, Any]) -> str:
     elif state == "done" and out["media"]:
         show.append(out["media"][-1])
     out["show"] = show
-    out["next"] = ("Your reply must start with each line in `show`, each alone on its own line (on Hermes desktop "
-                   "they render the film card and the clip; on other surfaces keep only MEDIA lines). Then: "
+    out["next"] = ("Write each line in `show` alone on its own line in your message text now, in the same message "
+                   "as your next tool call if you make one (on Hermes desktop they render the film card and the "
+                   "clip the person is about to judge; on other surfaces keep only MEDIA lines). Then: "
                    + out.get("next", "tell the person where the production stands."))
     return json.dumps(out, default=str)
+
+
+# The lines each chat's current turn has been handed, so its final reply always carries them (show_in_reply): an
+# agent that answers every gate in one turn otherwise writes no reply in which the card could render.
+_PENDING_SHOW: dict[str, list[str]] = {}
+
+
+def _owe(session_id: str, text: str) -> str:
+    if session_id:
+        try:
+            lines = json.loads(text).get("show") or []
+        except (ValueError, AttributeError):
+            lines = []
+        owed = _PENDING_SHOW.setdefault(session_id, [])
+        owed.extend(line for line in lines if line not in owed)
+    return text
+
+
+def show_in_reply(response_text: str = "", session_id: str = "", **_: Any) -> Optional[str]:
+    """transform_llm_output: lead the turn's final reply with any card or clip line it left out."""
+    owed = _PENDING_SHOW.pop(str(session_id or ""), None)
+    if not owed or not isinstance(response_text, str):
+        return None
+    missing = [line for line in owed if line not in response_text]
+    return "\n\n".join(missing + [response_text]) if missing else None
 
 
 def _produce(args: dict[str, Any], session_id: str = "") -> str:
@@ -127,7 +153,7 @@ def _produce(args: dict[str, Any], session_id: str = "") -> str:
     raw_wait = args.get("wait_s")
     wait_s = min(max(_DEFAULT_WAIT_S if raw_wait is None else int(raw_wait), 0), _MAX_WAIT_S)
     production.wait(pid, wait_s)
-    return _result(production.summary(pid, detail=True))
+    return _owe(session_id, _result(production.summary(pid, detail=True)))
 
 
 def _status(args: dict[str, Any], session_id: str = "") -> str:
@@ -141,7 +167,7 @@ def _status(args: dict[str, Any], session_id: str = "") -> str:
     wait_s = min(max(int(args.get("wait_s") or 0), 0), _MAX_WAIT_S)
     if wait_s:
         production.wait(pid, wait_s)
-    return _result(production.summary(pid, detail=True))
+    return _owe(session_id, _result(production.summary(pid, detail=True)))
 
 
 def _stop(args: dict[str, Any], session_id: str = "") -> str:
