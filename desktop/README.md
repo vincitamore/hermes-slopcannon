@@ -9,32 +9,44 @@ folder to `$HERMES_HOME/desktop-plugins/slopcannon/` and loads that copy
 
 | Surface | Area | Notes |
 |---|---|---|
-| Studio page `/slopcannon` | `ROUTES_AREA` | account strip, productions list, production detail (phase stepper, needs banner, master player, scene grid, driver log), Stop with confirm |
+| Studio page `/slopcannon` | `ROUTES_AREA` | productions grouped Needs you / Rendering / Finished / Paused with the film's own thumbnail; account as quiet text; header, step line, the decision block, the film with its poster, the scenes laid on the song (frames at each scene's real length, the song's envelope, playhead tied to the film), the scene inspector (take, credits, check verdict in plain words, direction, Reroll / Check again), driver log, Stop with confirm; first-run and signed-out states |
 | Sidebar row `SLOPCANNON` | `SIDEBAR_NAV_AREA` | codicon `device-camera-video` |
-| Status bar item | `STATUSBAR_AREAS.right` | `443 cr`, a spinner and count while renders run, a bell when a production waits; `SLOPCANNON: sign in` when signed out; hidden when the backend is off |
-| Palette | `PALETTE_AREA` | SLOPCANNON: Open studio / Copy sign-in command / Refresh |
-| Directive `slopcannon-film` | `TRANSCRIPT_DIRECTIVE_AREA` | `::slopcannon-film{id="<production id>"}`; ids must match `^[a-z0-9][a-z0-9-]{0,63}$`, anything else renders nothing |
-| Clip cards | `TOOL_MEDIA_RENDERER_AREA` | video MEDIA from `slopcannon_wait`, `slopcannon_download`, `slopcannon_produce`, `slopcannon_production_status` |
+| Status bar item | `STATUSBAR_AREAS.right` | `SLOPCANNON 443 cr · 1 rendering · 1 needs you`; `SLOPCANNON sign in` when signed out; hidden when the backend is off |
+| Palette | `PALETTE_AREA` | SLOPCANNON: Open studio / Ask for a music video / Copy sign-in command / Refresh |
+| Directive `slopcannon-film` | `TRANSCRIPT_DIRECTIVE_AREA` | `::slopcannon-film{id="<production id>"}`: one card that changes in place (needs you with the plan on the song, rendering with the latest take and progress, done with the film); actions sit below the card; ids must match `^[a-z0-9][a-z0-9-]{0,63}$`, anything else renders nothing |
+| Scene cards | `TOOL_MEDIA_RENDERER_AREA` | video MEDIA from `slopcannon_wait`, `slopcannon_download`, `slopcannon_produce`, `slopcannon_production_status`, drawn as the studio's scene inspector (poster, timing, verdict, take, credits) |
 
 ## Backend it reads
 
 `dashboard/plugin_api.py` through `ctx.rest`: `GET /status`, `GET /productions`,
-`GET /productions/{id}`, `POST /productions/{id}/stop`, `POST /login` (returns the
+`GET /productions/{id}`, `GET /productions/{id}/media`, `GET /thumbs`, `GET /frames/{name}`,
+`GET /locate`, `POST /productions/{id}/stop`, `POST /login` (returns the
 `hermes auth add slopcannon:slop` command; it starts nothing). Live
 updates come from `plugin.slopcannon.production.updated` and
 `plugin.slopcannon.account.updated`; polling is the fallback (5 s while a
 production runs, 30 s otherwise). If the Python half is not loaded the page
 shows one quiet line and the status item hides.
 
+## Frames and the song envelope
+
+`media.py` makes posters, six-frame strips, thumbs and the song's RMS envelope with
+ffmpeg, lazily, on two background workers, cached under the plugin data folder by the
+source file's path, size and mtime. The UI asks for a production's media (cache names
+and `pending`), polls while anything is pending, and reads each image once as a data
+URL by its opaque name. A request never names a file. Without ffmpeg the slots stay
+neutral and the scenes line says so once.
+
 ## Video playback
 
 - Clip cards in the chat use `file.resolveUrl()` (the host's ticketed range
   stream) in a plain `<video>`.
-- The studio page renders `MEDIA:"<path>"` through the SDK's
-  `MessageTextContent`, which is Desktop's own media pipeline (the gateway's
-  `/api/files/stream` with a path-bound ticket). `ctx.rest` returns JSON only
-  and the SDK has no helper that turns a plugin route into a `<video src>`, so
-  the plugin's own `/media` route is not used by this half.
+- The studio page and the film card render `MEDIA:"<path>"` through the SDK's
+  `MessageTextContent` in a hidden probe, which is Desktop's own media pipeline
+  (Electron's media protocol, or the gateway's `/api/files/stream` with a
+  path-bound ticket), and play that source in their own `<video>` with the
+  poster. If the probe yields no source, Desktop's built-in player is shown
+  as it is. `ctx.rest` returns JSON only, so the plugin's own `/media` route
+  is not used by this half.
 
 ## Decisions go back to the chat
 
