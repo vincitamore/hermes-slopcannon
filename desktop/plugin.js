@@ -926,7 +926,7 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-details[open]>summary .codicon{transform:rotate(90deg)}
 .sc-details>*+*{margin-top:8px}
 .sc-log{max-height:240px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem;line-height:1.5;color:var(--ui-text-secondary)}
-.sc-empty{display:flex;flex-direction:column;align-items:center;gap:14px;max-width:520px;margin:0 auto;padding:40px 0}
+.sc-empty{display:flex;flex-direction:column;align-items:center;gap:14px;max-width:640px;margin:0 auto;padding:40px 0}
 .sc-empty-row{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;font-size:.75rem;color:var(--ui-text-tertiary)}
 .sc-cmd{padding:1px 6px;border-radius:3px;background:var(--ui-bg-quaternary);color:var(--ui-text-primary)}
 .sc-wrap{display:flex;flex-direction:column;max-width:700px;margin:6px 0}
