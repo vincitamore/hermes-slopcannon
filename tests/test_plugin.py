@@ -868,7 +868,7 @@ class ProductionTest(unittest.TestCase):
         pid = first["production"]["id"]
         self.assertEqual(first["production"]["needs"], "rights")
         self.assertEqual(first["production"]["needsDetail"]["requiredVersion"], "v1")
-        self.assertIn("rights_version", first["next"])
+        self.assertIn("rights_version", first["next"])  # the chat path, after the card
         self.assertEqual(first["card"], f'::slopcannon-film{{id="{pid}"}}')
         stored = json.loads((self.root / pid / "production.json").read_text(encoding="utf-8"))
         self.assertNotIn("approve", stored)  # gate answers never ride the production file
@@ -952,6 +952,52 @@ class ProductionTest(unittest.TestCase):
         hand = gate.pre_tool_call("mcp_slopcannon_slopcannon_create_quote", {"projectId": "proj_1"})
         self.assertEqual(hand["action"], "block")
         self.assertIn("reroll=", hand["message"])
+
+    @unittest.skipUnless(production.node_status()["ok"], "Node.js 22.13+ not installed")
+    def test_the_film_card_answers_every_gate(self):
+        def card(pid, **answer):
+            production.decide(pid, answer)
+            return production.wait(pid, 30) | {"detail": production.summary(pid, detail=True)}
+
+        first = self.produce(production=self.spec())
+        pid = first["production"]["id"]
+        self.assertIn("END YOUR TURN", first["next"])  # the agent shows the card and stops
+        with self.assertRaises(production.ProductionError):
+            production.decide(pid, {"gate": "rights", "version": "v0"})  # only the version the gate names
+        with self.assertRaises(production.ProductionError):
+            production.decide(pid, {"gate": "approval", "credits": 96})  # not the gate it is stopped at
+        quoted = card(pid, gate="rights", version="v1")["detail"]
+        self.assertEqual((quoted["needs"], quoted["needsDetail"]["totalCannonCredits"]), ("approval", 96))
+        with self.assertRaises(production.ProductionError) as stale:
+            production.decide(pid, {"gate": "approval", "credits": 95})
+        self.assertEqual(stale.exception.code, "stale_decision")
+        with mock.patch.object(settings, "get_int", lambda key: 50 if key == "max_credits_per_action" else 0):
+            with self.assertRaises(production.ProductionError) as over:
+                production.decide(pid, {"gate": "approval", "credits": 96})
+        self.assertEqual(over.exception.code, "over_ceiling")
+        done = card(pid, gate="approval", credits=96)["detail"]
+        self.assertEqual(done["state"], "done", done)
+        self.assertEqual(done["spend"]["approvedCredits"], 96)
+        self.assertIn("on the film card the person approved 96 Cannon Credits", production.load_state(pid)["log"])
+        # A reroll from the card is quoted first; keeping the current take cancels it without buying anything.
+        asked = card(pid, gate="reroll", reroll=["sc01"])["detail"]
+        self.assertEqual((asked["needs"], asked["needsDetail"]["amountUnits"]), ("reroll_approval", 44))
+        kept = card(pid, gate="reroll_approval", cancel=True)["detail"]
+        self.assertEqual(kept["state"], "done", kept)
+        self.assertNotIn("sc01.r1=", Path(kept["master"]["path"]).read_text())
+        card(pid, gate="reroll", reroll=["sc01"])
+        cut = card(pid, gate="reroll_approval", credits=44)["detail"]
+        self.assertEqual(Path(cut["master"]["path"]).read_text(), "cut sc01=sc01.r1")
+        # At the take check every flagged scene needs an answer, and the card's routes are never the agent's.
+        state = production.load_state(pid)
+        production._save_state(pid, {**state, "state": "needs", "needs": "shot_review",
+                                     "needsDetail": {"flagged": [{"scene": "sc01"}, {"scene": "sc02"}]}})
+        with self.assertRaises(production.ProductionError) as partial:
+            production.decide(pid, {"gate": "shot_review", "keep": ["sc01"]})
+        self.assertEqual(partial.exception.code, "incomplete_decision")
+        with mock.patch.object(settings, "get", lambda key: False if key == "protect_production_files" else None):
+            agent = gate.pre_tool_call("terminal", {"command": "curl -X POST http://127.0.0.1:9119/api/plugins/slopcannon/productions/x/decide"})
+        self.assertEqual(agent["action"], "block")
 
     def test_changed_inputs_after_paid_state_need_a_new_revision(self):
         production.write_production("film-1", self.spec())
@@ -1105,9 +1151,9 @@ class ProductionTest(unittest.TestCase):
             upload = gate.pre_tool_call("slopcannon_upload", {"path": str(self.song), "kind": "song",
                                                               "rights_version": "v1"})
             self.assertIn(statement, upload["message"])
-        # The gate's own next steps never tell the agent to wait for a typed agreement.
-        self.assertIn("same turn", production_tools.NEXT["rights"])
-        self.assertIn("same turn", production_tools.NEXT["approval"])
+        # The gate's own next steps never tell the agent to wait for a typed agreement: the card is the answer.
+        for need in ("rights", "approval", "first_scene_review", "shot_review", "reroll_approval"):
+            self.assertIn("do not ask the person to reply in chat", production_tools.NEXT[need])
 
 class TranscribeTest(unittest.TestCase):
     def test_server_words_become_whisper_segments(self):

@@ -7,7 +7,7 @@ Music videos from a song, inside Hermes. Ask for a film; the agent writes the di
 ## What you get
 
 - **A whole film in one request.** `slopcannon_produce` runs SLOPCANNON's own production driver: uploads, scene audio cut on the server, a timed scene plan, quotes, one first scene for your review, parallel renders, character checks and assembly. It is resumable and never buys a scene twice.
-- **You decide every spend.** Credit approvals, rights sign-offs, deleting takes and publishing characters all go through Hermes's approval prompt. Nobody present means no spend. A per-action ceiling and an unattended allowance are in the plugin settings.
+- **You decide every spend.** On Hermes desktop a film's decisions (the rights sign-off, the credit quote, the first scene, keep or reroll each flagged take) are buttons on its film card in the chat, and each accepts only the exact figure or file it shows. Through chat or on other surfaces, credit approvals, rights sign-offs, deleting takes and publishing characters go through Hermes's approval prompt. The agent can never press the card's buttons. Nobody present means no spend. A per-action ceiling and an unattended allowance are in the plugin settings.
 - **A studio in Hermes Desktop.** A SLOPCANNON page in the sidebar shows your credits and every production: its phase, each scene with its clip, the decision waiting on you, and the finished film. The agent drops a live production card into the chat, with the answer one click away. Rendered clips play inline, with buttons to keep, check or reroll a take.
 - **Every SLOPCANNON tool.** All hosted tools (music videos, source-video remixes, the Ad Cannon, Character Lab, Slop TV) are native Hermes tools, plus what only a local agent can do: upload from disk, word-timed lyrics, wait for renders, bring the video home.
 
@@ -60,7 +60,7 @@ Then ask: *"Make a music video for ~/Music/song.mp3 with my photo ~/Pictures/me.
   - Credentials go only to the API origin, never across a redirect. The plugin never asks the model for a token, and the model never sees one.
 - **Files.** Reads only the songs and pictures you point the agent at. Writes productions and transcripts under `<hermes home>/plugin-data/slopcannon/` and media under the download folder. The studio's frames (posters, filmstrips, the song envelope) are made with ffmpeg into `plugin-data/slopcannon/media-cache/`; a poster you pick in the studio ("Use this frame as poster") is kept in `plugin-data/slopcannon/posters.json`, never in the production's own files.
 - **Background processes.** `slopcannon_produce` runs the bundled production driver (`skills/slopcannon-music-video/scripts/slopcannon-agent.mjs`, plain JavaScript in this repository) with Node.js as a background child process, with its own short-lived session in that child's environment. It runs only the approvals you gave, as command-line flags; the production file the agent writes cannot carry an approval. Stop it from the studio or with `slopcannon_production_stop`.
-- **Spending.** Credits are spent only by calls that passed Hermes's approval prompt. Buying credits is never done by the plugin (it does not request the `billing:purchase` scope).
+- **Spending.** Credits are spent only on the person's click on a film card or on a call that passed Hermes's approval prompt. Buying credits is never done by the plugin (it does not request the `billing:purchase` scope).
 
 ## Development
 

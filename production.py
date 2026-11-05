@@ -277,6 +277,125 @@ def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str,
     return current
 
 
+# --------------------------------------------------------------------------- decisions from the film card
+
+# The gates a person answers. On Hermes desktop the film card answers them (decide); elsewhere the agent passes the
+# answer to slopcannon_produce and Hermes asks in an approval prompt.
+DECISION_GATES = ("rights", "approval", "budget", "first_scene_review", "shot_review", "reroll_approval")
+
+
+def _derived_direction(production_id: str, scene: str) -> str:
+    """A reroll's direction when the person asked from the card: fix what the character check found."""
+    entry = ((_read_json(_dir(production_id) / "ledger.json") or {}).get("scenes") or {}).get(scene) or {}
+    issues = [str(i.get("description") or "").strip() for i in (entry.get("shotCheck") or {}).get("issues") or []
+              if isinstance(i, dict)]
+    issues = [i for i in issues if i]
+    base = "Keep every character exactly as its reference picture for the whole shot."
+    return base + (" Fix what the check found: " + " ".join(issues) if issues else "")
+
+
+def decide(production_id: str, answer: dict[str, Any]) -> dict[str, Any]:
+    """Record the person's answer from the film card and resume the production.
+
+    The card is the person's own click, so it is the sign-off, the spend approval or the keep-or-reroll choice.
+    Every answer must match the gate the production is stopped at (the exact quoted figure, the exact rights
+    version, the exact first-scene file), so a stale card can never approve something else; the seat's
+    max_credits_per_action ceiling still applies."""
+    state = load_state(production_id)
+    if state is None:
+        raise ProductionError(f"no production {production_id}", "unknown_production")
+    if state.get("state") == "running" or is_running(production_id):
+        raise ProductionError("the production is already running", "busy")
+    gate, needs = str(answer.get("gate") or ""), state.get("needs")
+    detail = state.get("needsDetail") or {}
+    decisions: dict[str, Any] = {}
+    said = ""
+
+    def credits(expected: Any, what: str) -> int:
+        given = answer.get("credits")
+        if not isinstance(given, int) or isinstance(given, bool) or given != expected:
+            raise ProductionError(f"the card is out of date: {what} is {expected} Cannon Credits", "stale_decision")
+        ceiling = settings.get_int("max_credits_per_action")
+        if ceiling and given > ceiling:
+            raise ProductionError(f"{given} Cannon Credits exceeds this seat's ceiling of {ceiling} "
+                                  "(plugins.entries.slopcannon.settings.max_credits_per_action)", "over_ceiling")
+        return given
+
+    if gate in DECISION_GATES and gate != needs:
+        raise ProductionError(f"the production is no longer waiting on {gate}", "stale_decision")
+    if gate == "rights":
+        version = detail.get("requiredVersion")
+        if not version or answer.get("version") != version:
+            raise ProductionError("the rights statement changed; read the new one", "stale_decision")
+        decisions["rights_version"], said = version, f"signed the rights statement {version}"
+    elif gate == "approval":
+        decisions["approved_credits"] = credits(detail.get("totalCannonCredits"), "the quote")
+        said = f"approved {decisions['approved_credits']:,} Cannon Credits"
+    elif gate == "budget":
+        decisions["approved_credits"] = credits(detail.get("exposureCredits"), "the ceiling needed")
+        said = f"raised the ceiling to {decisions['approved_credits']:,} Cannon Credits"
+    elif gate == "first_scene_review":
+        if not detail.get("sha256") or answer.get("sha256") != detail.get("sha256"):
+            raise ProductionError("the first scene changed; watch the new take", "stale_decision")
+        decisions["review_first"] = detail["sha256"]
+        said = f"approved the first scene {detail.get('scene') or ''}".strip()
+    elif gate in ("shot_review", "reroll"):
+        if gate == "reroll" and needs in DECISION_GATES and needs != "shot_review":
+            raise ProductionError(f"answer the production's current step ({needs}) first", "stale_decision")
+        flagged = {str(f.get("scene")) for f in detail.get("flagged") or [] if isinstance(f, dict)}
+        keep = [str(x) for x in answer.get("keep") or [] if str(x) in flagged]
+        asked = [str(x.get("scene") if isinstance(x, dict) else x) for x in answer.get("reroll") or []]
+        if gate == "shot_review" and not flagged <= set(keep) | set(asked):
+            raise ProductionError("choose keep or reroll for every flagged scene", "incomplete_decision")
+        if gate == "reroll" and not asked:
+            raise ProductionError("name the scenes to reroll", "incomplete_decision")
+        for scene in asked:
+            problem = reroll_problem(production_id, scene)
+            if problem:
+                raise ProductionError(f"cannot reroll {scene}: {problem}", "reroll_unavailable")
+        before = (state.get("decisions") or {}).get("accept_checks")
+        kept = before if before == "all" else sorted(set(before or []) | set(keep))
+        if kept:
+            decisions["accept_checks"] = kept
+        decisions["reroll"] = [{"scene": s, "direction": _derived_direction(production_id, s)} for s in asked]
+        said = "; ".join(x for x in (f"kept {', '.join(keep)}" if keep else "",
+                                     f"asked for new takes of {', '.join(asked)}" if asked else "") if x)
+    elif gate == "reroll_approval":
+        if answer.get("cancel"):
+            current = state.setdefault("decisions", {})
+            rerolls = current.get("rerolls") or {}
+            dropped = sorted(k for k, r in rerolls.items() if r.get("approved") is None and not r.get("take"))
+            for k in dropped:
+                rerolls.pop(k, None)
+            if current.get("accept_checks") != "all":
+                current["accept_checks"] = sorted(set(current.get("accept_checks") or []) | set(dropped))
+            if not rerolls:
+                current.pop("rerolls", None)
+            _save_state(production_id, state)
+            said = f"kept the current takes of {', '.join(dropped)}"
+        else:
+            decisions["approve_reroll"] = credits(detail.get("amountUnits"), "the new takes' quote")
+            said = (f"approved {decisions['approve_reroll']:,} Cannon Credits for new takes of "
+                    f"{', '.join(str(x) for x in detail.get('scenes') or [])}")
+    elif gate == "recheck":  # takes the check could not reach: checked again, nothing decided or bought
+        if needs != "shot_review":
+            raise ProductionError("there are no takes waiting for a check", "stale_decision")
+        said = "asked the character check to run again"
+    elif gate == "resume":
+        if needs in DECISION_GATES:
+            raise ProductionError(f"the production is waiting on {needs}", "stale_decision")
+        said = "resumed the production"
+    else:
+        raise ProductionError(f"unknown decision {gate!r}", "bad_decision")
+    if any(v not in (None, "", []) for v in decisions.values()):
+        record_decisions(production_id, decisions)
+    state = load_state(production_id) or state
+    state["log"] = (state.get("log") or [])[-_LOG_LINES:] + [f"on the film card the person {said}"]
+    _save_state(production_id, state)
+    start(production_id, concurrency=3)
+    return summary(production_id, detail=True)
+
+
 def _reroll_list(raw: Any) -> list[dict[str, Any]]:
     """reroll as one {scene, direction} or a list of them."""
     items = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else []

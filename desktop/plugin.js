@@ -495,6 +495,34 @@ function sendFromCard(sessionId, text) {
   return sent
 }
 
+// The film card's buttons: the person's own answer to the gate a production is stopped at. The backend accepts
+// only the exact figure, version or file the gate names and resumes the film; the card then shows the next step.
+// No chat message and no agent turn: the card is the decision.
+const $deciding = atom({})
+
+async function decideOnCard(production, answer) {
+  const id = production && production.id
+  if (!id || $deciding.get()[id]) return false
+  $deciding.set({ ...$deciding.get(), [id]: true })
+  try {
+    await api(`/productions/${encodeURIComponent(id)}/decide`, { method: 'POST', body: answer })
+    return true
+  } catch (error) {
+    reportError(error, 'The film did not take that answer. The card shows where it stands now.')
+    return false
+  } finally {
+    const next = { ...$deciding.get() }
+    delete next[id]
+    $deciding.set(next)
+    invalidateAll()
+  }
+}
+
+function useDeciding(id) {
+  const all = useValue($deciding)
+  return Boolean(id && all && all[id])
+}
+
 // From the studio page: the chat the production came from when it still exists, else the composer the person is
 // using, else that chat opened, else a new chat in this profile (a deleted chat is never opened: it cannot load),
 // and failing all of those, the clipboard.
@@ -640,7 +668,8 @@ function needsModel(p, extra = {}) {
       icon: 'error',
       headline: 'The production stopped with an error',
       body: p.message ? redact(p.message) : 'The driver reported an error and stopped.',
-      primary: { label: 'Ask the agent to look into it', text: `${ref} stopped with an error. Look into it and tell me the options.` }
+      primary: { label: 'Try again', decide: { gate: 'resume' } },
+      secondary: [{ label: 'Ask the agent', text: `${ref} stopped with an error. Look into it and tell me the options.` }]
     }
   }
   switch (p.needs) {
@@ -651,7 +680,9 @@ function needsModel(p, extra = {}) {
         icon: 'law',
         headline: 'Agree to the rights statement',
         body: `SLOPCANNON renders nothing until you confirm you hold the rights to the files below${version ? ` (statement ${version})` : ''}.`,
-        primary: { label: 'I agree, continue', text: `I agree to the SLOPCANNON rights statement for these files; continue the film ${ref}.` }
+        primary: version
+          ? { label: 'I agree, continue', decide: { gate: 'rights', version } }
+          : { label: 'I agree, continue', text: `I agree to the SLOPCANNON rights statement for these files; continue the film ${ref}.` }
       }
     }
     case 'approval': {
@@ -670,7 +701,7 @@ function needsModel(p, extra = {}) {
         planActions: true,
         primary:
           n !== null
-            ? { label: `Approve ${fmtCredits(n)} credits`, text: `Approve up to ${n} Cannon Credits for ${ref}.` }
+            ? { label: `Approve ${fmtCredits(n)} credits`, decide: { gate: 'approval', credits: n } }
             : { label: 'Approve the quote', text: `Approve the quoted Cannon Credits for ${ref}.` }
       }
     }
@@ -690,7 +721,7 @@ function needsModel(p, extra = {}) {
         body: `${parts.length ? `Cannon Credits: ${parts.join(', ')}. ` : ''}Continuing needs a higher ceiling${exposure !== null ? ` of ${fmtCredits(exposure)} credits` : ''}.`,
         primary:
           exposure !== null
-            ? { label: `Approve ${fmtCredits(exposure)} credits`, text: `Approve up to ${exposure} Cannon Credits for ${ref}.` }
+            ? { label: `Approve ${fmtCredits(exposure)} credits`, decide: { gate: 'budget', credits: exposure } }
             : { label: 'Raise the budget', text: `Raise the approved Cannon Credits budget for ${ref} enough to finish it.` }
       }
     }
@@ -700,8 +731,10 @@ function needsModel(p, extra = {}) {
         icon: 'eye',
         headline: 'Review the first scene',
         body: 'The first scene is rendered. Watch it before the rest of the film is rendered.',
-        primary: { label: 'Looks good, continue', text: `I reviewed the first scene; continue the film ${ref}.` },
-        secondary: [{ label: 'Reroll the first scene', text: `Reroll the first scene of ${ref}.` }]
+        primary: str(d.sha256)
+          ? { label: 'Looks good, render the rest', decide: { gate: 'first_scene_review', sha256: str(d.sha256) } }
+          : { label: 'Looks good, continue', text: `I reviewed the first scene; continue the film ${ref}.` },
+        secondary: [{ label: 'Change the direction', text: `I want to change the direction of the first scene of ${ref}.` }]
       }
     case 'shot_review': {
       const flagged = arr(d.flagged).length
@@ -709,8 +742,20 @@ function needsModel(p, extra = {}) {
         tone: 'attention',
         icon: 'warning',
         headline: 'Checks flagged scenes',
-        body: `The automatic checks flagged ${flagged || 'some'} scene${flagged === 1 ? '' : 's'}. Accept or reroll each one.`,
-        primary: { label: 'Accept all flagged scenes', text: `Accept all flagged scenes of ${ref} as rendered and continue.` }
+        body: `The character check flagged ${flagged || 'some'} take${flagged === 1 ? '' : 's'}. Keep or reroll each one; a reroll is quoted before anything is bought.`,
+        chooser: true
+      }
+    }
+    case 'reroll_approval': {
+      const n = int(d.amountUnits)
+      const scenes = arr(d.scenes).map(str).filter(Boolean)
+      return {
+        tone: 'attention',
+        icon: 'credit-card',
+        headline: n !== null ? `Approve ${fmtCredits(n)} credits for ${plural(scenes.length || 1, 'new take')}` : 'Approve the new takes',
+        body: `${scenes.length ? `${scenes.map(s => s.toUpperCase()).join(', ')} render` : 'They render'} again together, then the film is cut with them. The current takes stay available.`,
+        primary: n !== null ? { label: `Approve ${fmtCredits(n)} credits`, decide: { gate: 'reroll_approval', credits: n } } : null,
+        secondary: [{ label: 'Keep the current takes', decide: { gate: 'reroll_approval', cancel: true } }]
       }
     }
     case 'review':
@@ -719,7 +764,7 @@ function needsModel(p, extra = {}) {
         icon: 'eye',
         headline: 'Review the film',
         body: p.message ? redact(p.message) : 'The film is waiting for your review.',
-        primary: { label: 'Reviewed, finish it', text: `I reviewed ${ref}; finish the film.` }
+        primary: { label: 'Reviewed, finish it', decide: { gate: 'resume' } }
       }
     case 'new_revision':
       return {
@@ -743,7 +788,7 @@ function needsModel(p, extra = {}) {
         icon: 'debug-restart',
         headline: 'Recover the production',
         body: p.message ? redact(p.message) : 'A step stopped partway. The agent can recover the paid work and continue.',
-        primary: { label: 'Recover and continue', text: `Recover ${ref} and continue.` }
+        primary: { label: 'Recover and continue', decide: { gate: 'resume' } }
       }
     default:
       if (p.state === 'needs') {
@@ -870,6 +915,7 @@ const CSS = `
 .sc-cell-r{text-align:right;font-variant-numeric:tabular-nums}
 .sc-flagrow{display:flex;flex-direction:column;gap:4px;padding:8px 0;border-top:1px solid var(--ui-stroke-tertiary)}
 .sc-flagrow-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sc-chooser-go{display:flex;justify-content:flex-end;padding-top:8px;border-top:1px solid var(--ui-stroke-tertiary)}
 .sc-issues{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;list-style:none;font-size:.75rem;color:var(--ui-text-secondary)}
 .sc-issues li{display:flex;gap:6px}
 .sc-film{position:relative;width:100%;max-height:60vh;overflow:hidden;background:black}
@@ -1598,10 +1644,22 @@ function progressModel(p) {
     const elapsed = running.length ? Math.max(...running.map(r => Date.now() - r.submittedAt)) : 0
     eta = Math.max(60_000, avg * Math.ceil((c.total - c.downloaded) / RENDER_CONCURRENCY) - elapsed)
   }
+  if (now) {
+    const what = now.rerolled ? `New take of scene ${now.index + 1}` : `Scene ${now.index + 1}`
+    return {
+      label: `${what} ${now.status === 'queued' ? 'queued' : 'rendering'}`,
+      frac: c.total ? c.downloaded / c.total : 0,
+      eta: eta !== null ? `about ${Math.max(1, Math.round(eta / 60_000))} min left` : `${c.downloaded} of ${c.total} rendered`
+    }
+  }
+  // Every take is in: what runs now is the check or the cut, and the card says which instead of a full bar
+  // that looks finished.
+  const checking = c.total && c.downloaded >= c.total && !p.assembly && rows.some(r => r.clip && !r.check)
   return {
-    label: now ? `Scene ${now.index + 1} ${now.status === 'queued' ? 'queued' : 'rendering'}` : `${c.downloaded} of ${c.total} rendered`,
+    label: checking ? 'Checking the takes' : c.total && c.downloaded >= c.total ? (rows.some(r => r.rerolled) ? 'Cutting the film with the new takes' : 'Assembling the film') : `${c.downloaded} of ${c.total} rendered`,
     frac: c.total ? c.downloaded / c.total : 0,
-    eta: eta !== null ? `about ${Math.max(1, Math.round(eta / 60_000))} min left` : `${c.downloaded} of ${c.total} rendered`
+    eta: c.total && c.downloaded >= c.total ? 'a minute or two' : `${c.downloaded} of ${c.total} rendered`,
+    busy: Boolean(c.total && c.downloaded >= c.total)
   }
 }
 
@@ -1610,7 +1668,7 @@ function Progress({ production }) {
   return h(
     'div',
     { className: 'sc-progress', role: 'status' },
-    h('span', null, m.label),
+    h('span', { className: 'sc-line' }, m.busy ? icon('loading', { spinning: true }) : null, m.label),
     h('span', { className: 'sc-bar', role: 'progressbar', 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': Math.round(m.frac * 100) }, h('i', { style: { width: `${Math.round(m.frac * 100)}%` } })),
     h('span', { className: 'sc-num' }, m.eta)
   )
@@ -1715,21 +1773,18 @@ function sceneFacts(scene) {
 }
 
 function sceneActions(scene, p, send, { compact } = {}) {
-  const ref = filmRef(p)
   const out = []
   const flagged = scene.clip && scene.check && scene.check.verdict === 'fail' && !scene.checkAccepted
-  if (flagged && p.needs === 'shot_review') {
-    out.push({ key: 'accept', label: 'Accept as rendered', variant: 'secondary', onClick: () => send(`Accept scene ${scene.id} of ${ref} as rendered.`) })
-  }
-  if (scene.clip || scene.status === 'failed') {
+  // A flagged take at the take check is answered in the decision above (keep or reroll, all at once).
+  const settled = p.state === 'done' || p.state === 'idle' || (p.state === 'needs' && p.needs === 'shot_review' && !flagged)
+  if (scene.clip && settled && !scene.id.includes('.')) {
     out.push({
       key: 'reroll',
       label: scene.quoteCredits !== null ? `Reroll this scene \u00b7 ~${fmtCredits(scene.quoteCredits)} cr` : 'Reroll this scene',
-      variant: compact || (flagged && p.needs === 'shot_review') ? 'ghost' : 'secondary',
-      onClick: () => send(`Reroll scene ${scene.id} of ${ref}.`)
+      variant: compact ? 'ghost' : 'secondary',
+      onClick: () => decideOnCard(p, { gate: 'reroll', reroll: [scene.id] })
     })
   }
-  if (scene.clip) out.push({ key: 'check', label: 'Check again', variant: 'ghost', onClick: () => send(`Check scene ${scene.id} of ${ref} for defects again.`) })
   return out
 }
 
@@ -1737,7 +1792,7 @@ function ActionRow({ actions, className = 'sc-acts' }) {
   return h(
     'div',
     { className },
-    actions.filter(Boolean).map(a => (a.node ? h(Fragment, { key: a.key }, a.node) : h(Btn, { key: a.key, label: a.label, iconName: a.iconName, variant: a.variant || 'ghost', size: 'sm', onClick: a.onClick })))
+    actions.filter(Boolean).map(a => (a.node ? h(Fragment, { key: a.key }, a.node) : h(Btn, { key: a.key, label: a.label, iconName: a.iconName, variant: a.variant || 'ghost', size: 'sm', disabled: a.disabled, loading: a.loading, onClick: a.onClick })))
   )
 }
 
@@ -1792,10 +1847,11 @@ function pickScene(p) {
 // -----------------------------------------------------------------------------
 // The decision (studio: actions inside, on the right; chat: actions below the card)
 
-function decisionActions(production, model, send, { inChat } = {}) {
+function decisionActions(production, model, send, { inChat, busy } = {}) {
   const out = []
-  if (model.primary) out.push({ key: 'primary', label: model.primary.label, variant: 'default', onClick: () => send(model.primary.text) })
-  arr(model.secondary).forEach(s => out.push({ key: s.label, label: s.label, variant: inChat ? 'ghost' : 'secondary', onClick: () => send(s.text) }))
+  const run = a => (a.decide ? decideOnCard(production, a.decide) : send(a.text))
+  if (model.primary) out.push({ key: 'primary', label: model.primary.label, variant: 'default', disabled: busy, loading: busy && Boolean(model.primary.decide), onClick: () => run(model.primary) })
+  arr(model.secondary).forEach(s => out.push({ key: s.label, label: s.label, variant: inChat ? 'ghost' : 'secondary', disabled: busy, onClick: () => run(s) }))
   if (inChat) {
     if (model.planActions) out.push({ key: 'plan', label: 'See the scene plan', onClick: () => openStudio(production.id) })
     else out.push({ key: 'studio', label: 'Open in studio', onClick: () => openStudio(production.id) })
@@ -1805,12 +1861,13 @@ function decisionActions(production, model, send, { inChat } = {}) {
 }
 
 function Decision({ production, model, send }) {
+  const busy = useDeciding(production.id)
   return h(
     'div',
     { className: 'sc-decide', 'data-tone': model.tone, role: 'status' },
     h('h2', null, model.headline),
     h('p', null, model.body),
-    h(ActionRow, { actions: decisionActions(production, model, send), className: 'sc-decide-acts' })
+    h(ActionRow, { actions: decisionActions(production, model, send, { busy }), className: 'sc-decide-acts' })
   )
 }
 
@@ -1834,7 +1891,8 @@ function NeedsDetail({ production, send }) {
           : null
       )
     }
-    case 'approval': {
+    case 'approval':
+    case 'reroll_approval': {
       const quotes = arr(detail.quotes).map(obj)
       if (!quotes.length) return null
       const cells = []
@@ -1849,35 +1907,64 @@ function NeedsDetail({ production, send }) {
       }
       return h('details', { className: 'sc-details' }, h('summary', null, icon('chevron-right'), 'Quote by scene'), h('div', { className: 'sc-table' }, cells))
     }
-    case 'shot_review': {
-      const flagged = arr(detail.flagged).map(obj)
-      if (!flagged.length) return null
-      const ref = filmRef(production)
-      return h(
-        'div',
-        { className: 'sc-detail-extra' },
-        flagged.map((f, i) => {
-          const scene = str(f.scene) || `#${i + 1}`
-          const issues = arr(f.issues).map(normIssue)
-          return h(
-            'div',
-            { key: `${scene}-${i}`, className: 'sc-flagrow' },
-            h(
-              'div',
-              { className: 'sc-flagrow-head' },
-              h('b', { className: 'sc-mono' }, scene.toUpperCase()),
-              h('span', { className: 'sc-spacer' }),
-              h(Btn, { label: 'Accept', variant: 'secondary', size: 'xs', onClick: () => send(`Accept scene ${scene} of ${ref} as rendered.`) }),
-              h(Btn, { label: 'Reroll', variant: 'ghost', size: 'xs', onClick: () => send(`Reroll scene ${scene} of ${ref}.`) })
-            ),
-            issues.length ? h(IssueList, { issues }) : null
-          )
-        })
-      )
-    }
+    case 'shot_review':
+      return h(ShotChooser, { production })
     default:
       return null
   }
+}
+
+// Keep or reroll, per flagged take, then one answer for all of them: kept takes are accepted and every reroll is
+// quoted together (the card then asks for that one approval).
+function ShotChooser({ production }) {
+  const detail = obj(production.needsDetail)
+  const flagged = arr(detail.flagged).map(obj)
+  const unchecked = arr(detail.unchecked).map(obj).filter(u => u.retryable !== false)
+  const [pick, setPick] = useState({})
+  const busy = useDeciding(production.id)
+  if (!flagged.length && !unchecked.length) return null
+  const scenes = flagged.map((f, i) => str(f.scene) || `#${i + 1}`)
+  const keep = scenes.filter(s => pick[s] === 'keep')
+  const reroll = scenes.filter(s => pick[s] === 'reroll')
+  const left = scenes.length - keep.length - reroll.length
+  const price = reroll.reduce((n, s) => n + (int(obj((production.rows || []).find(r => r.id === s)).quoteCredits) || 0), 0)
+  const go = left
+    ? `Choose for ${plural(left, 'more scene')}`
+    : reroll.length
+      ? `Quote ${plural(reroll.length, 'new take')}${price ? ` \u00b7 about ${fmtCredits(price)} credits` : ''}`
+      : keep.length === 1 ? 'Keep it and finish the film' : 'Keep them and finish the film'
+  const choice = (scene, value, label) =>
+    h(Btn, { label, size: 'xs', variant: pick[scene] === value ? 'default' : 'secondary', disabled: busy, ariaLabel: `${label} ${scene}`, onClick: () => setPick({ ...pick, [scene]: value }) })
+  return h(
+    'div',
+    { className: 'sc-detail-extra sc-chooser' },
+    unchecked.length
+      ? h(
+          'div',
+          { className: 'sc-flagrow-head' },
+          h('span', { className: 'sc-second' }, `${plural(unchecked.length, 'take')} could not be checked yet.`),
+          h('span', { className: 'sc-spacer' }),
+          h(Btn, { label: 'Check again', size: 'xs', variant: 'secondary', disabled: busy, onClick: () => decideOnCard(production, { gate: 'recheck' }) })
+        )
+      : null,
+    flagged.map((f, i) => {
+      const scene = scenes[i]
+      const issues = arr(f.issues).map(normIssue)
+      return h(
+        'div',
+        { key: `${scene}-${i}`, className: 'sc-flagrow' },
+        h('div', { className: 'sc-flagrow-head' }, h('b', { className: 'sc-mono' }, scene.toUpperCase()), h('span', { className: 'sc-spacer' }), choice(scene, 'keep', 'Keep'), choice(scene, 'reroll', 'Reroll')),
+        issues.length ? h(IssueList, { issues }) : null
+      )
+    }),
+    scenes.length
+      ? h(
+          'div',
+          { className: 'sc-chooser-go' },
+          h(Btn, { label: go, variant: 'default', size: 'sm', disabled: Boolean(left) || busy, loading: busy, onClick: () => decideOnCard(production, { gate: 'shot_review', keep, reroll }) })
+        )
+      : null
+  )
 }
 
 function IssueList({ issues }) {
@@ -2088,7 +2175,7 @@ function ProductionDetail({ id, summary }) {
     if (p.state === 'done') headActions.push({ key: 'send', label: 'Send to chat', variant: 'default', onClick: () => send(`Show the finished film ${filmRef(p)} in this chat.`) })
   }
   if (p.state === 'running') headActions.push({ key: 'stop', node: h(StopControl, { production: p }) })
-  if (p.state === 'idle' && !model) headActions.push({ key: 'resume', label: 'Continue', variant: 'secondary', onClick: () => send(`Continue ${filmRef(p)}.`) })
+  if (p.state === 'idle' && !model) headActions.push({ key: 'resume', label: 'Continue', variant: 'secondary', onClick: () => decideOnCard(p, { gate: 'resume' }) })
   const onSelect = sid => {
     setSel(sid)
     const row = rows.find(r => r.id === sid)
@@ -2352,6 +2439,7 @@ function FilmCard({ productionId, sessionId }) {
   }, [productionId, sessionId])
   const q = useProduction(productionId)
   const status = useStatus()
+  const busy = useDeciding(productionId)
   const p = q.data
   const media = useMedia(p ? p.id : null, p && p.state === 'running').data || null
   if (!p) {
@@ -2390,9 +2478,12 @@ function FilmCard({ productionId, sessionId }) {
       null,
       player,
       h('div', { className: 'sc-wc-body' }, track, h(Meta, { items: [fmtDur(filmDuration(p)), p.counts.total ? plural(p.counts.total, 'scene') : null, p.aspectRatio, 'direction by Hermes'] })),
-      h('div', { className: 'sc-wc-decide', 'data-tone': model.tone }, h('b', null, model.headline), h('span', null, model.body))
+      h('div', { className: 'sc-wc-decide', 'data-tone': model.tone }, h('b', null, model.headline), h('span', null, model.body)),
+      ['rights', 'approval', 'reroll_approval', 'shot_review'].includes(p.needs)
+        ? h('div', { className: 'sc-wc-body' }, guard(h(NeedsDetail, { production: p, send }), null, `${p.id}:${p.needs}`))
+        : null
     )
-    actions = decisionActions(p, model, send, { inChat: true })
+    actions = decisionActions(p, model, send, { inChat: true, busy })
   } else if (p.state === 'running') {
     body = h(Fragment, null, player, h('div', { className: 'sc-wc-body' }, track, h(Progress, { production: p })))
     actions = [{ key: 'studio', label: 'Open in studio', onClick: () => openStudio(p.id) }, { key: 'stop', node: h(StopControl, { production: p }) }]
@@ -2410,7 +2501,7 @@ function FilmCard({ productionId, sessionId }) {
       player,
       h('div', { className: 'sc-wc-body' }, track, h(Meta, { items: [fmtDur(filmDuration(p)), p.counts.total ? plural(p.counts.total, 'scene') : null, whenLabel(p)] }), p.message ? h('div', { className: 'sc-quiet' }, redact(p.message)) : null)
     )
-    actions = [{ key: 'continue', label: 'Continue', variant: 'secondary', onClick: () => send(`Continue ${ref}.`) }, { key: 'studio', label: 'Open in studio', onClick: () => openStudio(p.id) }]
+    actions = [{ key: 'continue', label: 'Continue', variant: 'secondary', disabled: busy, onClick: () => decideOnCard(p, { gate: 'resume' }) }, { key: 'studio', label: 'Open in studio', onClick: () => openStudio(p.id) }]
   }
   return h(CardShell, { title: p.title, badge: h(StateBadge, { production: p }), actions }, body)
 }
@@ -2573,7 +2664,7 @@ function ToolClipCardInner({ file, toolName, args, result, sessionId, fallback }
   const v = row ? verdictOf(row, p) : null
   const f = row ? sceneFacts(row) : null
   const actions = []
-  if (info.kind === 'first') actions.push({ key: 'continue', label: 'Looks good, continue the film', variant: 'default', onClick: () => send(`Looks good, continue the film${ref ? ` ${ref}` : ''}.`) })
+  // The first scene's decision is on the film card above it: one place to answer, never two.
   if (row && p) sceneActions(row, p, send, { compact: true }).forEach(a => actions.push(a))
   else {
     actions.push({ key: 'reroll', label: 'Reroll this scene', onClick: () => send(`Reroll ${subjectText('this scene')}.`) })

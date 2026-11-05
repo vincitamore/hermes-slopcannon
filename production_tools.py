@@ -33,32 +33,34 @@ _MAX_WAIT_S = 300
 
 # What the agent should do next at each gate. Kept beside the tool so the skill and
 # the result never disagree.
+# On Hermes desktop the film card is where the person answers a gate: its buttons record the answer and resume
+# the film, so the agent shows the card and stops. Through chat (or a surface with no card) the agent passes the
+# person's answer to slopcannon_produce and Hermes asks again in an approval prompt.
+_ON_CARD = ("The film card in `show` carries this decision on Hermes desktop: its buttons are the person's answer "
+            "and resume the film by themselves, and the card then shows each next step. Write the `show` lines and "
+            "one short sentence on what the card asks, then END YOUR TURN: do not answer the gate yourself, and do "
+            "not ask the person to reply in chat. Only if the person answers you in chat instead, or this surface "
+            "shows no card, ")
+
 NEXT: dict[str, str] = {
-    "rights": ("Call slopcannon_produce again now, in this same turn, with this production_id and rights_version = "
-               "needsDetail.requiredVersion. Do not ask the person to type their agreement: Hermes shows them the "
-               "statement and the files in an approval prompt, and their Approve is the sign-off. Say one line "
-               "first (what the files are and that the prompt carries the statement)."),
-    "approval": ("Show every scene's quote and needsDetail.totalCannonCredits in a short table, then call "
-                 "slopcannon_produce again now, in this same turn, with approve_credits = "
-                 "needsDetail.totalCannonCredits. Do not ask the person to reply in chat: Hermes shows them the "
-                 "figure in an approval prompt, and Approve or Deny is their answer."),
-    "budget": ("The approved ceiling is too low for the work still to buy (needsDetail). Ask the person for a "
-               "higher ceiling and pass it as approve_credits, or stop."),
-    "first_scene_review": ("The first scene is ready and the character check has already watched it: do not "
-                           "inspect the file yourself. After showing it, in this same turn, call slopcannon_produce with review_first = needsDetail.sha256: "
-                           "Hermes asks the person in an approval prompt to watch the scene and approve rendering "
-                           "the rest. Do not ask them to reply in chat. If they deny, ask what to change and start "
-                           "a new production_id with the revised direction."),
-    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second); each flagged clip is "
-                    "in `show`. If needsDetail.unchecked lists takes the check could not reach, call "
-                    "slopcannon_produce with the production_id first: it checks them again (never check, quote or "
-                    "look up a scene by hand). Ask the person, per flagged scene, to keep it or replace it. Then make "
-                    "ONE slopcannon_produce call with accept_checks (the scenes kept) and reroll (a list of every "
-                    "scene to replace, each {scene, direction}); it quotes all the new takes and stops for one "
-                    "approval. Never quote, upload or submit a production's scenes with the per-scene tools."),
-    "reroll_approval": ("The new takes (needsDetail.quotes) are quoted at needsDetail.amountUnits Cannon Credits in "
-                        "all. Say so in one line, then call slopcannon_produce again now with approve_reroll = "
-                        "needsDetail.amountUnits: Hermes asks the person in one approval prompt. Do not ask in chat."),
+    "rights": _ON_CARD + ("call slopcannon_produce with this production_id and rights_version = "
+                          "needsDetail.requiredVersion: Hermes shows them the statement in an approval prompt."),
+    "approval": _ON_CARD + ("call slopcannon_produce with approve_credits = needsDetail.totalCannonCredits: Hermes "
+                            "asks them in an approval prompt."),
+    "budget": _ON_CARD + ("call slopcannon_produce with approve_credits = needsDetail.exposureCredits: Hermes asks "
+                          "them in an approval prompt."),
+    "first_scene_review": ("The first scene is ready and the character check has already watched it: do not inspect "
+                           "the file yourself. " + _ON_CARD + "call slopcannon_produce with review_first = "
+                           "needsDetail.sha256 (Hermes asks them in an approval prompt); if they want a different "
+                           "direction, start a new production_id with it."),
+    "shot_review": ("The character check flagged takes (needsDetail.flagged); each flagged clip is in `show`. If "
+                    "needsDetail.unchecked lists takes the check could not reach, first call slopcannon_produce with "
+                    "the production_id: it checks them again (never check, quote or look up a scene by hand). "
+                    + _ON_CARD + "make ONE slopcannon_produce call with accept_checks (the scenes kept) and reroll "
+                    "(a list of every scene to replace, each {scene, direction}); never quote, upload or submit a "
+                    "production's scenes with the per-scene tools."),
+    "reroll_approval": _ON_CARD + ("call slopcannon_produce with approve_reroll = needsDetail.amountUnits: Hermes "
+                                   "asks them in an approval prompt."),
     "review": "Some scenes did not deliver. Show needsDetail.failed; run slopcannon_production_status later, or "
               "revise the direction in a new production_id.",
     "new_revision": "The inputs changed after paid work began. Use a new production_id for the revision.",
@@ -219,12 +221,11 @@ PRODUCE = ToolSpec("slopcannon_produce", {
     "description": (
         "Make a whole SLOPCANNON music video from a local song in one call: uploads, scene plan, quotes, a first "
         "scene for review, parallel renders, character checks and assembly, run in the background and resumable. "
-        "Start with `production` (and `timed_plan` when the person supplied one); pass rights_version "
-        "(slopcannon_account's rights.requiredVersion) on that first call and Hermes shows the person the rights "
-        "statement and files in an approval prompt. It stops at each later human gate (credit approval, "
-        "first-scene review, flagged takes) and says exactly what to do. Answer a gate by calling again at once "
-        "with the same production_id and approve_credits / review_first / accept_checks / reroll / approve_reroll; Hermes asks the person "
-        "to approve each answer in a prompt, so never ask them to type an agreement in chat. It does the uploads, "
+        "Start with `production` (and `timed_plan` when the person supplied one). It stops at each human gate "
+        "(rights sign-off, credit approval, first-scene review, flagged takes, a reroll's quote) and says exactly "
+        "what to do: on Hermes desktop the person answers on the film card, so show the card and end the turn. "
+        "When the person answers in chat, pass it with the same production_id as rights_version / approve_credits / "
+        "review_first / accept_checks / reroll / approve_reroll; Hermes asks them to approve it in a prompt. It does the uploads, "
         "hashing and quotes itself, and validates the production and timed_plan before anything is signed: do not "
         "run node or the skill's scripts yourself. Nothing is bought twice. Prefer this over driving the per-scene "
         "tools by hand."),

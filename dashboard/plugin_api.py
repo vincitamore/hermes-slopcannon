@@ -3,8 +3,13 @@
 Hermes imports this file inside the gateway process when the plugin is enabled
 in ``plugins.enabled``. It reads the same on-disk production state the agent
 tools write, so the studio is correct whichever process drove a production.
-Nothing here spends credits or records a rights sign-off: those happen only
-through agent tool calls that pass Hermes's approval prompt.
+
+``/decide`` is the film card's buttons: the person's own click answering the
+gate a production is stopped at (rights sign-off, the quoted spend, the first
+scene, keep or reroll). It accepts only the exact figure, version or file the
+gate names, keeps the seat's credit ceiling, and the agent's tools may not
+call these routes (gate.py). Through chat, the same answers go through
+slopcannon_produce and Hermes's approval prompt.
 """
 from __future__ import annotations
 
@@ -152,6 +157,15 @@ def production_stop(production_id: str) -> dict[str, Any]:
         return {"stopped": production.stop(production_id)}
     except production.ProductionError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/productions/{production_id}/decide")
+def production_decide(production_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    production = _mod("production")
+    try:
+        return {"ok": True, "production": production.decide(production_id, body if isinstance(body, dict) else {})}
+    except production.ProductionError as exc:
+        raise HTTPException(status_code=409 if exc.code in ("busy", "stale_decision") else 400, detail=str(exc))
 
 
 @router.post("/login")

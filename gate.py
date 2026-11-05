@@ -276,7 +276,8 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
-_PRIVATE = ("plugin-data/slopcannon", "plugins/slopcannon/")
+# The production files, the driver, and the film card's decision routes (a person's click, never the agent's).
+_PRIVATE = ("plugin-data/slopcannon", "plugins/slopcannon/", "api/plugins/slopcannon")
 
 
 def _private_paths_directive(tool_name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -285,9 +286,15 @@ def _private_paths_directive(tool_name: str, args: dict[str, Any]) -> Optional[d
     Hand edits to a ledger can lose a paid job's receipt, and an agent digging through them mid-film is the
     failure the tools exist to prevent, so any other tool whose arguments name those folders is refused.
     """
-    if tool_name.startswith("slopcannon_") or str(settings.get("protect_production_files")).lower() in ("false", "0", "no"):
+    if tool_name.startswith("slopcannon_"):
         return None
     text = json.dumps(args, default=str).replace("\\\\", "/").replace("\\", "/").lower()
+    if "api/plugins/slopcannon" in text:  # the film card's buttons: on every seat, the person's click only
+        return {"action": "block", "message": (
+            "BLOCKED: the SLOPCANNON film card's routes are the person's own buttons. The person answers on the "
+            "card; if they answer you in chat, pass their answer to slopcannon_produce.")}
+    if str(settings.get("protect_production_files")).lower() in ("false", "0", "no"):
+        return None
     if not any(part in text for part in _PRIVATE):
         return None
     return {"action": "block", "message": (
