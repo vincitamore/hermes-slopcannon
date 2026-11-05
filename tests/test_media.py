@@ -1,4 +1,5 @@
-"""Media module: cache keys, path confinement, the ffmpeg-missing fallback and the poster choice.
+"""Media module: cache keys, path confinement, the ffmpeg-missing fallback, the poster heuristic and the
+chosen-poster record.
 
 The ffmpeg cases build tiny fixtures with lavfi (testsrc / colour / sine) and skip when ffmpeg is absent.
 Run with the other tests: python -m unittest discover -s tests
@@ -146,13 +147,91 @@ class NoFfmpegTest(MediaTestBase):
             self.assertEqual(media.artefact(clip.resolve(), "clip")["state"], "error")
 
 
+W, H = media.SCORE_W, media.SCORE_H
+
+
+def _image(pixel) -> bytes:
+    return bytes(v for y in range(H) for x in range(W) for v in pixel(x, y))
+
+
+def _interface(x, y):
+    """A screen recording: flat orange cards with straight borders on a dark panel, rows of 1-px text."""
+    cx, cy = x % 52, y % 42
+    if cx < 4 or cy < 4:
+        return (24, 24, 30)
+    if 10 <= cy <= 30 and cy % 4 == 2 and 8 <= cx <= 46 and x % 3 != 0:
+        return (250, 250, 250)
+    return (236, 92, 60)
+
+
+def _picture(x, y):
+    """A subject: a bright warm shape on a smooth dark-to-light gradient, with the fine grain any footage
+    has (no lines, no text)."""
+    import math
+    glow = math.exp(-((x - 100) ** 2 + (y - 40) ** 2) / 260.0)
+    grain = (x * 73856093 ^ y * 19349663) % 17 - 8
+    return tuple(max(0, min(255, int(v + grain))) for v in (30 + x / 2 + 215 * glow, 28 + y + 150 * glow, 70 + 40 * glow))
+
+
+# The lavfi fixture: two seconds of testsrc (saturated bars, a counter: an interface-like card), then two
+# of a smooth gradient with a bright subject.
+UI_THEN_PICTURE = (
+    "testsrc=s=320x180:d=2:r=10[a];"
+    "nullsrc=s=320x180:d=2:r=10,geq="
+    "r='clip(30+X/4+225*exp(-((X-200)*(X-200)+(Y-80)*(Y-80))/1200),0,255)':"
+    "g='clip(25+Y/3+170*exp(-((X-200)*(X-200)+(Y-80)*(Y-80))/1200),0,255)':"
+    "b='clip(70+X/8+40*exp(-((X-200)*(X-200)+(Y-80)*(Y-80))/1200),0,255)'[b];"
+    "[a][b]concat=n=2:v=1"
+)
+
+
 class ScoreTest(unittest.TestCase):
-    def test_dark_frames_lose_to_detail(self):
-        black = bytes(64 * 36 * 3)
-        white = bytes([250]) * (64 * 36 * 3)
-        stripes = bytes(v for i in range(64 * 36) for v in ((200, 60, 30) if i % 2 else (20, 40, 160)))
-        self.assertEqual(media.frame_score(black), 0.0)
-        self.assertGreater(media.frame_score(stripes), media.frame_score(white))
+    def test_dark_and_blank_frames_score_nothing(self):
+        self.assertEqual(media.frame_score(bytes(W * H * 3)), 0.0)
+        self.assertLess(media.frame_score(bytes([250]) * (W * H * 3)), 0.05)
+        self.assertEqual(media.frame_score(b""), 0.0)
+
+    def test_an_interface_loses_to_a_picture_although_it_is_more_colourful(self):
+        ui, pic = _image(_interface), _image(_picture)
+        f_ui, f_pic = media.frame_features(ui), media.frame_features(pic)
+        self.assertGreater(f_ui["appeal"], f_pic["appeal"])  # raw contrast and colour would pick the cards
+        self.assertGreater(f_ui["straight"], 0.3)
+        self.assertGreater(f_ui["flat"], 0.2)
+        self.assertGreater(f_ui["thin"], f_pic["thin"])
+        self.assertLess(f_pic["ui"], 0.2)
+        self.assertGreater(media.frame_score(pic), 2 * media.frame_score(ui))
+
+    def test_candidates_leave_out_the_first_and_last_five_percent(self):
+        times = media.candidate_times(60.0)
+        self.assertEqual(len(times), media.FILM_CANDIDATES)
+        self.assertGreaterEqual(min(times), 3.0)
+        self.assertLessEqual(max(times), 57.0)
+        self.assertEqual(times, sorted(times))
+
+
+class PosterChoiceRecordTest(MediaTestBase):
+    """The chosen poster is the plugin's own record; inputs are checked before anything is written."""
+
+    def test_bad_times_and_productions_without_a_film_are_refused(self):
+        film = self.base / "film.mp4"
+        film.write_bytes(b"0")
+        self.make_production("p1", master=film)
+        self.make_production("p2")
+        with mock.patch.object(media, "duration_s", lambda _p: 10.0):
+            for bad in (True, "1500", -1, float("nan"), float("inf"), media.MAX_POSTER_MS + 1, [1]):
+                with self.assertRaises(media.MediaError, msg=repr(bad)):
+                    media.set_poster("p1", bad)
+            with self.assertRaises(media.MediaError):
+                media.set_poster("p2", 1000)
+        with self.assertRaises(production.ProductionError):
+            media.set_poster("../p1", 1000)
+        self.assertFalse((self.root.parent / media.POSTERS_FILE).exists())
+
+    def test_a_garbled_record_reads_as_no_choice(self):
+        (self.root.parent / media.POSTERS_FILE).write_text('{"p1": "soon", "p2": 1200, "p3": true}', encoding="utf-8")
+        self.assertEqual(media.poster_choices(), {"p2": 1200})
+        (self.root.parent / media.POSTERS_FILE).write_text("[1, 2", encoding="utf-8")
+        self.assertEqual(media.poster_choices(), {})
 
 
 @unittest.skipUnless(HAVE_FFMPEG, "ffmpeg not installed")
@@ -163,6 +242,41 @@ class FfmpegTest(MediaTestBase):
                       "-pix_fmt", "yuv420p")
         film = film.resolve()
         self.assertGreater(media.best_frame_time(film, media.duration_s(film)), 3.0)
+
+    def test_poster_prefers_a_picture_to_an_interface(self):
+        film = _lavfi(self.base / "film.mp4", UI_THEN_PICTURE, "-pix_fmt", "yuv420p").resolve()
+        self.assertGreater(media.best_frame_time(film, media.duration_s(film)), 2.0)
+
+    def test_a_chosen_poster_persists_and_automatic_comes_back(self):
+        film = _lavfi(self.base / "film.mp4", UI_THEN_PICTURE, "-pix_fmt", "yuv420p").resolve()
+        folder = self.make_production("p1", master=film)
+        auto = self.settle("p1")["film"]
+        self.assertEqual(auto["state"], "ready", auto)
+        self.assertFalse(auto["posterChosen"])
+        self.assertGreater(auto["posterAtMs"], 2000)
+        before = {f.name: f.read_bytes() for f in folder.rglob("*") if f.is_file()}
+
+        out = media.set_poster("p1", 1000)
+        self.assertTrue(out["film"]["posterChosen"])
+        chosen = self.settle("p1")["film"]
+        self.assertEqual(chosen["state"], "ready", chosen)
+        self.assertEqual((chosen["posterChosen"], chosen["posterAtMs"]), (True, 1000))
+        self.assertNotEqual(chosen["poster"], auto["poster"])
+        self.assertEqual(media.thumbs(["p1"])["thumbs"]["p1"], chosen["thumb"])
+        # Kept in the plugin's own data beside the cache, never in the production's files.
+        record = json.loads((self.root.parent / media.POSTERS_FILE).read_text(encoding="utf-8"))
+        self.assertEqual(record, {"p1": 1000})
+        self.assertEqual({f.name: f.read_bytes() for f in folder.rglob("*") if f.is_file()}, before)
+        # A fresh read (another process, a restart) sees the same choice; a time past the end is clamped.
+        self.assertEqual(media.poster_choice("p1"), 1000)
+        media.set_poster("p1", 99_000)
+        self.assertLessEqual(media.poster_choice("p1"), 4000)
+        self.settle("p1")
+
+        back = media.set_poster("p1", None)["film"]
+        self.assertEqual(back["state"], "ready")  # the automatic frames are still cached
+        self.assertEqual((back["posterChosen"], back["poster"]), (False, auto["poster"]))
+        self.assertEqual(media.poster_choices(), {})
 
     def test_production_media_end_to_end(self):
         clip = _lavfi(self.base / "clip.mp4", "testsrc=s=320x180:d=2:r=10", "-pix_fmt", "yuv420p")

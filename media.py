@@ -14,12 +14,17 @@ Safety: a request never names a file. Sources are only the paths a production's 
 (``state.json`` master, ``ledger.json`` downloads, ``production.json`` song), checked to be existing
 media files; the UI then reads finished images by an opaque cache name that must match ``_NAME`` and
 is resolved inside the cache folder only.
+
+The film's poster is the best of FILM_CANDIDATES frames (``frame_score``: a picture with colour and tonal
+range, not a dark fade, a white card or a frame of an interface), unless the person chose one in the
+studio; that choice is the plugin's own record (``posters.json`` beside the cache), never the production's.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -35,13 +40,16 @@ from typing import Any, Callable, Optional
 from . import production
 
 VERSION = 1
+POSTER_VERSION = 2  # the automatic poster's heuristic: a new one re-picks every film's poster
 STRIP_FRAMES = 6
 POSTER_W = 640
 FILM_W = 1280
 THUMB_W = 192
 STRIP_H = 135
 WAVE_BUCKETS = 480
-FILM_CANDIDATES = 9
+FILM_CANDIDATES = 15
+EDGE_MARGIN = 0.05
+SCORE_W, SCORE_H = 160, 90
 WORKERS = 2
 RETRY_S = 600
 _TIMEOUT_S = 90
@@ -51,7 +59,11 @@ _NAME = re.compile(r"^[a-f0-9]{24}-(poster|strip|thumb)\.jpg$")
 _SCENE = re.compile(r"^sc\d{1,3}$")
 _KINDS = {"clip": ("poster", "strip", "thumb"), "film": ("poster", "thumb"), "wave": ()}
 
+POSTERS_FILE = "posters.json"
+MAX_POSTER_MS = 6 * 3600 * 1000
+
 _lock = threading.Lock()
+_posters_lock = threading.Lock()
 _inflight: set[str] = set()
 _pool: Optional[ThreadPoolExecutor] = None
 
@@ -148,44 +160,123 @@ def _strip(path: Path, dur: float, out: Path) -> None:
     _run(args + ["-filter_complex", graph, "-map", "[out]", "-frames:v", "1", "-q:v", "5", str(out)])
 
 
-def frame_score(rgb: bytes) -> float:
-    """How much a small RGB frame shows: contrast and colour, with dark fades and blown-out cards losing."""
+def frame_features(rgb: bytes, w: int = SCORE_W) -> dict[str, float]:
+    """What a small RGB frame (``w`` wide, rows inferred) shows, as numbers in roughly 0..2.
+
+    ``appeal``: contrast and colour, best at mid exposure (a black fade or a white card loses).
+    ``tonal``: the 2nd..98th percentile luma range. Then three marks of a screen recording or a title card
+    rather than a picture: ``straight`` (share of edges that lie on long horizontal or vertical lines: card
+    borders, panels, rules), ``thin`` (one-pixel strokes: small text) and ``flat`` (large flat saturated
+    areas: filled UI cards and buttons).
+    """
     n = len(rgb) // 3
-    if n == 0:
-        return 0.0
-    luma, rg, yb = [], [], []
+    h = n // w if w else 0
+    n = w * h
+    zero = {"mean": 0.0, "appeal": 0.0, "tonal": 0.0, "straight": 0.0, "thin": 0.0, "flat": 0.0, "ui": 0.0}
+    if n == 0 or h < 3 or w < 3:
+        return zero
+    L = [0.0] * n
+    sat = [0.0] * n
+    s_l = s_rg = s_yb = 0.0
     for i in range(n):
         r, g, b = rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]
-        luma.append(0.299 * r + 0.587 * g + 0.114 * b)
-        rg.append(r - g)
-        yb.append((r + g) / 2 - b)
-    mean = sum(luma) / n
-    if mean < 18:
-        return 0.0
-    std = (sum((v - mean) ** 2 for v in luma) / n) ** 0.5
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        L[i] = y
+        hi, lo = max(r, g, b), min(r, g, b)
+        sat[i] = (hi - lo) / hi if hi else 0.0
+        s_l += y
+        s_rg += r - g
+        s_yb += (r + g) / 2 - b
+    mean, m_rg, m_yb = s_l / n, s_rg / n, s_yb / n
+    v_l = v_rg = v_yb = 0.0
+    for i in range(n):
+        r, g, b = rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]
+        v_l += (L[i] - mean) ** 2
+        v_rg += (r - g - m_rg) ** 2
+        v_yb += ((r + g) / 2 - b - m_yb) ** 2
+    std = (v_l / n) ** 0.5
+    colour = ((v_rg + v_yb) / n) ** 0.5 + 0.3 * (m_rg ** 2 + m_yb ** 2) ** 0.5
+    exposure = max(0.0, 1.0 - abs(mean - 120) / 160)
+    appeal = exposure * (std / 64.0 + colour / 48.0) if mean >= 18 else 0.0
+    ranked = sorted(L)
+    tonal = (ranked[int(n * 0.98)] - ranked[int(n * 0.02)]) / 255.0
 
-    def spread(xs: list[float]) -> tuple[float, float]:
-        m = sum(xs) / n
-        return m, (sum((x - m) ** 2 for x in xs) / n) ** 0.5
+    edge_t, stroke_t, flat_t = 36.0, 30.0, 6.0
+    edges = 0
+    for y in range(h - 1):
+        row = y * w
+        for x in range(w - 1):
+            i = row + x
+            if abs(L[i + 1] - L[i]) > edge_t or abs(L[i + w] - L[i]) > edge_t:
+                edges += 1
 
-    (m_rg, s_rg), (m_yb, s_yb) = spread(rg), spread(yb)
-    colour = (s_rg ** 2 + s_yb ** 2) ** 0.5 + 0.3 * (m_rg ** 2 + m_yb ** 2) ** 0.5
-    exposure = 1.0 - abs(mean - 120) / 160  # best mid-grey; a white card or a near-black frame loses
-    return max(0.0, exposure) * (std / 64.0 + colour / 48.0)
+    def lines(count: int, length: int, step: int, across: int, min_run: int) -> int:
+        """Pixels on runs of at least ``min_run`` same-signed edges along ``step`` (a straight line)."""
+        on = 0
+        for k in range(count):
+            run = sign = 0
+            for j in range(length):
+                i = k * across + j * step
+                d = L[i + across] - L[i]
+                s = 1 if d > edge_t else (-1 if d < -edge_t else 0)
+                if s and s == sign:
+                    run += 1
+                else:
+                    if run >= min_run:
+                        on += run
+                    run, sign = (1 if s else 0), s
+            if run >= min_run:
+                on += run
+        return on
+
+    horizontal = lines(h - 1, w, 1, w, max(8, int(w * 0.09)))   # along a row, edge across it
+    vertical = lines(w - 1, h, w, 1, max(6, int(h * 0.11)))     # down a column, edge across it
+    straight = (horizontal + vertical) / max(1, edges)
+    thin = flat = 0
+    for y in range(1, h - 1):
+        row = y * w
+        for x in range(1, w - 1):
+            i = row + x
+            c = L[i]
+            a, b, u, d = L[i - 1] - c, L[i + 1] - c, L[i - w] - c, L[i + w] - c
+            if (a > stroke_t and b > stroke_t) or (a < -stroke_t and b < -stroke_t) or \
+                    (u > stroke_t and d > stroke_t) or (u < -stroke_t and d < -stroke_t):
+                thin += 1
+            if sat[i] > 0.5 and c > 70 and abs(a) < flat_t and abs(b) < flat_t and abs(u) < flat_t and \
+                    abs(d) < flat_t and abs(L[i - w - 1] - c) < flat_t and abs(L[i + w + 1] - c) < flat_t:
+                flat += 1
+    thin_f, flat_f = thin / n, flat / n
+    ui = 1.8 * straight + 5.0 * flat_f + 8.0 * max(0.0, thin_f - 0.015)
+    return {"mean": mean, "appeal": appeal, "tonal": tonal, "straight": straight, "thin": thin_f, "flat": flat_f,
+            "ui": ui}
+
+
+def frame_score(rgb: bytes, w: int = SCORE_W) -> float:
+    """How good a poster a small RGB frame makes: a picture with colour and tonal range wins; a dark fade,
+    a white card and a frame that reads as an interface (panels, small text, flat filled cards) lose."""
+    f = frame_features(rgb, w)
+    return f["appeal"] * max(0.05, 1.0 - f["ui"]) * (0.5 + 0.5 * f["tonal"])
+
+
+def candidate_times(dur: float) -> list[float]:
+    """FILM_CANDIDATES evenly spaced timestamps, leaving out the first and last EDGE_MARGIN of the film
+    (title cards and end slates live there)."""
+    lo, span = dur * EDGE_MARGIN, dur * (1 - 2 * EDGE_MARGIN)
+    return [lo + span * (i + 0.5) / FILM_CANDIDATES for i in range(FILM_CANDIDATES)]
 
 
 def best_frame_time(path: Path, dur: float) -> float:
     """The candidate timestamp whose frame scores highest; the middle of the film if none decodes."""
     ffmpeg = _ffmpeg()
     best_t, best = dur / 2, -1.0
-    for i in range(FILM_CANDIDATES):
-        t = dur * (i + 0.5) / FILM_CANDIDATES
+    for t in candidate_times(dur):
         try:
             raw = _run([ffmpeg, "-v", "error", "-nostdin", "-ss", f"{t:.3f}", "-i", str(path), "-frames:v", "1",
-                        "-vf", "scale=64:36,format=rgb24", "-f", "rawvideo", "-"], binary=True).stdout
+                        "-vf", f"scale={SCORE_W}:{SCORE_H}:flags=area,format=rgb24", "-f", "rawvideo", "-"],
+                       binary=True).stdout
         except (subprocess.SubprocessError, OSError):
             continue
-        score = frame_score(raw)
+        score = frame_score(raw, SCORE_W)
         if score > best:
             best_t, best = t, score
     return best_t
@@ -227,7 +318,7 @@ def _write_json(out: Path, value: Any) -> None:
     _atomic(out, make)
 
 
-def _make(kind: str, src: Path, key: str) -> None:
+def _make(kind: str, src: Path, key: str, at_ms: Optional[int] = None) -> None:
     root = cache_dir()
     dur = duration_s(src)
     if kind == "clip":
@@ -236,18 +327,20 @@ def _make(kind: str, src: Path, key: str) -> None:
         _atomic(root / f"{key}-strip.jpg", lambda t: _strip(src, dur, t))
         _write_json(root / f"{key}.json", {"durationMs": int(dur * 1000), "frames": STRIP_FRAMES})
     elif kind == "film":
-        at = best_frame_time(src, dur)
+        chosen = at_ms is not None
+        at = min(max(0.0, at_ms / 1000), max(0.0, dur - 0.05)) if chosen else best_frame_time(src, dur)
         _atomic(root / f"{key}-poster.jpg", lambda t: _frame(src, at, t, FILM_W, 5))
         _atomic(root / f"{key}-thumb.jpg", lambda t: _frame(src, at, t, THUMB_W, 5))
-        _write_json(root / f"{key}.json", {"durationMs": int(dur * 1000), "posterAtMs": int(at * 1000)})
+        _write_json(root / f"{key}.json", {"durationMs": int(dur * 1000), "posterAtMs": int(at * 1000),
+                                           "posterChosen": chosen})
     elif kind == "wave":
         _write_json(root / f"{key}.json", envelope(src))
 
 
-def _job(kind: str, src: Path, key: str) -> None:
+def _job(kind: str, src: Path, key: str, at_ms: Optional[int] = None) -> None:
     err = cache_dir() / f"{key}.err"
     try:
-        _make(kind, src, key)
+        _make(kind, src, key, at_ms)
         err.unlink(missing_ok=True)
     except Exception as exc:  # recorded, retried after RETRY_S; the UI shows a neutral slot meanwhile
         try:
@@ -259,7 +352,7 @@ def _job(kind: str, src: Path, key: str) -> None:
             _inflight.discard(key)
 
 
-def _schedule(kind: str, src: Path, key: str) -> None:
+def _schedule(kind: str, src: Path, key: str, at_ms: Optional[int] = None) -> None:
     global _pool
     with _lock:
         if key in _inflight:
@@ -268,18 +361,22 @@ def _schedule(kind: str, src: Path, key: str) -> None:
         if _pool is None:
             _pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="slopcannon-media")
         pool = _pool
-    pool.submit(_job, kind, src, key)
+    pool.submit(_job, kind, src, key, at_ms)
 
 
-def artefact(src: Optional[Path], kind: str, *, schedule: bool = True) -> dict[str, Any]:
+def artefact(src: Optional[Path], kind: str, *, schedule: bool = True, at_ms: Optional[int] = None) -> dict[str, Any]:
     """One source's artefacts: ``ready`` with cache names, ``pending``, ``unavailable`` (no ffmpeg),
-    ``missing`` (no file) or ``error`` (ffmpeg failed; retried later)."""
+    ``missing`` (no file) or ``error`` (ffmpeg failed; retried later). ``at_ms`` (films only) is a poster
+    time the person chose; it is part of the cache key, so choosing again, or going back to the automatic
+    poster, never overwrites another choice's frames."""
     if src is None:
         return {"state": "missing"}
     if not available():
         return {"state": "unavailable"}
+    if kind != "film":
+        at_ms = None
     try:
-        key = source_key(src, kind)
+        key = source_key(src, kind if kind != "film" else f"film@{at_ms}" if at_ms is not None else f"film.v{POSTER_VERSION}")
     except OSError:
         return {"state": "missing"}
     root = cache_dir()
@@ -298,8 +395,61 @@ def artefact(src: Optional[Path], kind: str, *, schedule: bool = True) -> dict[s
     except OSError:
         pass
     if schedule:
-        _schedule(kind, src, key)
+        _schedule(kind, src, key, at_ms)
     return {"state": "pending"}
+
+
+# --------------------------------------------------------------------------- chosen posters
+#
+# A poster the person picks in the studio ("Use this frame as poster") is the plugin's own record, kept
+# beside the media cache in the plugin's data folder: a production's own files are never written for it.
+
+
+def _posters_file() -> Path:
+    return production.root().parent / POSTERS_FILE
+
+
+def poster_choices() -> dict[str, int]:
+    try:
+        raw = json.loads(_posters_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {pid: int(v) for pid, v in raw.items()
+            if isinstance(pid, str) and isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_POSTER_MS}
+
+
+def poster_choice(production_id: str) -> Optional[int]:
+    return poster_choices().get(production_id)
+
+
+def set_poster(production_id: str, at_ms: Any) -> dict[str, Any]:
+    """Use the film's frame at ``at_ms`` as its poster, or (``None``) go back to the automatic choice.
+    Returns the production's media, with the new poster ``pending`` until it is made."""
+    state, _, _ = _records(production_id)  # validates the id and that the production exists
+    master = _media_file((state.get("master") or {}).get("path"), _VIDEO)
+    if master is None:
+        raise MediaError("this production has no finished film")
+    if at_ms is not None:
+        if isinstance(at_ms, bool) or not isinstance(at_ms, (int, float)) or not math.isfinite(at_ms):
+            raise MediaError("the poster time must be a number of milliseconds")
+        at_ms = int(at_ms)
+        if not 0 <= at_ms <= MAX_POSTER_MS:
+            raise MediaError("the poster time is outside the film")
+        try:
+            at_ms = min(at_ms, max(0, int(duration_s(master) * 1000) - 50))
+        except (MediaError, subprocess.SubprocessError, OSError, ValueError):
+            pass  # no ffprobe: the frame is clamped when it is made
+    with _posters_lock:
+        choices = poster_choices()
+        if at_ms is None:
+            choices.pop(production_id, None)
+        else:
+            choices[production_id] = at_ms
+        _posters_file().parent.mkdir(parents=True, exist_ok=True)
+        _write_json(_posters_file(), choices)
+    return production_media(production_id)
 
 
 # --------------------------------------------------------------------------- per production
@@ -329,7 +479,11 @@ def production_media(production_id: str) -> dict[str, Any]:
     state, ledger, spec = _records(production_id)
     master = _media_file((state.get("master") or {}).get("path"), _VIDEO)
     scenes = {sid: artefact(path, "clip") for sid, path in _clips(ledger).items()}
-    film = artefact(master, "film") if master else {"state": "missing"}
+    chosen = poster_choice(production_id)
+    film = artefact(master, "film", at_ms=chosen) if master else {"state": "missing"}
+    film["posterChosen"] = chosen is not None
+    if chosen is not None:
+        film.setdefault("posterAtMs", chosen)
     song = _media_file(spec.get("song"), _AUDIO | _VIDEO)
     wave_src, wave_from = (song, "song") if song else (master, "film")
     wave = artefact(wave_src, "wave")
@@ -343,6 +497,7 @@ def thumbs(production_ids: list[str]) -> dict[str, Any]:
     """A small picture per production for the studio list: the film's, else its latest rendered scene's."""
     out: dict[str, Optional[str]] = {}
     pending = False
+    choices = poster_choices()
     for pid in production_ids:
         try:
             state, ledger, _ = _records(pid)
@@ -351,7 +506,7 @@ def thumbs(production_ids: list[str]) -> dict[str, Any]:
         master = _media_file((state.get("master") or {}).get("path"), _VIDEO)
         clips = _clips(ledger)
         src, kind = (master, "film") if master else ((clips[max(clips)], "clip") if clips else (None, "clip"))
-        art = artefact(src, kind)
+        art = artefact(src, kind, at_ms=choices.get(pid) if master else None)
         pending = pending or art["state"] == "pending"
         out[pid] = art.get("thumb") if art["state"] == "ready" else None
     return {"ffmpeg": available(), "pending": pending, "thumbs": out}

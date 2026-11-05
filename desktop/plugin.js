@@ -13,7 +13,7 @@
 //     that changes in place (needs you, rendering, done)
 //   - tool media renderer for this package's own tools' MEDIA files (scene card)
 //
-// Design: Hermes's own primitives (Button, Badge, Loader, EmptyState, Tip) and
+// Design: Hermes's own primitives (Button, Badge, Loader, Tip, ConfirmDialog) and
 // live theme variables only; the film's frames carry the colour. Frames and
 // the song envelope come from the backend (media.py) by opaque cache name.
 //
@@ -49,7 +49,6 @@ const {
   Tip,
   ConfirmDialog,
   Loader,
-  EmptyState,
   LogView,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
@@ -863,6 +862,11 @@ const CSS = `
 .sc-film[data-portrait=true]>img{object-fit:contain}
 .sc-film[data-started=false]>video{opacity:0}
 .sc-film[data-started=false][data-has-poster=false]>video{opacity:1}
+.sc-stage{display:flex;justify-content:center;min-width:0;background:black;--sc-cap:clamp(220px,calc(100vh - 540px),620px)}
+.sc-stage>.sc-film{flex:none;width:min(100%,calc(var(--sc-cap) * var(--sc-ar,1.7778)));max-height:none}
+.sc-stage>.sc-film-fallback{flex:1;padding:12px;background:var(--ui-bg-secondary)}
+.sc-posterbar{display:flex;align-items:center;justify-content:flex-end;gap:2px 8px;flex-wrap:wrap;min-height:24px;margin-top:-12px;font-size:.6875rem;color:var(--ui-text-tertiary)}
+.sc-tipwrap{display:inline-flex}
 .sc-film-over{position:absolute;left:16px;right:16px;bottom:14px;display:flex;align-items:center;gap:10px;pointer-events:none}
 .sc-film-over>*{pointer-events:auto}
 .sc-film[data-compact=true] .sc-film-over{left:12px;right:12px;bottom:10px}
@@ -926,8 +930,17 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-details[open]>summary .codicon{transform:rotate(90deg)}
 .sc-details>*+*{margin-top:8px}
 .sc-log{max-height:240px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem;line-height:1.5;color:var(--ui-text-secondary)}
-.sc-empty{display:flex;flex-direction:column;align-items:center;gap:14px;max-width:640px;margin:0 auto;padding:40px 0}
-.sc-empty-row{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;font-size:.75rem;color:var(--ui-text-tertiary)}
+.sc-first{display:flex;flex-direction:column;gap:18px;min-width:0;padding-top:6px}
+.sc-first-tl .sc-wave{opacity:.28}
+.sc-first-tl .sc-seg[data-kind=plan]{box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary)}
+.sc-beats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin:0;padding:0;list-style:none;counter-reset:sc-beat}
+.sc-beat{display:flex;flex-direction:column;gap:3px;min-width:0;padding-top:10px;border-top:1px solid var(--ui-stroke-secondary);counter-increment:sc-beat}
+.sc-beat b{font-weight:600}
+.sc-beat b::before{content:counter(sc-beat,decimal-leading-zero);margin-right:8px;font-family:var(--font-mono,ui-monospace,SFMono-Regular,Menlo,Consolas,monospace);font-size:.6875rem;font-weight:600;color:var(--ui-text-quaternary)}
+.sc-beat span{color:var(--ui-text-secondary);max-width:34ch}
+@container (max-width:700px){.sc-beats{grid-template-columns:minmax(0,1fr);gap:12px}}
+.sc-first-acts{display:flex;align-items:center;gap:8px 16px;flex-wrap:wrap;padding-top:4px}
+.sc-first-signin{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:.75rem;color:var(--ui-text-tertiary)}
 .sc-cmd{padding:1px 6px;border-radius:3px;background:var(--ui-bg-quaternary);color:var(--ui-text-primary)}
 .sc-wrap{display:flex;flex-direction:column;max-width:700px;margin:6px 0}
 .sc-wcard{container-type:inline-size;overflow:hidden;border-radius:calc(var(--radius-scalar,.2) * 2rem);background:var(--ui-widget-surface-background);color:var(--ui-text-primary);font-size:.8125rem;line-height:1.45}
@@ -1052,7 +1065,9 @@ function normMediaPart(raw) {
     strip: name(o.strip),
     thumb: name(o.thumb),
     frames: int(o.frames),
-    durationMs: num(o.durationMs)
+    durationMs: num(o.durationMs),
+    posterAtMs: num(o.posterAtMs),
+    posterChosen: o.posterChosen === true
   }
 }
 
@@ -1191,10 +1206,57 @@ function ratioCss(ratio) {
   return `${m[1]} / ${m[2]}`
 }
 
+function ratioNum(ratio) {
+  const [a, b] = ratioCss(ratio).split(' / ').map(Number)
+  return a > 0 && b > 0 ? a / b : 16 / 9
+}
+
+// The studio's film: centred on a black stage whose height is capped to the window, so the scenes on the
+// song and the top of the scene inspector stay in view; the frame keeps its ratio (never cropped).
+function Stage({ ratio, children }) {
+  return h('div', { className: 'sc-stage', style: { '--sc-ar': ratioNum(ratio).toFixed(4) } }, children)
+}
+
+// Under the finished film: which frame is the poster, and a quiet way to choose another. The choice is
+// the plugin's own record (not the production's files); the chat card shows the same poster.
+function PosterBar({ production, film, paused, filmApi }) {
+  const [busy, setBusy] = useState(false)
+  if (!production.master || !film || film.state === 'missing' || film.state === 'unavailable') return null
+  const choose = async atMs => {
+    setBusy(true)
+    try {
+      await api(`/productions/${encodeURIComponent(production.id)}/poster`, { method: 'POST', body: { atMs } })
+      notify('info', atMs === null ? 'The poster is picked automatically again.' : `The poster is now the frame at ${fmtClock(atMs)}.`)
+      invalidateAll()
+    } finally {
+      setBusy(false)
+    }
+  }
+  const useFrame = () => {
+    const t = filmApi.current && filmApi.current.timeMs()
+    if (num(t) === null) return undefined
+    return choose(Math.max(0, Math.round(t)))
+  }
+  const pending = film.state === 'pending'
+  const note = pending
+    ? 'Making the poster'
+    : film.posterAtMs !== null
+      ? `Poster ${fmtClock(film.posterAtMs)} \u00b7 ${film.posterChosen ? 'your pick' : 'picked automatically'}`
+      : null
+  const useBtn = h(Btn, { label: 'Use this frame as poster', iconName: 'device-camera', variant: 'ghost', size: 'xs', disabled: !paused || busy, onClick: useFrame })
+  return h(
+    'div',
+    { className: 'sc-posterbar' },
+    note ? h('span', { className: 'sc-mono' }, note) : null,
+    Tip && !paused ? h(Tip, { label: 'Pause the film on the frame you want' }, h('span', { className: 'sc-tipwrap' }, useBtn)) : useBtn,
+    film.posterChosen ? h(Btn, { label: 'Automatic poster', variant: 'ghost', size: 'xs', disabled: busy, onClick: () => choose(null) }) : null
+  )
+}
+
 // One film or clip: the poster first, a play button and a time label on it;
 // native controls once it plays. `src` (a ready URL, e.g. a tool file's) or
 // `path` (a backend file) gives the video.
-function Player({ path, src: givenSrc, posterName, ratio, label, onTime, apiRef, compact, ariaLabel }) {
+function Player({ path, src: givenSrc, posterName, ratio, label, onTime, onPlayState, apiRef, compact, ariaLabel }) {
   const poster = useFrameUrl(posterName)
   const [probed, setProbed] = useState(null)
   const [late, setLate] = useState(false)
@@ -1212,6 +1274,7 @@ function Player({ path, src: givenSrc, posterName, ratio, label, onTime, apiRef,
   useEffect(() => {
     if (!apiRef) return undefined
     apiRef.current = {
+      timeMs: () => (ref.current ? ref.current.currentTime * 1000 : null),
       seek: ms => {
         const v = ref.current
         if (!v) return
@@ -1262,7 +1325,11 @@ function Player({ path, src: givenSrc, posterName, ratio, label, onTime, apiRef,
           playsInline: true,
           controls: started,
           'aria-label': ariaLabel,
-          onPlay: () => setStarted(true),
+          onPlay: () => {
+            setStarted(true)
+            if (onPlayState) onPlayState(false)
+          },
+          onPause: () => onPlayState && onPlayState(true),
           onTimeUpdate: e => onTime && onTime(e.currentTarget.currentTime * 1000),
           onSeeked: e => onTime && onTime(e.currentTarget.currentTime * 1000)
         })
@@ -1800,7 +1867,7 @@ function IssueList({ issues }) {
 
 const VIA_LABEL = { 'hermes sign-in': 'Signed in with Hermes', 'personal token': 'Signed in with a personal token' }
 
-function Account() {
+function Account({ brief } = {}) {
   const status = useStatus()
   if (status.isLoading && !status.data) return h('div', { className: 'sc-acct' }, h(Spinner, { label: 'Checking the account' }))
   if (!status.data) {
@@ -1808,6 +1875,8 @@ function Account() {
   }
   const s = status.data
   if (!s.connected) {
+    // On the first run the sign-in command sits beside the first action instead (said once).
+    if (brief) return h('div', { className: 'sc-acct' }, h('span', { className: 'sc-acct-item' }, h('span', { className: 'sc-warndot', 'aria-hidden': true }), 'Not signed in'))
     return h(
       'div',
       { className: 'sc-acct' },
@@ -1866,7 +1935,7 @@ function ProductionRow({ p, selected, onSelect, thumb }) {
   const meta = [p.counts.total ? plural(p.counts.total, 'scene') : null, dur, g === 'running' && when ? `updated ${when}` : g === 'done' || g === 'idle' ? when : null].filter(Boolean).join(' \u00b7 ')
   return h(
     'button',
-    { type: 'button', className: 'sc-prow', 'data-selected': selected ? 'true' : 'false', 'aria-current': selected ? 'true' : undefined, onClick: () => onSelect(p.id) },
+    { type: 'button', className: 'sc-prow', title: p.title, 'data-selected': selected ? 'true' : 'false', 'aria-current': selected ? 'true' : undefined, onClick: () => onSelect(p.id) },
     h('span', { className: 'sc-thumb', 'data-ready': thumb ? 'true' : 'false', 'aria-hidden': true }, thumb ? h(Frame, { name: thumb }) : null),
     h('span', { className: 'sc-ptext' }, h('span', { className: 'sc-ptitle' }, p.title), h('span', { className: 'sc-pmeta' }, rowChip(p), h('span', { className: 'sc-num' }, meta)))
   )
@@ -1959,6 +2028,7 @@ function ProductionDetail({ id, summary }) {
   const media = useMedia(p ? p.id : null, p && p.state === 'running').data || null
   const [sel, setSel] = useState(null)
   const [t, setT] = useState(0)
+  const [paused, setPaused] = useState(false)
   const filmApi = useRef(null)
   if (!p) {
     if (q.isError) return h('div', { className: 'sc-quiet' }, isNotFound(q.error) ? 'This production no longer exists.' : backendDownText(q.error))
@@ -2017,20 +2087,26 @@ function ProductionDetail({ id, summary }) {
     p.state === 'running' ? h(Progress, { production: p }) : null,
     subject
       ? guard(
-          h(Player, {
-            key: subject.path,
-            path: subject.path,
-            posterName: subject.kind === 'film' ? media && media.film.poster : subjectMedia && subjectMedia.poster,
-            ratio: p.aspectRatio,
-            label: subject.kind === 'film' ? fmtDur(filmDuration(p)) : subject.kind === 'latest' ? `Latest \u00b7 scene ${subject.row.index + 1}` : `Scene ${subject.row ? subject.row.index + 1 : 1}`,
-            onTime: subject.kind === 'film' ? setT : null,
-            apiRef: subject.kind === 'film' ? filmApi : null,
-            ariaLabel: subject.kind === 'film' ? p.title : 'the latest scene'
-          }),
+          h(
+            Stage,
+            { ratio: p.aspectRatio },
+            h(Player, {
+              key: subject.path,
+              path: subject.path,
+              posterName: subject.kind === 'film' ? media && media.film.poster : subjectMedia && subjectMedia.poster,
+              ratio: p.aspectRatio,
+              label: subject.kind === 'film' ? fmtDur(filmDuration(p)) : subject.kind === 'latest' ? `Latest \u00b7 scene ${subject.row.index + 1}` : `Scene ${subject.row ? subject.row.index + 1 : 1}`,
+              onTime: subject.kind === 'film' ? setT : null,
+              onPlayState: subject.kind === 'film' ? setPaused : null,
+              apiRef: subject.kind === 'film' ? filmApi : null,
+              ariaLabel: subject.kind === 'film' ? p.title : 'the latest scene'
+            })
+          ),
           h(RevealFallback, { path: subject.path }),
           subject.path
         )
       : null,
+    subject && subject.kind === 'film' && media ? guard(h(PosterBar, { production: p, film: media.film, paused, filmApi }), null, p.id) : null,
     rows.length ? guard(h(SceneTrack, { production: p, media, selectedId: selected && selected.id, onSelect, timeMs: subject && subject.kind === 'film' ? t : 0 }), null, p.id) : null,
     !rows.length && p.counts.total ? h(Waiting, { label: 'Reading the scenes' }) : null,
     selected ? guard(h(SceneInspector, { production: p, scene: selected, media, send, hideClip: Boolean(subject && subject.row && subject.row.id === selected.id) }), null, `${p.id}:${selected.id}`) : null,
@@ -2053,30 +2129,82 @@ function pickDefault(list) {
   return (running || list[0]).id
 }
 
+// First run, in the studio's own vocabulary: the scenes-on-the-song lane as it will look, with empty
+// slots over a generic waveform (no song yet, so no times and no numbers), and the three beats of how a
+// production goes, each under its part of the lane.
+const FIRST_RUN_SLOTS = [5, 4, 6, 3, 5, 4, 6]
+const FIRST_RUN_BEATS = [
+  { title: 'Your song in', body: 'Give Hermes a song file in a chat and, if you like, pictures of who or what should appear.' },
+  { title: 'Scenes timed to the beat', body: 'It cuts the song into scenes on the beats and the words, and writes what each one shows.' },
+  { title: 'Nothing spends until you approve', body: 'It quotes the credits first and asks. You see the first scene before the rest render.' }
+]
+
+// A made-up song shape (quiet intro, verse, chorus, break, chorus, fade), drawn faintly: no song yet.
+function genericPeaks(n = 240) {
+  const sections = [[0, 0.22], [0.1, 0.5], [0.34, 0.86], [0.55, 0.34], [0.64, 0.92], [0.9, 0.3], [1, 0.06]]
+  let seed = 7
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647)
+  const out = []
+  for (let i = 0; i < n; i++) {
+    const x = i / (n - 1)
+    let k = 0
+    while (k < sections.length - 2 && x >= sections[k + 1][0]) k++
+    const [x0, a] = sections[k]
+    const [x1, b] = sections[k + 1]
+    const level = a + (b - a) * Math.min(1, Math.max(0, (x - x0) / (x1 - x0)) ** 3)
+    const beat = i % 4 === 0 ? 1 : 0.78
+    out.push(Math.max(0.04, Math.min(1, level * beat * (0.7 + 0.3 * rand()))))
+  }
+  return out
+}
+
 function FirstRun() {
   const status = useStatus()
-  const signedOut = status.data && !status.data.connected
+  const signedOut = Boolean(status.data && !status.data.connected)
   const command = (status.data && status.data.signInCommand) || SIGN_IN_COMMAND
+  const peaks = useMemo(() => genericPeaks(), [])
+  const slots = FIRST_RUN_SLOTS.map((len, i) =>
+    h('div', { key: i, className: 'sc-seg', 'data-kind': 'plan', style: { flexGrow: len } }, h('span', { className: 'sc-tag sc-mono' }, `SC${String(i + 1).padStart(2, '0')}`))
+  )
   return h(
-    'div',
-    { className: 'sc-empty' },
-    EmptyState
-      ? h(EmptyState, {
-          title: 'No music videos yet',
-          description: 'Give Hermes a song file and, if you like, pictures of who or what should appear. It times the scenes to the music, quotes the credits and asks before it spends any.'
-        })
-      : h('div', { className: 'sc-quiet' }, 'No music videos yet.'),
-    signedOut
-      ? h(
-          'div',
-          { className: 'sc-empty-row' },
-          h('span', null, 'First, sign in: run'),
-          h('span', { className: 'sc-cmd sc-mono' }, command),
-          h('span', null, 'in a terminal'),
-          h(Btn, { label: 'Copy command', iconName: 'copy', variant: 'ghost', size: 'xs', onClick: () => signIn(command) })
-        )
-      : null,
-    h('div', { className: 'sc-empty-row' }, h(Btn, { label: 'Ask Hermes for a music video', variant: signedOut ? 'secondary' : 'default', size: 'sm', onClick: askForVideo }))
+    'section',
+    { className: 'sc-first', 'aria-label': 'Make your first music video' },
+    h(
+      'header',
+      { className: 'sc-head' },
+      h('div', { className: 'sc-head-text' }, h('div', { className: 'sc-label' }, 'No music videos yet'), h('h1', { className: 'sc-h1' }, 'Your first music video starts in a chat'))
+    ),
+    h(
+      'div',
+      { className: 'sc-tl sc-first-tl' },
+      h('div', { className: 'sc-tl-head' }, h('h3', { className: 'sc-label' }, 'Scenes on the song'), h('span', { className: 'sc-mono' }, 'your song goes here')),
+      h(
+        'div',
+        { className: 'sc-lane', 'aria-hidden': true },
+        h('div', { className: 'sc-track' }, slots),
+        h(Wave, { wave: { state: 'ready', peaks, durationMs: null }, totalMs: null })
+      )
+    ),
+    h(
+      'ol',
+      { className: 'sc-beats' },
+      FIRST_RUN_BEATS.map((b, i) => h('li', { key: i, className: 'sc-beat' }, h('b', null, b.title), h('span', null, b.body)))
+    ),
+    h(
+      'div',
+      { className: 'sc-first-acts' },
+      h(Btn, { label: 'Ask Hermes for a music video', variant: 'default', size: 'sm', onClick: askForVideo }),
+      signedOut
+        ? h(
+            'span',
+            { className: 'sc-first-signin' },
+            h('span', null, 'First, sign in: run'),
+            h('span', { className: 'sc-cmd sc-mono' }, command),
+            h('span', null, 'in a terminal'),
+            h(Btn, { label: 'Copy command', iconName: 'copy', variant: 'ghost', size: 'xs', onClick: () => signIn(command) })
+          )
+        : null
+    )
   )
 }
 
@@ -2120,7 +2248,7 @@ function StudioPage() {
       'div',
       { className: 'sc-studio' },
       h('aside', { className: 'sc-side', 'aria-label': 'Productions' }, h('div', { className: 'sc-brandrow' }, h('span', { className: 'sc-brand' }, 'SLOPCANNON'), h('span', { className: 'sc-label' }, 'Studio')), side),
-      h('main', { className: 'sc-main' }, guard(h(Account)), main)
+      h('main', { className: 'sc-main' }, guard(h(Account, { brief: Boolean(productions.data && !list.length) })), main)
     )
   )
 }

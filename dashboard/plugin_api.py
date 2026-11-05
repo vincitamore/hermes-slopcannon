@@ -14,7 +14,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import FileResponse
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -103,6 +103,21 @@ def production_media(production_id: str) -> dict[str, Any]:
         return media.production_media(production_id)
     except production.ProductionError as exc:
         raise HTTPException(status_code=404 if exc.code == "unknown_production" else 400, detail=str(exc))
+
+
+@router.post("/productions/{production_id}/poster")
+def production_poster(production_id: str, body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Use the film's frame at ``atMs`` as its poster; ``{"atMs": null}`` goes back to the automatic poster.
+    Kept in the plugin's own data, not in the production's files."""
+    production, media = _mod("production"), _mod("media")
+    if not isinstance(body, dict) or "atMs" not in body:
+        raise HTTPException(status_code=400, detail="atMs is required (a number of milliseconds, or null)")
+    try:
+        return media.set_poster(production_id, body.get("atMs"))
+    except production.ProductionError as exc:
+        raise HTTPException(status_code=404 if exc.code == "unknown_production" else 400, detail=str(exc))
+    except media.MediaError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/thumbs")
