@@ -1386,6 +1386,22 @@ async function verbQuote(options, ledgerFile) {
   return { ok: true, scene: id, quoteId: quote.id, amountUnits: total.amountUnits, currency: total.currency, creditUnit: total.creditUnit, cannonCredits: total.amountUnits, expiresAt: quote.expiresAt, lineItems: entry.quote.lineItems };
 }
 
+// A retryable refusal (the queue did not confirm admission, a transient server error) is answered by sending the
+// same frozen submission under the same key again: the server either confirms the original or settles it, and
+// never makes a second purchase from one key.
+const SUBMIT_RETRY_DELAYS_MS = [3_000, 8_000, 15_000, 30_000];
+async function submitWithRetry(ledger, submission, call = mcpCall, wait = sleep) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await call(ledger, "slopcannon_submit_generation", submission);
+    } catch (error) {
+      if (error?.retryable !== true || attempt >= SUBMIT_RETRY_DELAYS_MS.length) throw error;
+      await wait(SUBMIT_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+export { submitWithRetry };
+
 async function verbSubmit(options, ledgerFile) {
   const ledger = loadLedger(ledgerFile);
   requireOrigin(ledger, options);
@@ -1428,7 +1444,7 @@ async function verbSubmit(options, ledgerFile) {
   saveLedger(ledgerFile, ledger, id);
   let result;
   try {
-    result = await mcpCall(ledger, "slopcannon_submit_generation", submission);
+    result = await submitWithRetry(ledger, submission);
   } catch (error) {
     // A refusal names the generation it ended (failed, nothing held); keep that receipt with the key.
     const refused = error?.details?.generation;
@@ -1445,6 +1461,9 @@ async function verbSubmit(options, ledgerFile) {
   saveLedger(ledgerFile, ledger, id);
   return { ok: true, scene: id, generationId: generation.id, status: generation.status, replayed: result.replayed === true };
 }
+
+// Submissions go a few at a time: a burst of paid admissions is where the queue fails to confirm them.
+const SUBMIT_CONCURRENCY = 3;
 
 // submission_unknown is not here: the server resolves it by itself, so `poll` keeps polling it (bounded by --timeout).
 const TERMINAL = new Set(["succeeded", "failed", "billing_unknown"]);
@@ -3333,10 +3352,16 @@ async function verbRun(options, ledgerFile) {
 
   const quotes = await mapWithConcurrency(sceneIds, concurrency, async (id) => {
     const current = loadLedger(ledgerFile).scenes[id];
-    if (current.generation?.id) return { scene: id, amountUnits: current.quote?.amountUnits ?? null, submitted: true };
-    if (current.generation?.key) {
-      throw new Error(`Scene ${id} has an unresolved submission. Run recover --scene ${id} to find its original job without spending; never obtain a replacement quote.`);
+    if (current.generation?.key && !current.generation?.id) {
+      // An earlier submission's answer was lost: find the job under its own key (free, never a purchase).
+      try {
+        await verbRecover(new Map([["--scene", id]]), ledgerFile);
+      } catch {
+        throw new Error(`Scene ${id} has an unresolved submission. Run recover --scene ${id} to find its original job without spending; never obtain a replacement quote.`);
+      }
+      return { scene: id, amountUnits: current.quote?.amountUnits ?? null, submitted: true };
     }
+    if (current.generation?.id) return { scene: id, amountUnits: current.quote?.amountUnits ?? null, submitted: true };
     const quoteOptions = new Map([["--scene", id], ["--plan", path.join(prepDir, "scene-plans", `${id}.json`)], ["--cast", castFile], ["--aspect", production.aspectRatio ?? "16:9"]]);
     if (bibleFile) quoteOptions.set("--bible", bibleFile);
     const quoteIsCurrent = current.quote?.currency === "CANNON_CREDIT"
@@ -3377,7 +3402,7 @@ async function verbRun(options, ledgerFile) {
     const renderRequest=await ensureProductionRenderRequest({ledgerFile,projectId,members:productionRequestMembers(sceneIds,prepDir,cast)});
     if(renderRequest) steps.push({step:"render-request",...renderRequest});
     const permitted = review.accepted ? pending : pending.filter((quote) => quote.scene === sceneIds[0]);
-    await mapWithConcurrency(permitted, concurrency, (quote) => verbSubmit(new Map([["--scene", quote.scene], ["--approve-units", String(quote.amountUnits)], ["--reference", `${production.title} ${quote.scene}`]]), ledgerFile));
+    await mapWithConcurrency(permitted, Math.min(concurrency, SUBMIT_CONCURRENCY), (quote) => verbSubmit(new Map([["--scene", quote.scene], ["--approve-units", String(quote.amountUnits)], ["--reference", `${production.title} ${quote.scene}`]]), ledgerFile));
     steps.push({ step: "submit", count: permitted.length, concurrency, spending });
   } else if (runLedger.renderRequest || sceneIds.some(id => runLedger.scenes[id].customerRequest || runLedger.scenes[id].generation?.submission?.customerRequest)) {
     // Already-owned scenes still form one requested film. Recover/compose its
@@ -3386,8 +3411,16 @@ async function verbRun(options, ledgerFile) {
     if(renderRequest) steps.push({step:"render-request",...renderRequest});
   }
 
-  // 6. Poll every scene, then fetch content.
+  // 5b. A scene the server holds as `accepted` (claimed, queue admission never confirmed) was approved and sent
+  // already; its same frozen submission is sent again under its key so it settles instead of waiting forever.
   const permittedSceneIds = review.accepted ? sceneIds : sceneIds.slice(0, 1);
+  if (approve) {
+    const unsettled = permittedSceneIds.filter((id) => ["accepted", "reserving_funds"].includes(loadLedger(ledgerFile).scenes[id]?.generation?.status));
+    await mapWithConcurrency(unsettled, Math.min(concurrency, SUBMIT_CONCURRENCY), (id) => verbSubmit(new Map([["--scene", id], ["--approve-units", String(loadLedger(ledgerFile).scenes[id].quote.amountUnits)]]), ledgerFile));
+    if (unsettled.length > 0) steps.push({ step: "settle", scenes: unsettled });
+  }
+
+  // 6. Poll every scene, then fetch content.
   const outcomes = await mapWithConcurrency(permittedSceneIds, concurrency, async (id) => {
     try {
       const current = loadLedger(ledgerFile).scenes[id];
