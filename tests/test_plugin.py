@@ -779,6 +779,25 @@ const ledgerFile = flag("--ledger");
 const ledger = existsSync(ledgerFile) ? JSON.parse(readFileSync(ledgerFile, "utf8")) : { scenes: {} };
 const out = (value, code) => { process.stdout.write(JSON.stringify(value) + "\n"); process.exitCode = code; };
 if (process.env.SLOPCANNON_AGENT_TOKEN !== "slop_live_test") { out({ ok: false, needs: "origin", message: "no token" }, 2); }
+else if (args[0] === "reroll") {
+  const take = flag("--scene") + ".r1";
+  if (!flag("--approve-units")) {
+    ledger.scenes[take] = { rerollOf: flag("--scene"), direction: flag("--direction"), quote: { id: "q9", amountUnits: 44 } };
+    writeFileSync(ledgerFile, JSON.stringify(ledger));
+    out({ ok: false, needs: "approval", scene: take, rerollOf: flag("--scene"), quoteId: "q9", amountUnits: 44 }, 2);
+  } else if (flag("--approve-units") !== "44" || flag("--max-credits") !== "144") { out({ ok: false, error: "bad approval " + flag("--max-credits") }, 1); }
+  else {
+    const clip = path.join(path.dirname(ledgerFile), "work", "clips", take + ".mp4"); writeFileSync(clip, "mp4");
+    ledger.scenes[take].generation = { id: "gen_r1", status: "succeeded" };
+    ledger.scenes[take].downloaded = { path: clip, sha256: "b".repeat(64), bytes: 3 };
+    writeFileSync(ledgerFile, JSON.stringify(ledger));
+    out({ ok: true, scene: take, rerollOf: flag("--scene"), path: clip, check: { verdict: "pass" } }, 0);
+  }
+}
+else if (args[0] === "cut") {
+  if (flag("--takes") !== "sc01=sc01.r1") out({ ok: false, error: "bad takes " + flag("--takes") }, 1);
+  else { const master = flag("--output"); writeFileSync(master, "mp4cut"); out({ ok: true, output: master, cut: "c1", takes: { sc01: "sc01.r1" } }, 0); }
+}
 else if (flag("--rights-accepted") !== "v1") {
   out({ ok: false, needs: "rights", requiredVersion: "v1", statement: "I own it.", files: [{ file: "/x/song.mp3", bytes: 10, role: "master" }] }, 2);
 } else if (!flag("--max-credits")) {
@@ -866,6 +885,29 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(quoted["show"], [quoted["card"]])
         listed = json.loads(production_tools.PRODUCTION_STATUS.handler({}))
         self.assertEqual([p["id"] for p in listed["productions"]], [pid])
+
+        # A reroll runs inside the production: asked for, quoted, approved in a prompt, then cut into the film.
+        self.assertIsNone(gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "reroll": {"scene": "sc01"},
+                                                                    "rights_version": "v1"}))  # already signed
+        quote = self.produce(production_id=pid, reroll={"scene": "sc01", "direction": "keep the helmet"})
+        self.assertEqual(quote["production"]["needs"], "reroll_approval", quote)
+        self.assertEqual(quote["production"]["needsDetail"]["amountUnits"], 44)
+        row = quote["production"]["scenes"][0]
+        self.assertEqual((row["id"], row["rerolled"], row["status"], row["take"]), ("sc01", True, "quoted", 2))
+        self.assertEqual(len(quote["production"]["scenes"]), 2)  # the reroll is a take of sc01, not a scene
+        wrong = gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "approve_reroll": 40})
+        self.assertEqual(wrong["action"], "block")
+        ask = gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "approve_reroll": 44})
+        self.assertEqual(ask["action"], "approve")
+        self.assertIn("44 Cannon Credits on a new take of sc01", ask["message"])
+        cut = self.produce(production_id=pid, approve_reroll=44)
+        self.assertEqual(cut["production"]["state"], "done", cut)
+        self.assertTrue(cut["production"]["master"]["path"].endswith("Film.mp4"))
+        self.assertEqual(cut["production"]["scenes"][0]["clip"]["name"], "sc01.r1.mp4")
+        # Hand-driving the film's own project is refused, and so is a second sign-off for the same files.
+        hand = gate.pre_tool_call("mcp_slopcannon_slopcannon_create_quote", {"projectId": "proj_1"})
+        self.assertEqual(hand["action"], "block")
+        self.assertIn("reroll=", hand["message"])
 
     def test_changed_inputs_after_paid_state_need_a_new_revision(self):
         production.write_production("film-1", self.spec())

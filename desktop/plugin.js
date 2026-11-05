@@ -1638,6 +1638,10 @@ function verdictOf(scene, p) {
         return { tone: 'run', icon: 'loading', spin: true, title: 'Rendering', text: 'The take arrives here when it is done.' }
       case 'queued':
         return { tone: 'run', icon: 'clock', title: 'Queued', text: 'Waiting for a render slot.' }
+      case 'quoted':
+      case 'unsubmitted':
+        if (scene.rerolled) return { tone: 'run', icon: 'sync', title: 'New take quoted', text: 'It renders once you approve its quote in chat.' }
+        break
       case 'failed':
         return { tone: 'err', icon: 'error', title: 'The render failed', text: 'Reroll it, or ask Hermes what went wrong.' }
       case 'uncertain':
@@ -1649,6 +1653,14 @@ function verdictOf(scene, p) {
           title: 'Not rendered yet',
           text: scene.quoteCredits !== null ? `Quoted at ${fmtCredits(scene.quoteCredits)} credits. It renders after the quote is approved.` : 'It renders after the quote is approved.'
         }
+    }
+  }
+  if (!scene.clip) {
+    return {
+      tone: 'mute',
+      icon: 'circle-large-outline',
+      title: 'Not rendered yet',
+      text: scene.quoteCredits !== null ? `Quoted at ${fmtCredits(scene.quoteCredits)} credits. It renders after the quote is approved.` : 'It renders after the quote is approved.'
     }
   }
   const c = scene.check

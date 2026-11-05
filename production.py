@@ -256,8 +256,41 @@ def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str,
     for key in ("rights_version", "approved_credits", "review_first", "accept_checks"):
         if decisions.get(key) not in (None, "", []):
             current[key] = decisions[key]
+    rerolls = current.setdefault("rerolls", {})
+    asked = decisions.get("reroll")
+    if isinstance(asked, dict) and asked.get("scene"):
+        # A new take of a delivered scene: quoted first, bought only on the person's approve_reroll.
+        scene = str(asked["scene"])
+        rerolls[scene] = {"direction": (str(asked.get("direction")).strip() or None) if asked.get("direction") else None,
+                          "approved": None, "take": None}
+    approved = decisions.get("approve_reroll")
+    if isinstance(approved, int) and not isinstance(approved, bool):
+        scene = (state.get("needsDetail") or {}).get("scene")
+        if state.get("needs") == "reroll_approval" and scene in rerolls:
+            rerolls[scene]["approved"] = approved
+    if not rerolls:
+        current.pop("rerolls", None)
     _save_state(production_id, state)
     return current
+
+
+def reroll_problem(production_id: str, scene: Any) -> Optional[str]:
+    """Why a reroll of this scene cannot be asked for now, or None when it can."""
+    state = load_state(production_id) or {}
+    if state.get("state") == "running" or is_running(production_id):
+        return "the production is still running; wait for it to stop at a gate or finish"
+    if not (state.get("state") == "done" or state.get("needs") in ("shot_review", "review", "reroll_approval")):
+        return "a scene can be rerolled once the film's takes are delivered (at the take check or when it is done)"
+    entry = ((_read_json(_dir(production_id) / "ledger.json") or {}).get("scenes") or {}).get(str(scene))
+    if not isinstance(entry, dict) or str(scene) == "production" or entry.get("rerollOf"):
+        return f"{scene} is not one of this film's scenes (use the scene id, such as sc03)"
+    if (entry.get("generation") or {}).get("status") != "succeeded":
+        return f"{scene} has no delivered take to replace"
+    return None
+
+
+def _film_title(folder: Path) -> str:
+    return str((_read_json(folder / "production.json") or {}).get("title") or folder.name)
 
 
 def remember_session(production_id: str, session_id: str) -> None:
@@ -268,6 +301,33 @@ def remember_session(production_id: str, session_id: str) -> None:
 
 
 def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> list[str]:
+    """The next driver call: an open reroll, then the cut with the chosen takes, else the film's own run."""
+    ledger = str(folder / "ledger.json")
+    checks = decisions.get("accept_checks")
+    rerolls = decisions.get("rerolls") or {}
+    for scene, ask in rerolls.items():
+        if ask.get("take"):
+            continue
+        args = ["reroll", "--ledger", ledger, "--scene", scene,
+                "--plan", str(folder / "work" / "scene-audio" / "scene-plans" / f"{scene}.json"),
+                "--cast", str(folder / "work" / "cast.json")]
+        if ask.get("direction"):
+            args += ["--direction", str(ask["direction"])]
+        if isinstance(ask.get("approved"), int):
+            # A reroll counts toward the film's ceiling, so the approved take raises it by exactly its quote.
+            ceiling = int(decisions.get("approved_credits") or 0) + sum(
+                int(r.get("approved") or 0) for r in rerolls.values())
+            args += ["--approve-units", str(ask["approved"]), "--max-credits", str(ceiling)]
+        return args
+    takes = {scene: ask["take"] for scene, ask in rerolls.items() if ask.get("take")}
+    if takes:
+        title = _film_title(folder)
+        args = ["cut", "--ledger", ledger, "--plan", str(folder / "work" / "timed-plan.json"),
+                "--takes", ",".join(f"{scene}={take}" for scene, take in takes.items()),
+                "--title", title, "--output", str(folder / "work" / f"{re.sub(r'[^A-Za-z0-9._-]+', '-', title)}.mp4")]
+        if checks:
+            args += ["--accept-checks", "all" if checks == "all" else ",".join(checks)]
+        return args
     args = ["run", "--production", str(folder / "production.json"), "--ledger", str(folder / "ledger.json"),
             "--concurrency", str(max(1, min(16, concurrency)))]
     if decisions.get("rights_version"):
@@ -319,20 +379,22 @@ class _Runner(threading.Thread):
             except auth.CredentialError as exc:
                 raise ProductionError(str(exc), exc.code) from None
             env = {**os.environ, settings.TOKEN_ENV: token, "SLOPCANNON_AGENT_ORIGIN": settings.api_origin()}
-            args = [node["node"], str(DRIVER), *_driver_args(folder, state.get("decisions") or {}, self.concurrency)]
-            state.update(state="running", needs=None, message=None)
-            state.setdefault("runs", []).append({"startedAt": int(time.time() * 1000)})
-            _save_state(pid, state)
-            self.proc = subprocess.Popen(args, cwd=str(folder), env=env, stdout=subprocess.PIPE,
-                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-            watcher = threading.Thread(target=contextvars.copy_context().run, args=(self._watch_ledger,), daemon=True)
-            watcher.start()
-            stdout, stderr = self.proc.communicate()
-            code = self.proc.returncode
-            result = _last_json(stdout) or _last_json(stderr) or {}
-            state = load_state(pid) or state
-            state["runs"][-1].update(endedAt=int(time.time() * 1000), exitCode=code)
-            state["log"] = (state.get("log") or [])[-_LOG_LINES:] + _log_lines(result, stderr)
+            while True:
+                verb_args = _driver_args(folder, state.get("decisions") or {}, self.concurrency)
+                code, result, stdout, stderr = self._call([node["node"], str(DRIVER), *verb_args], env, state)
+                state = load_state(pid) or state
+                state["runs"][-1].update(endedAt=int(time.time() * 1000), exitCode=code)
+                state["log"] = (state.get("log") or [])[-_LOG_LINES:] + _log_lines(result, stderr)
+                if verb_args[0] == "reroll" and code == 0 and result.get("ok") and not self.stopped:
+                    ask = state["decisions"]["rerolls"][verb_args[verb_args.index("--scene") + 1]]
+                    ask["take"] = result.get("scene")
+                    ask["check"] = (result.get("check") or {}).get("verdict")
+                    state["log"].append(f"reroll {result.get('rerollOf')} -> {result.get('scene')}")
+                    _save_state(pid, state)
+                    continue  # the next reroll, or the cut with the new takes
+                break
+            if verb_args[0] == "reroll" and code == 2 and result.get("needs") == "approval":
+                result = {**result, "needs": "reroll_approval"}
             if self.stopped:
                 state.update(state="idle", needs=None, message="Stopped. Paid work already accepted keeps running "
                              "on the server; continuing the production recovers it without paying again.")
@@ -347,7 +409,7 @@ class _Runner(threading.Thread):
             else:
                 silent = not result and not stdout.strip() and not stderr.strip()
                 state.update(state="error", needs=None,
-                             message=str(result.get("error") or stderr.strip()[-600:]
+                             message=str(result.get("error") or result.get("advice") or stderr.strip()[-600:]
                                          or (f"the driver exited {code} without a result: {DRIVER}" if silent
                                              else f"driver exited {code}")))
             _save_state(pid, state)
@@ -363,6 +425,17 @@ class _Runner(threading.Thread):
             with _runners_lock:
                 if _runners.get(pid) is self:
                     _runners.pop(pid, None)
+
+    def _call(self, args: list[str], env: dict[str, str], state: dict[str, Any]) -> tuple[int, dict[str, Any], str, str]:
+        state.update(state="running", needs=None, message=None)
+        state.setdefault("runs", []).append({"startedAt": int(time.time() * 1000), "verb": args[2]})
+        _save_state(self.production_id, state)
+        self.proc = subprocess.Popen(args, cwd=str(_dir(self.production_id)), env=env, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        watcher = threading.Thread(target=contextvars.copy_context().run, args=(self._watch_ledger,), daemon=True)
+        watcher.start()
+        stdout, stderr = self.proc.communicate()
+        return self.proc.returncode, _last_json(stdout) or _last_json(stderr) or {}, stdout, stderr
 
     def _watch_ledger(self) -> None:
         folder = _dir(self.production_id)
@@ -444,6 +517,10 @@ def _needs_detail(result: dict[str, Any]) -> dict[str, Any]:
         return {"scene": result.get("scene"), "sha256": result.get("sha256"),
                 "clip": {"path": path, "name": Path(path).name} if path else None,
                 "shotCheck": result.get("shotCheck"), "directionWarnings": result.get("directionWarnings")}
+    if needs == "reroll_approval":
+        return {"scene": result.get("rerollOf"), "take": result.get("scene"), "amountUnits": result.get("amountUnits"),
+                "quoteId": result.get("quoteId"), "expiresAt": result.get("expiresAt"),
+                "productionCeilingCredits": result.get("productionCeilingCredits")}
     if needs == "shot_review":
         return {"flagged": [{"scene": f.get("scene"), "verdict": f.get("verdict"), "issues": f.get("issues") or []}
                             for f in result.get("flagged") or [] if isinstance(f, dict)]}
@@ -520,10 +597,22 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
     raw_scenes = plan.get("scenes")
     plan_scenes: list[Any] = raw_scenes if isinstance(raw_scenes, list) else []
     entries = {k: v for k, v in (ledger.get("scenes") or {}).items() if k.startswith("sc") and isinstance(v, dict)}
-    ids = sorted(set(entries) | {f"sc{i + 1:02d}" for i in range(len(plan_scenes))})
+    # A reroll is a newer take of its scene, not a scene of its own: the row shows the take the film will use
+    # (the newest reroll once asked for), so a replaced scene never still reads as flagged.
+    rerolls: dict[str, list[dict[str, Any]]] = {}
+    for key, value in entries.items():
+        if value.get("rerollOf"):
+            rerolls.setdefault(str(value["rerollOf"]), []).append(value)
+    ids = sorted({k for k in entries if not entries[k].get("rerollOf")} | {f"sc{i + 1:02d}" for i in range(len(plan_scenes))})
+    asked = (state.get("decisions") or {}).get("rerolls") or {}
     rows = []
     for sid in ids:
         entry = entries.get(sid, {})
+        takes = rerolls.get(sid) or []
+        if takes:
+            entry = takes[-1]
+        elif sid in asked:
+            entry = {}  # asked for, not yet quoted
         try:
             index = int(sid[2:].split(".")[0]) - 1
         except ValueError:
@@ -558,7 +647,8 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             "clip": {"path": downloaded["path"], "name": Path(downloaded["path"]).name} if downloaded.get("path") else None,
             "check": _check_row(entry),
             "checkAccepted": accepted == "all" or (isinstance(accepted, list) and sid in accepted),
-            "take": len([a for a in entry.get("attempts") or [] if isinstance(a, dict)]) + 1,
+            "take": len([a for a in entry.get("attempts") or [] if isinstance(a, dict)]) + 1 + len(takes),
+            "rerolled": bool(takes) or sid in asked,
             **_scene_times(entry),
         })
     return rows
@@ -692,3 +782,23 @@ def inventory(production_id: str) -> list[dict[str, Any]]:
 
 def allowed_media_roots() -> list[Path]:
     return [root(), settings.download_dir()]
+
+
+def signed_files(version: Any) -> set[tuple[str, Any]]:
+    """(name, bytes) of every file a production in this profile already holds a sign-off of this version for."""
+    out: set[tuple[str, Any]] = set()
+    for pid in list_ids():
+        if ((load_state(pid) or {}).get("decisions") or {}).get("rights_version") == version:
+            out |= {(f.get("name"), f.get("bytes")) for f in inventory(pid)}
+    return out
+
+
+def managing(project_id: Any) -> Optional[str]:
+    """The production that drives this SLOPCANNON project, if any."""
+    if not project_id:
+        return None
+    for pid in list_ids():
+        ledger = _read_json(_dir(pid) / "ledger.json") or {}
+        if ((ledger.get("scenes") or {}).get("production") or {}).get("projectId") == project_id:
+            return pid
+    return None

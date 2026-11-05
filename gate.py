@@ -27,6 +27,12 @@ SPENDING: dict[str, str] = {
 }
 # MCP tools that record the person's own rights sign-off.
 RIGHTS: set[str] = {"slopcannon_import_character", "slopcannon_create_audio_spot"}
+# Per-scene tools that would drive a managed production's project by hand, outside its ledger.
+HAND_DRIVEN: set[str] = {
+    "slopcannon_create_quote", "slopcannon_slice_scene_audio", "slopcannon_create_render_request",
+    "slopcannon_plan_cuts", "slopcannon_direct_scenes", "slopcannon_start_assembly", "slopcannon_select_take",
+    "slopcannon_save_workspace", "slopcannon_add_reference", "slopcannon_remove_reference",
+}
 # MCP tools whose effect is irreversible or public.
 DESTRUCTIVE: dict[str, str] = {
     "slopcannon_delete_take": "permanently deletes a take's stored video",
@@ -127,7 +133,22 @@ def rights_text(version: Any, files: list[dict[str, Any]], *, label: str = "",
     return "\n".join(lines)
 
 
-def _rights_directive(label: str, version: Any, files: list[dict[str, Any]]) -> dict[str, Any]:
+def _already_signed(version: Any, files: list[dict[str, Any]]) -> bool:
+    """True when the person already signed this version for exactly these files: one sign-off is enough."""
+    if not version or not files:
+        return False
+    from . import production
+
+    try:
+        signed = production.signed_files(version)
+    except Exception:
+        return False
+    return all((f.get("name"), f.get("bytes")) in signed for f in files)
+
+
+def _rights_directive(label: str, version: Any, files: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if _already_signed(version, files):
+        return None
     return {
         "action": "approve",
         "message": rights_text(version, files, label=label),
@@ -171,10 +192,18 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
 
     rights, credits = args.get("rights_version"), args.get("approve_credits")
     review, accept = args.get("review_first"), args.get("accept_checks")
-    if all(v in (None, "", []) for v in (rights, credits, review, accept)):
-        return None
+    reroll, reroll_units = args.get("reroll"), args.get("approve_reroll")
     pid = str(args.get("production_id") or "")
     spec = args.get("production")
+    if reroll not in (None, "", {}):
+        if not pid:
+            return {"action": "block", "message": "BLOCKED: reroll names a scene of a production: pass its production_id."}
+        scene = reroll.get("scene") if isinstance(reroll, dict) else None
+        problem = production.reroll_problem(pid, scene) if scene else "reroll needs the scene id, such as sc03"
+        if problem:
+            return {"action": "block", "message": f"BLOCKED: cannot reroll now: {problem}."}
+    if all(v in (None, "", []) for v in (rights, credits, review, accept, reroll_units)):
+        return None
     starting = not pid and isinstance(spec, dict)
     if not pid and not starting:
         return {"action": "block", "message": (
@@ -187,7 +216,7 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
             return {"action": "block", "message": (
                 "BLOCKED: fix the production before it starts (nothing was signed or uploaded): "
                 + "; ".join(problems))}
-    if starting and any(v not in (None, "", []) for v in (credits, review, accept)):
+    if starting and any(v not in (None, "", []) for v in (credits, review, accept, reroll_units)):
         return {"action": "block", "message": (
             "BLOCKED: a new production can carry only rights_version. Credits, reviews and accepted takes "
             "answer a gate the production has reached; start it, then answer with its production_id.")}
@@ -196,9 +225,24 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     detail = state.get("needsDetail") or {}
     parts: list[str] = []
     rights_block = ""
-    if rights not in (None, ""):
+    signed = (state.get("decisions") or {}).get("rights_version") == rights
+    if rights not in (None, "") and not signed:  # a version this production already holds is never asked again
         files = _spec_files(spec) or (production.inventory(pid) if pid else [])
         rights_block = rights_text(rights, files, known=detail if state.get("needs") == "rights" else None)
+    if reroll_units is not None:
+        if state.get("needs") != "reroll_approval":
+            return {"action": "block", "message": (
+                "BLOCKED: approve_reroll answers a reroll's quote. Ask for the reroll first (reroll = {scene, "
+                "direction}); the production quotes it and stops for the approval.")}
+        quoted = detail.get("amountUnits")
+        if reroll_units != quoted:
+            return {"action": "block", "message": (
+                f"BLOCKED: approve_reroll must be the quoted {quoted} Cannon Credits for {detail.get('scene')}.")}
+        limited = _credit_limits(reroll_units, f"a new take of {detail.get('scene')}")
+        if limited is not None and limited["action"] == "block":
+            return limited
+        parts.append(f"spend {reroll_units:,} Cannon Credits on a new take of {detail.get('scene')}; the first "
+                     "take stays available")
     if credits is not None:
         if not isinstance(credits, int) or isinstance(credits, bool) or credits < 0:
             return {"action": "block", "message": "BLOCKED: approve_credits must be a whole number of Cannon Credits."}
@@ -217,10 +261,13 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     message = f'SLOPCANNON "{title}": ' + "; ".join(parts) if parts else ""
     if rights_block:
         message = (message + "\n\n" if message else f'SLOPCANNON "{title}"\n') + rights_block
+    if not message:  # only an answer the production already holds (a repeated rights_version): nothing to ask
+        return None
     return {
         "action": "approve",
         "message": message,
-        "rule_key": _rule_key("produce", pid or title, rights, credits, review, accept),
+        "rule_key": _rule_key("produce", pid or title, rights, credits, review, accept, reroll_units,
+                              detail.get("quoteId") if reroll_units is not None else None),
     }
 
 
@@ -247,6 +294,8 @@ def _private_paths_directive(tool_name: str, args: dict[str, Any]) -> Optional[d
 def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **_: Any) -> Optional[dict[str, Any]]:
     args = args or {}
     try:
+        from . import production
+
         private = _private_paths_directive(tool_name, args)
         if private is not None:
             return private
@@ -257,6 +306,10 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **
             path = Path(str(args.get("song") or "")).expanduser()
             files = [{"name": path.name, "bytes": path.stat().st_size}] if path.is_file() else []
             return _rights_directive("song analysis", args.get("rights_version"), files)
+        if tool_name == "slopcannon_upload" and production.managing(args.get("project_id") or args.get("projectId")):
+            return {"action": "block", "message": (
+                "BLOCKED: this project belongs to a production that slopcannon_produce drives; its pictures are "
+                "already uploaded. Reroll a scene with slopcannon_produce(production_id, reroll={scene, direction}).")}
         if tool_name == "slopcannon_upload":
             path = Path(str(args.get("path") or "")).expanduser()
             files = [{"name": path.name, "bytes": path.stat().st_size}] if path.is_file() else []
@@ -265,6 +318,13 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **
         inner, inner_args = _inner_tool(tool_name, args)
         if not inner:
             return None
+        if inner in HAND_DRIVEN:
+            owner = production.managing(inner_args.get("projectId") or inner_args.get("project_id"))
+            if owner:
+                return {"action": "block", "message": (
+                    f"BLOCKED: this project belongs to the production {owner}, which slopcannon_produce drives. To "
+                    f"replace a scene, call slopcannon_produce(production_id=\"{owner}\", reroll={{scene, "
+                    "direction}}): it quotes the new take, asks the person, and cuts it into the film.")}
         if inner in SPENDING:
             directive = _spend_directive(inner, inner_args)
             if directive is not None and directive["action"] == "approve" and inner in RIGHTS:

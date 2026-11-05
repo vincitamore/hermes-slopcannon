@@ -28,8 +28,8 @@ def _guard(fn):
             return _fail(exc)
     return handler
 
-_DEFAULT_WAIT_S = 240
-_MAX_WAIT_S = 840
+_DEFAULT_WAIT_S = 90  # well inside Hermes's 420 s tool deadline, approvals included
+_MAX_WAIT_S = 300
 
 # What the agent should do next at each gate. Kept beside the tool so the skill and
 # the result never disagree.
@@ -49,8 +49,15 @@ NEXT: dict[str, str] = {
                            "Hermes asks the person in an approval prompt to watch the scene and approve rendering "
                            "the rest. Do not ask them to reply in chat. If they deny, ask what to change and start "
                            "a new production_id with the revised direction."),
-    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second). Show each one. Pass "
-                    "the scenes the person accepts as accept_checks, or reroll a scene with their approval."),
+    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second). Show each one and "
+                    "ask the person, per scene, to keep it or replace it. Keep: call slopcannon_produce with "
+                    "accept_checks naming those scenes. Replace: call slopcannon_produce with reroll = {scene, "
+                    "direction (optional, what to change)}; it quotes the new take and stops for their approval, then "
+                    "cuts it into the film. Never quote, upload or submit a production's scenes with the per-scene "
+                    "tools."),
+    "reroll_approval": ("The new take of needsDetail.scene is quoted at needsDetail.amountUnits Cannon Credits. Say "
+                        "so in one line, then call slopcannon_produce again now with approve_reroll = "
+                        "needsDetail.amountUnits: Hermes asks the person in an approval prompt. Do not ask in chat."),
     "review": "Some scenes did not deliver. Show needsDetail.failed; run slopcannon_production_status later, or "
               "revise the direction in a new production_id.",
     "new_revision": "The inputs changed after paid work began. Use a new production_id for the revision.",
@@ -105,8 +112,14 @@ def _produce(args: dict[str, Any], session_id: str = "") -> str:
         "approved_credits": args.get("approve_credits"),
         "review_first": args.get("review_first"),
         "accept_checks": args.get("accept_checks"),
+        "reroll": args.get("reroll"),
+        "approve_reroll": args.get("approve_reroll"),
     }
-    if any(v not in (None, "", []) for v in decisions.values()):
+    if isinstance(args.get("reroll"), dict):
+        problem = production.reroll_problem(pid, args["reroll"].get("scene"))
+        if problem:
+            raise production.ProductionError(f"cannot reroll now: {problem}", "reroll_unavailable")
+    if any(v not in (None, "", [], {}) for v in decisions.values()):
         production.record_decisions(pid, decisions)
     if session_id:
         production.remember_session(pid, session_id)
@@ -174,7 +187,7 @@ PRODUCE = ToolSpec("slopcannon_produce", {
         "(slopcannon_account's rights.requiredVersion) on that first call and Hermes shows the person the rights "
         "statement and files in an approval prompt. It stops at each later human gate (credit approval, "
         "first-scene review, flagged takes) and says exactly what to do. Answer a gate by calling again at once "
-        "with the same production_id and approve_credits / review_first / accept_checks; Hermes asks the person "
+        "with the same production_id and approve_credits / review_first / accept_checks / reroll / approve_reroll; Hermes asks the person "
         "to approve each answer in a prompt, so never ask them to type an agreement in chat. It does the uploads, "
         "hashing and quotes itself, and validates the production and timed_plan before anything is signed: do not "
         "run node or the skill's scripts yourself. Nothing is bought twice. Prefer this over driving the per-scene "
@@ -191,6 +204,14 @@ PRODUCE = ToolSpec("slopcannon_produce", {
             "review_first": {"type": "string", "description": "sha256 of the first scene the person reviewed."},
             "accept_checks": {"type": "array", "items": {"type": "string"},
                               "description": "Flagged scene ids (sc03) the person accepts as they are."},
+            "reroll": {"type": "object", "description": (
+                "Replace one delivered scene with a new take (at the take check or after the film is done). It is "
+                "quoted first and bought only on approve_reroll; the film is then cut with the new take."),
+                "properties": {"scene": {"type": "string", "description": "The scene id, such as sc08."},
+                               "direction": {"type": "string", "description": "What to change in the new take."}},
+                "required": ["scene"], "additionalProperties": False},
+            "approve_reroll": {"type": "integer", "minimum": 0,
+                               "description": "The reroll's quoted Cannon Credits the person approved."},
             "concurrency": {"type": "integer", "minimum": 1, "maximum": 16},
             "wait_s": {"type": "integer", "minimum": 0, "maximum": _MAX_WAIT_S,
                        "description": f"How long to wait for the next stop (default {_DEFAULT_WAIT_S})."},
