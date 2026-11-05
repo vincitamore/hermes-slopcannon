@@ -137,7 +137,16 @@ _PRODUCTION_SCHEMA = {
         "title": {"type": "string"},
         "song": {"type": "string", "description": "Absolute path of the song the person owns or licenses."},
         "concept": {"type": "string"},
-        "references": {"type": "array", "items": {"type": "object"}},
+        "references": {"type": "array", "description": "One picture per cast name the scenes use.", "items": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "The cast name in capitals, exactly as the scenes write it."},
+                "path": {"type": "string", "description": "Absolute path of the picture."},
+                "kind": {"type": "string", "enum": ["character", "product"], "description": (
+                    "character (the default) for a person or creature; product for a set, place or object.")},
+            },
+            "required": ["name"],
+        }},
         "transcript": {"type": "string"},
         "scenes": {"type": "array", "items": {"type": "object"}},
         "aspectRatio": {"type": "string", "description": "One of the ratios slopcannon_account lists; default 16:9."},
@@ -156,7 +165,9 @@ PRODUCE = ToolSpec("slopcannon_produce", {
         "first-scene review, flagged takes) and says exactly what to do. Answer a gate by calling again at once "
         "with the same production_id and approve_credits / review_first / accept_checks; Hermes asks the person "
         "to approve each answer in a prompt, so never ask them to type an agreement in chat. It does the uploads, "
-        "hashing and quotes itself. Nothing is bought twice. Prefer this over driving the per-scene tools by hand."),
+        "hashing and quotes itself, and validates the production and timed_plan before anything is signed: do not "
+        "run node or the skill's scripts yourself. Nothing is bought twice. Prefer this over driving the per-scene "
+        "tools by hand."),
     "parameters": {
         "type": "object",
         "properties": {

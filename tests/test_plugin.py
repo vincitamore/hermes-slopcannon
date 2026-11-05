@@ -957,6 +957,29 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(gate.pre_tool_call("slopcannon_transcribe", {"song": str(self.song),
                                                                       "rights_version": "v1"})["action"], "approve")
 
+    def test_production_is_checked_before_the_rights_prompt(self):
+        pic = Path(self.song).with_name("cloudsea.jpg")
+        pic.write_bytes(b"jpg")
+        plan = {"schemaVersion": 1, "durationMs": 1000,
+                "scenes": [{"startMs": 0, "endMs": 1000, "beat": "x", "cast": ["CLOUDSEA"]}]}
+        # The natural word for a place is accepted and written as the driver's own kind.
+        ok = self.spec(references=[{"name": "CLOUDSEA", "path": str(pic), "kind": "set"}])
+        self.assertEqual(gate.pre_tool_call("slopcannon_produce", {"production": ok, "timed_plan": plan,
+                                                                   "rights_version": "v1"})["action"], "approve")
+        production.write_production("kinds", ok, plan)
+        written = json.loads((production._dir("kinds") / "production.json").read_text(encoding="utf-8"))
+        self.assertEqual(written["references"][0]["kind"], "product")
+        # A kind nothing maps to, or a cast name with no picture, is refused before anything is signed.
+        bad = self.spec(references=[{"name": "CLOUDSEA", "path": str(pic), "kind": "vibe"}])
+        d = gate.pre_tool_call("slopcannon_produce", {"production": bad, "timed_plan": plan, "rights_version": "v1"})
+        self.assertEqual(d["action"], "block")
+        self.assertIn("nothing was signed", d["message"])
+        self.assertIn('"product" for a set', d["message"])
+        missing = dict(plan, scenes=[dict(plan["scenes"][0], cast=["COURIER"])])
+        d = gate.pre_tool_call("slopcannon_produce", {"production": ok, "timed_plan": missing, "rights_version": "v1"})
+        self.assertEqual(d["action"], "block")
+        self.assertIn("'COURIER'", d["message"])
+
     def test_rights_sign_off_is_one_prompt_carrying_the_statement(self):
         statement = "I confirm that I own or am licensed to use this song."
         policy = {"requiredVersion": "v1", "statement": statement,

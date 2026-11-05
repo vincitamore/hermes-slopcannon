@@ -180,6 +180,13 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
         return {"action": "block", "message": (
             "BLOCKED: pass the production to start (it may carry rights_version), or the production_id of one "
             "already started.")}
+    if starting:
+        plan = args.get("timed_plan") if isinstance(args.get("timed_plan"), dict) else None
+        problems = production.check_production(spec, plan)
+        if problems:  # never ask for a sign-off on a production that cannot start
+            return {"action": "block", "message": (
+                "BLOCKED: fix the production before it starts (nothing was signed or uploaded): "
+                + "; ".join(problems))}
     if starting and any(v not in (None, "", []) for v in (credits, review, accept)):
         return {"action": "block", "message": (
             "BLOCKED: a new production can carry only rights_version. Credits, reviews and accepted takes "

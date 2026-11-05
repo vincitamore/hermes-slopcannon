@@ -153,6 +153,31 @@ def node_status() -> dict[str, Any]:
 # --------------------------------------------------------------------------- production file
 
 
+# The driver knows two picture kinds. A set, place or object is a "product" (uploaded as a set picture); the
+# words people and agents naturally use for either are accepted and written as the driver's own.
+_KIND_ALIASES = {
+    "character": "character", "person": "character", "people": "character", "cast": "character",
+    "product": "product", "set": "product", "place": "product", "location": "product", "scene": "product",
+    "setting": "product", "environment": "product", "background": "product", "object": "product",
+    "prop": "product", "item": "product", "set_reference": "product", "character_reference": "character",
+}
+
+
+def _reference_kind(raw: Any) -> Optional[str]:
+    return _KIND_ALIASES.get(str(raw).strip().lower().replace("-", "_").replace(" ", "_"))
+
+
+def check_production(production: dict[str, Any], timed_plan: Optional[dict[str, Any]] = None) -> list[str]:
+    """Every problem a production would hit, found before anything is signed, uploaded or bought."""
+    problems = _check_inputs({**production, "_timedPlan": timed_plan})
+    names = {str(r.get("name")).strip().upper() for r in production.get("references") or [] if isinstance(r, dict)}
+    for i, scene in enumerate((timed_plan or {}).get("scenes") or []):
+        for name in (scene.get("cast") or []) if isinstance(scene, dict) else []:
+            if str(name).strip().upper() not in names:
+                problems.append(f"timed_plan scene {i + 1} casts {name!r}, which is not one of references' names")
+    return problems
+
+
 def _check_inputs(production: dict[str, Any]) -> list[str]:
     problems = []
     if not isinstance(production.get("title"), str) or not production["title"].strip():
@@ -167,6 +192,9 @@ def _check_inputs(production: dict[str, Any]) -> list[str]:
             problems.append(f"references[{i}].path does not exist: {ref['path']}")
         elif not ref.get("path") and not (ref.get("character") or ref.get("characterId")):
             problems.append(f"references[{i}] needs a path or a Character Lab character")
+        if isinstance(ref, dict) and ref.get("kind") not in (None, "") and _reference_kind(ref["kind"]) is None:
+            problems.append(f"references[{i}].kind {ref['kind']!r} is not a picture kind: use \"character\" for a "
+                            "person or creature, or \"product\" for a set, place or object")
     for key in ("transcript", "bible"):
         value = production.get(key)
         if value is not None and not Path(str(value)).expanduser().is_file():
@@ -189,6 +217,8 @@ def write_production(production_id: str, production: dict[str, Any],
         ref = dict(ref)
         if ref.get("path"):
             ref["path"] = str(Path(str(ref["path"])).expanduser().resolve())
+        if ref.get("kind") not in (None, ""):
+            ref["kind"] = _reference_kind(ref["kind"]) or ref["kind"]
         refs.append(ref)
     clean["references"] = refs
     clean["origin"] = settings.api_origin()
