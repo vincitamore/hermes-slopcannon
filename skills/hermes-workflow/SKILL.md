@@ -42,7 +42,7 @@ The plugin registers every SLOPCANNON server tool under its own name (`slopcanno
 4. Write the production (canonical skill `references/agent-cli.md`, "The production file"): `title`, `song`, `references` (`name` in capitals, `path`, `kind` for sets), `singer`, `identityLock`, `transcript` (the path from step 3), `cuts`, `scenes` [{`shot`, `cast`}], `aspectRatio`. Apply the canonical skill's direction rules to every shot.
 5. `slopcannon_produce` with `production` (and `timed_plan`) and `rights_version`: Hermes shows the rights prompt, then the driver uploads, hashes and quotes by itself (do not hash files or call the API by hand). It returns at the next human gate; `next` says exactly what to do:
    - `approval`: show each scene's quote and the total, then call again at once with `approve_credits` = the total; Hermes shows the person the figure.
-   - `first_scene_review`: show the clip (its MEDIA line) and wait for their verdict before `review_first` = the sha256.
+   - `first_scene_review`: show the clip (its MEDIA line), then call again at once with `review_first` = the sha256; Hermes asks the person to watch it and approve the rest.
    - `shot_review`: show each flagged issue at its second; pass the scenes they keep as `accept_checks`.
 6. Finished: the master arrives as a MEDIA line. Ask the person to judge identity, mouth timing and take quality.
 

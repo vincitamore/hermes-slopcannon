@@ -203,7 +203,8 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
                      + (f" (quoted total {total:,})" if isinstance(total, int) else ""))
     if review not in (None, ""):
         scene = detail.get("scene") or "the first scene"
-        parts.append(f"the person watched {scene} ({str(review)[:12]}) and approves rendering the rest")
+        parts.append(f"watch {scene} above ({str(review)[:12]}), then Approve to render the rest of the film; "
+                     "Deny to stop and change the direction")
     if accept:
         parts.append("keep flagged takes " + ", ".join(str(a) for a in accept))
     message = f'SLOPCANNON "{title}": ' + "; ".join(parts) if parts else ""

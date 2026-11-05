@@ -45,9 +45,10 @@ NEXT: dict[str, str] = {
     "budget": ("The approved ceiling is too low for the work still to buy (needsDetail). Ask the person for a "
                "higher ceiling and pass it as approve_credits, or stop."),
     "first_scene_review": ("The first scene is ready (its MEDIA line is in `media`; put it alone on its own line). "
-                           "Ask the person to watch it. Only after they say it is good, call slopcannon_produce with "
-                           "review_first = needsDetail.sha256. If it is wrong, change the direction and start a new "
-                           "production_id."),
+                           "In this same turn, call slopcannon_produce with review_first = needsDetail.sha256: "
+                           "Hermes asks the person in an approval prompt to watch the scene and approve rendering "
+                           "the rest. Do not ask them to reply in chat. If they deny, ask what to change and start "
+                           "a new production_id with the revised direction."),
     "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second). Show each one. Pass "
                     "the scenes the person accepts as accept_checks, or reroll a scene with their approval."),
     "review": "Some scenes did not deliver. Show needsDetail.failed; run slopcannon_production_status later, or "
