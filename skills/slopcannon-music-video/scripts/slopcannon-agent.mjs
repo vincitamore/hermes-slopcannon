@@ -1989,7 +1989,17 @@ async function verbPoll(options, ledgerFile) {
   const timeoutSeconds = Math.max(30, Number(options.get("--timeout") ?? 1800));
   const deadline = Date.now() + timeoutSeconds * 1000;
   for (;;) {
-    const result = await mcpCall(ledger, "slopcannon_get_generation", { generationId: entry.generation.id });
+    let result;
+    try {
+      result = await mcpCall(ledger, "slopcannon_get_generation", { generationId: entry.generation.id });
+    } catch (error) {
+      // A read the server could not answer (a 503, a gateway hiccup, a timeout) says nothing about the render,
+      // which keeps going: read it again on the next tick rather than fail a paid scene mid-render.
+      if ((error?.name !== "TimeoutError" && error?.retryable !== true) || Date.now() > deadline) throw error;
+      note(entry, "poll", `read missed (${error?.code ?? error?.name ?? "error"}), reading again`);
+      await new Promise((resolve) => setTimeout(resolve, interval));
+      continue;
+    }
     const generation = result.generation ?? result;
     if (generation.status !== entry.generation.status) note(entry, "poll", `${generation.status}${generation.errorCode ? ` ${generation.errorCode}` : ""}`);
     entry.generation.status = generation.status;
