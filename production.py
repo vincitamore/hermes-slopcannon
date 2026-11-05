@@ -35,7 +35,13 @@ from typing import Any, Optional
 
 from . import auth, settings
 
-DRIVER = Path(__file__).parent / "skills" / "slopcannon-music-video" / "scripts" / "slopcannon-agent.mjs"
+# Resolved: Node runs a script only when its own real path equals argv[1], and a plugin installed as a
+# link (or loaded through a differently-cased path) otherwise exits 0 having done nothing.
+def _driver_path(plugin_dir: Path) -> Path:
+    return (plugin_dir / "skills" / "slopcannon-music-video" / "scripts" / "slopcannon-agent.mjs").resolve()
+
+
+DRIVER = _driver_path(Path(__file__).parent)
 MIN_NODE = (22, 13)
 _GATE_KEYS = ("rightsAccepted", "approve", "maxCredits")
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -309,8 +315,11 @@ class _Runner(threading.Thread):
                 state.update(state="needs", needs=result["needs"], message=result.get("message"),
                              needsDetail=_needs_detail(result))
             else:
+                silent = not result and not stdout.strip() and not stderr.strip()
                 state.update(state="error", needs=None,
-                             message=str(result.get("error") or stderr.strip()[-600:] or f"driver exited {code}"))
+                             message=str(result.get("error") or stderr.strip()[-600:]
+                                         or (f"the driver exited {code} without a result: {DRIVER}" if silent
+                                             else f"driver exited {code}")))
             _save_state(pid, state)
         except ProductionError as exc:
             state.update(state="error", needs=None, message=str(exc), errorCode=exc.code)

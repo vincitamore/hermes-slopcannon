@@ -877,6 +877,29 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(args[args.index("--concurrency") + 1], "16")
         self.assertEqual(args[args.index("--accept-checks") + 1], "sc03")
 
+    def test_driver_runs_when_the_plugin_is_installed_as_a_link(self):
+        # Hermes installs a local plugin as a link; Node runs a script only from its real path and
+        # otherwise exits 0 having done nothing.
+        node = production.node_status()
+        if not node["ok"]:
+            self.skipTest("node is not installed")
+        real = Path(production.__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "slopcannon"
+            try:
+                os.symlink(real, link, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                try:
+                    import _winapi
+                    _winapi.CreateJunction(str(real), str(link))
+                except (ImportError, OSError):
+                    self.skipTest("links are not available here")
+            import subprocess
+            driver = production._driver_path(link)
+            run = subprocess.run([node["node"], str(driver), "run"], capture_output=True, text=True, timeout=60)
+            self.assertEqual(driver, production._driver_path(real))
+            self.assertTrue((run.stdout + run.stderr).strip(), "the driver printed nothing")
+
     def test_runner_keeps_the_calling_profile_scope(self):
         # Hermes holds the served profile in context variables; the background run must see the caller's.
         import contextvars
