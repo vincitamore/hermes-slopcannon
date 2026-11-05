@@ -28,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -496,17 +497,39 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             row_status = "quoted"
         else:
             row_status = "unsubmitted"
+        accepted = (state.get("decisions") or {}).get("accept_checks")
         rows.append({
             "id": sid, "index": index,
             "startMs": planned.get("startMs"), "endMs": planned.get("endMs"),
-            "beat": (planned.get("beat") or "")[:400] or None,
+            "beat": (planned.get("beat") or "")[:2000] or None,
+            "cast": [c for c in planned.get("cast") or [] if isinstance(c, str)][:12],
             "status": row_status,
             "quoteCredits": (entry.get("quote") or {}).get("amountUnits"),
             "generationId": generation.get("id"),
             "clip": {"path": downloaded["path"], "name": Path(downloaded["path"]).name} if downloaded.get("path") else None,
             "check": _check_row(entry),
+            "checkAccepted": accepted == "all" or (isinstance(accepted, list) and sid in accepted),
+            "take": len([a for a in entry.get("attempts") or [] if isinstance(a, dict)]) + 1,
+            **_scene_times(entry),
         })
     return rows
+
+
+def _scene_times(entry: dict[str, Any]) -> dict[str, Any]:
+    """When the current take was submitted and when its file arrived (ms), from the driver's scene log."""
+    out: dict[str, Any] = {"submittedAt": None, "renderedAt": None}
+    for line in entry.get("log") or []:
+        if not isinstance(line, dict) or not isinstance(line.get("at"), str):
+            continue
+        try:
+            at = int(datetime.fromisoformat(line["at"].replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            continue
+        if line.get("step") == "submit":
+            out["submittedAt"], out["renderedAt"] = at, None
+        elif line.get("step") == "content":
+            out["renderedAt"] = at
+    return out
 
 
 def _check_row(entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -514,7 +537,9 @@ def _check_row(entry: dict[str, Any]) -> dict[str, Any] | None:
     with the driver's reason, so a take nobody judged never reads as passed."""
     check = entry.get("shotCheck")
     if isinstance(check, dict):
-        return {"verdict": check.get("verdict"), "issues": check.get("issues") or []}
+        issues = [{**i, "second": i["atSeconds"]} if "second" not in i and "atSeconds" in i else i
+                  for i in check.get("issues") or [] if isinstance(i, dict)]
+        return {"verdict": check.get("verdict"), "issues": issues}
     error = entry.get("shotCheckError")
     take = (entry.get("artifact") or {}).get("assetId")
     if isinstance(error, dict) and error.get("message") and (not take or error.get("assetId") in (None, take)):
@@ -561,6 +586,10 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
     ledger = _read_json(folder / "ledger.json") or {}
     scenes = _scenes(folder, state)
     committed = _committed_credits(ledger)
+    plan = _read_json(folder / "work" / "timed-plan.json") or {}
+    ends = [s["endMs"] for s in scenes if isinstance(s.get("endMs"), (int, float))]
+    duration = plan.get("durationMs") if isinstance(plan.get("durationMs"), (int, float)) else (max(ends) if ends else None)
+    quoted = [s["quoteCredits"] for s in scenes if isinstance(s.get("quoteCredits"), int)]
     out = {
         "id": production_id,
         "title": state.get("title"),
@@ -578,6 +607,8 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
         },
         "spend": {"approvedCredits": (state.get("decisions") or {}).get("approved_credits"),
                   "committedCredits": committed},
+        "durationMs": duration,
+        "quotedCredits": sum(quoted) if quoted else None,
         "master": state.get("master"),
         "sessionId": state.get("sessionId"),
         "assembly": _assembly(ledger),

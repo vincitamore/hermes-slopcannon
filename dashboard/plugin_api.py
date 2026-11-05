@@ -95,6 +95,41 @@ def production_detail(production_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=404 if exc.code == "unknown_production" else 400, detail=str(exc))
 
 
+@router.get("/productions/{production_id}/media")
+def production_media(production_id: str) -> dict[str, Any]:
+    """Poster/filmstrip cache names and the song envelope; ``pending`` while ffmpeg works in the background."""
+    production, media = _mod("production"), _mod("media")
+    try:
+        return media.production_media(production_id)
+    except production.ProductionError as exc:
+        raise HTTPException(status_code=404 if exc.code == "unknown_production" else 400, detail=str(exc))
+
+
+@router.get("/thumbs")
+def thumbs() -> dict[str, Any]:
+    production, media = _mod("production"), _mod("media")
+    return media.thumbs(production.list_ids()[:50])
+
+
+@router.get("/frames/{name}")
+def frame(name: str) -> dict[str, Any]:
+    """One finished poster/strip/thumb as a data URL, by its opaque cache name (never a path)."""
+    media = _mod("media")
+    try:
+        return {"dataUrl": media.frame_data_url(name)}
+    except media.MediaError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
+@router.get("/locate")
+def locate(path: str = Query("", max_length=4096), generationId: str = Query("", max_length=200)) -> dict[str, Any]:  # noqa: N803
+    """The production and scene a chat clip belongs to (the path is compared with recorded paths, never opened)."""
+    hit = _mod("media").locate(path=path or None, generation_id=generationId or None)
+    if not hit:
+        raise HTTPException(status_code=404, detail="not found")
+    return hit
+
+
 @router.post("/productions/{production_id}/stop")
 def production_stop(production_id: str) -> dict[str, Any]:
     production = _mod("production")
