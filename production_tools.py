@@ -90,6 +90,13 @@ def _result(info: dict[str, Any]) -> str:
     show = [out["card"]]
     if state == "needs" and needs == "first_scene_review" and out["media"]:
         show.append(out["media"][0])
+    elif state == "needs" and needs == "shot_review":
+        # The person decides keep-or-reroll per flagged take, so each one is shown, not only described.
+        flagged = {f.get("scene") for f in (info.get("needsDetail") or {}).get("flagged") or [] if isinstance(f, dict)}
+        for row in info.get("scenes") or []:
+            clip = row.get("clip") if isinstance(row, dict) else None
+            if row.get("id") in flagged and clip and clip.get("path"):
+                show.append(f"MEDIA:{Path(clip['path']).resolve().as_posix()}")
     elif state == "done" and out["media"]:
         show.append(out["media"][-1])
     out["show"] = show

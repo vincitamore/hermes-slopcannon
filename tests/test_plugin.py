@@ -883,6 +883,14 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(done["show"], [f'::slopcannon-film{{id="{pid}"}}', done["media"][0]])
         self.assertTrue(done["next"].startswith("Write each line in `show` alone on its own line"))
         self.assertEqual(quoted["show"], [quoted["card"]])
+        # At the take check every flagged take is shown in chat, not only described.
+        clip = Path(self.tmp.name) / "sc02.mp4"
+        clip.write_bytes(b"mp4")
+        review = {"id": pid, "state": "needs", "needs": "shot_review", "needsDetail": {"flagged": [{"scene": "sc02"}]},
+                  "scenes": [{"id": "sc01", "clip": {"path": str(clip)}}, {"id": "sc02", "clip": {"path": str(clip)}}]}
+        with mock.patch.object(production, "media_lines", lambda info: []):
+            shown = json.loads(production_tools._result(review))["show"]
+        self.assertEqual(shown, [f'::slopcannon-film{{id="{pid}"}}', f"MEDIA:{clip.resolve().as_posix()}"])
         # A turn that answered every gate without a reply still ends on the card and the master.
         production_tools._PENDING_SHOW.clear()
         production_tools._owe("chat-1", json.dumps(done))
