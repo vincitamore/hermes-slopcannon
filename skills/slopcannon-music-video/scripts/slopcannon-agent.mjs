@@ -2550,6 +2550,21 @@ async function checkScene(ledgerFile, id, { plan, cast, voiceOver, force }) {
 }
 
 /** A check that could not run, as a run reports it: the scene, why, and whether asking again can help. */
+export const CHECK_CONCURRENCY = 3;
+export const CHECK_RETRY_DELAYS_MS = [15_000, 45_000, 90_000];
+/** One take's character check, tried again after a retryable miss; the last miss is returned as unchecked. */
+export async function checkWithRetry(id, check, wait = sleep) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await check();
+    } catch (error) {
+      const result = uncheckedResult(id, error);
+      if (!result.retryable || attempt >= CHECK_RETRY_DELAYS_MS.length) return result;
+      await wait(CHECK_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+}
+
 function uncheckedResult(id, error) {
   return { scene: id, verdict: "unchecked", reason: error instanceof Error ? error.message : String(error),
     code: error?.code ?? null, retryable: error?.retryable === true };
@@ -3456,13 +3471,10 @@ async function verbRun(options, ledgerFile) {
   // 6b. The character check of each delivered take, where the server offers it (no credits; a stored answer is reused).
   const checkable = (loadLedger(ledgerFile).generation?.mcpTools ?? []).includes("slopcannon_check_take");
   const scenePlan = (id) => JSON.parse(readFileSync(path.join(prepDir, "scene-plans", `${id}.json`), "utf8"));
-  const runChecks = async (ids) => mapWithConcurrency(ids, concurrency, async (id) => {
-    try {
-      return await checkScene(ledgerFile, id, { plan: scenePlan(id), cast });
-    } catch (error) {
-      return uncheckedResult(id, error);
-    }
-  });
+  // The checker is rate limited, so checks run three at a time and a retryable miss (rate limit, timeout) is tried
+  // again here rather than handed to the person as "unchecked".
+  const runChecks = async (ids) => mapWithConcurrency(ids, Math.min(concurrency, CHECK_CONCURRENCY), (id) =>
+    checkWithRetry(id, () => checkScene(ledgerFile, id, { plan: scenePlan(id), cast })));
   if (!review.accepted) {
     const firstCheck = checkable ? (await runChecks([sceneIds[0]]))[0] : null;
     if (firstCheck) steps.push({ step: "check", checks: [firstCheck] });

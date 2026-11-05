@@ -97,3 +97,27 @@ class ReadRetryTest(unittest.TestCase):
         self.assertFalse(result["down"]["ok"])
         self.assertEqual(result["down"]["calls"], 4)
         self.assertIn("could not be reached (ECONNRESET)", result["down"]["error"])
+
+
+CHECK_SCRIPT = r"""
+const { checkWithRetry } = await import(process.argv[1]);
+const run = async (failures, retryable) => {
+  let calls = 0;
+  const check = async () => { calls += 1; if (calls <= failures) throw Object.assign(new Error("rate limited"), { code: "rate_limited", retryable }); return { scene: "sc04", verdict: "pass" }; };
+  const result = await checkWithRetry("sc04", check, async () => {});
+  return { calls, verdict: result.verdict };
+};
+console.log(JSON.stringify({ limited: await run(2, true), refused: await run(1, false), down: await run(99, true) }));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class CheckRetryTest(unittest.TestCase):
+    def test_a_rate_limited_check_is_tried_again_before_it_counts_as_unchecked(self):
+        out = subprocess.run([str(NODE), "--input-type=module", "-e", CHECK_SCRIPT, DRIVER.as_uri()],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["limited"], {"calls": 3, "verdict": "pass"})
+        self.assertEqual(result["refused"], {"calls": 1, "verdict": "unchecked"})
+        self.assertEqual(result["down"], {"calls": 4, "verdict": "unchecked"})

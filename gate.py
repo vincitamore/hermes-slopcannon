@@ -32,6 +32,7 @@ HAND_DRIVEN: set[str] = {
     "slopcannon_create_quote", "slopcannon_slice_scene_audio", "slopcannon_create_render_request",
     "slopcannon_plan_cuts", "slopcannon_direct_scenes", "slopcannon_start_assembly", "slopcannon_select_take",
     "slopcannon_save_workspace", "slopcannon_add_reference", "slopcannon_remove_reference",
+    "slopcannon_check_take",
 }
 # MCP tools whose effect is irreversible or public.
 DESTRUCTIVE: dict[str, str] = {
@@ -324,7 +325,8 @@ def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **
                 return {"action": "block", "message": (
                     f"BLOCKED: this project belongs to the production {owner}, which slopcannon_produce drives. To "
                     f"replace a scene, call slopcannon_produce(production_id=\"{owner}\", reroll={{scene, "
-                    "direction}}): it quotes the new take, asks the person, and cuts it into the film.")}
+                    "direction}}): it quotes the new take, asks the person, and cuts it into the film. To check "
+                    "takes the check skipped, call slopcannon_produce with the production_id: it checks them again.")}
         if inner in SPENDING:
             directive = _spend_directive(inner, inner_args)
             if directive is not None and directive["action"] == "approve" and inner in RIGHTS:

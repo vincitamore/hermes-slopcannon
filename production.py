@@ -523,7 +523,9 @@ def _needs_detail(result: dict[str, Any]) -> dict[str, Any]:
                 "productionCeilingCredits": result.get("productionCeilingCredits")}
     if needs == "shot_review":
         return {"flagged": [{"scene": f.get("scene"), "verdict": f.get("verdict"), "issues": f.get("issues") or []}
-                            for f in result.get("flagged") or [] if isinstance(f, dict)]}
+                            for f in result.get("flagged") or [] if isinstance(f, dict)],
+                "unchecked": [{"scene": u.get("scene"), "retryable": u.get("retryable")}
+                              for u in result.get("unchecked") or [] if isinstance(u, dict)]}
     if needs == "review":
         return {"failed": result.get("failed") or []}
     return {}

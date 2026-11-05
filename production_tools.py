@@ -49,7 +49,10 @@ NEXT: dict[str, str] = {
                            "Hermes asks the person in an approval prompt to watch the scene and approve rendering "
                            "the rest. Do not ask them to reply in chat. If they deny, ask what to change and start "
                            "a new production_id with the revised direction."),
-    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second). Show each one and "
+    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second). If "
+                    "needsDetail.unchecked lists takes the check could not reach, call slopcannon_produce with the "
+                    "production_id first: it checks them again (never check, quote or look up a scene by hand). "
+                    "Show each flagged one and "
                     "ask the person, per scene, to keep it or replace it. Keep: call slopcannon_produce with "
                     "accept_checks naming those scenes. Replace: call slopcannon_produce with reroll = {scene, "
                     "direction (optional, what to change)}; it quotes the new take and stops for their approval, then "
