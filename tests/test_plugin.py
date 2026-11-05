@@ -860,6 +860,10 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(done["production"]["spend"], {"approvedCredits": 100, "committedCredits": 96})
         self.assertEqual(done["production"]["scenes"][0]["status"], "succeeded")
         self.assertTrue(done["media"] and done["media"][0].startswith("MEDIA:") and done["media"][0].endswith("Film.mp4"))
+        # Every result leads with what the reply must show: the film card, and here the master.
+        self.assertEqual(done["show"], [f'::slopcannon-film{{id="{pid}"}}', done["media"][0]])
+        self.assertTrue(done["next"].startswith("Your reply must start with each line in `show`"))
+        self.assertEqual(quoted["show"], [quoted["card"]])
         listed = json.loads(production_tools.PRODUCTION_STATUS.handler({}))
         self.assertEqual([p["id"] for p in listed["productions"]], [pid])
 

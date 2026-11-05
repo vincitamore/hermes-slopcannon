@@ -44,8 +44,8 @@ NEXT: dict[str, str] = {
                  "figure in an approval prompt, and Approve or Deny is their answer."),
     "budget": ("The approved ceiling is too low for the work still to buy (needsDetail). Ask the person for a "
                "higher ceiling and pass it as approve_credits, or stop."),
-    "first_scene_review": ("The first scene is ready (its MEDIA line is in `media`; put it alone on its own line). "
-                           "In this same turn, call slopcannon_produce with review_first = needsDetail.sha256: "
+    "first_scene_review": ("The first scene is ready and the character check has already watched it: do not "
+                           "inspect the file yourself. After showing it, in this same turn, call slopcannon_produce with review_first = needsDetail.sha256: "
                            "Hermes asks the person in an approval prompt to watch the scene and approve rendering "
                            "the rest. Do not ask them to reply in chat. If they deny, ask what to change and start "
                            "a new production_id with the revised direction."),
@@ -75,6 +75,17 @@ def _result(info: dict[str, Any]) -> str:
                        "production_id: it recovers jobs already sent and never buys them twice. Do not open, edit or "
                        "run the production's files or the plugin's driver yourself.")
     out["card"] = f'::slopcannon-film{{id="{info["id"]}"}}'
+    # The cards are how the person sees the film in chat, and the agent only shows them by writing these lines in
+    # its reply; stated once in the skill they were skipped, so every result leads with them.
+    show = [out["card"]]
+    if state == "needs" and needs == "first_scene_review" and out["media"]:
+        show.append(out["media"][0])
+    elif state == "done" and out["media"]:
+        show.append(out["media"][-1])
+    out["show"] = show
+    out["next"] = ("Your reply must start with each line in `show`, each alone on its own line (on Hermes desktop "
+                   "they render the film card and the clip; on other surfaces keep only MEDIA lines). Then: "
+                   + out.get("next", "tell the person where the production stands."))
     return json.dumps(out, default=str)
 
 
