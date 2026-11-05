@@ -20,6 +20,7 @@ _DEFAULTS: dict[str, Any] = {
     "download_dir": "",
     "max_credits_per_action": 0,
     "auto_approve_max_credits": 0,
+    "protect_production_files": True,
 }
 
 _ctx: Any = None

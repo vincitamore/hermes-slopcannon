@@ -71,7 +71,9 @@ def _result(info: dict[str, Any]) -> str:
         out["next"] = ("Finished. Put the MEDIA line for the master alone on its own line. Ask the person to judge "
                        "identity, mouth timing and take quality; the sync check does not judge those.")
     elif state == "error":
-        out["next"] = "Tell the person the error in plain words. Paid work already accepted is never bought again."
+        out["next"] = ("Tell the person the error in plain words. To try again, call slopcannon_produce with the same "
+                       "production_id: it recovers jobs already sent and never buys them twice. Do not open, edit or "
+                       "run the production's files or the plugin's driver yourself.")
     out["card"] = f'::slopcannon-film{{id="{info["id"]}"}}'
     return json.dumps(out, default=str)
 

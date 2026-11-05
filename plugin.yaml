@@ -122,3 +122,7 @@ config_schema:
     type: int
     default: 0
     description: "When approvals are bypassed (YOLO / approvals.mode off), spending calls at or under this many credits proceed; anything larger is blocked. 0 blocks every unattended spend."
+  protect_production_files:
+    type: bool
+    default: true
+    description: "Refuse any other tool (shell, file edits, code) whose arguments name the plugin's production folders or its installed copy, so the agent reads and resumes films only through the SLOPCANNON tools. Turn off only to develop the plugin."

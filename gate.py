@@ -217,9 +217,32 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     }
 
 
+_PRIVATE = ("plugin-data/slopcannon", "plugins/slopcannon/")
+
+
+def _private_paths_directive(tool_name: str, args: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """A production's ledger, state and driver are the plugin's own: the agent reads them through the tools.
+
+    Hand edits to a ledger can lose a paid job's receipt, and an agent digging through them mid-film is the
+    failure the tools exist to prevent, so any other tool whose arguments name those folders is refused.
+    """
+    if tool_name.startswith("slopcannon_") or str(settings.get("protect_production_files")).lower() in ("false", "0", "no"):
+        return None
+    text = json.dumps(args, default=str).replace("\\\\", "/").replace("\\", "/").lower()
+    if not any(part in text for part in _PRIVATE):
+        return None
+    return {"action": "block", "message": (
+        "BLOCKED: SLOPCANNON's production files and driver belong to the plugin. Read a production with "
+        "slopcannon_production_status and resume it with slopcannon_produce (same production_id): it recovers "
+        "earlier jobs by itself and never buys them twice. Never open, edit or run them by hand.")}
+
+
 def pre_tool_call(tool_name: str = "", args: Optional[dict[str, Any]] = None, **_: Any) -> Optional[dict[str, Any]]:
     args = args or {}
     try:
+        private = _private_paths_directive(tool_name, args)
+        if private is not None:
+            return private
         if tool_name == "slopcannon_produce":
             directive = _produce_directive(args)
             return None if directive and directive["action"] == "allow" else directive

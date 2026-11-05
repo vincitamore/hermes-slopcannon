@@ -224,6 +224,21 @@ class GateTest(unittest.TestCase):
         offline.start()
         self.addCleanup(offline.stop)
 
+    def test_production_files_are_only_reached_through_the_tools(self):
+        home = r"C:\Users\x\AppData\Local\hermes\profiles\demo"
+        for tool, args in (
+            ("terminal", {"command": f'cat "{home}\\plugin-data\\slopcannon\\productions\\film\\ledger.json"'}),
+            ("write_file", {"path": "/home/x/.hermes/plugin-data/slopcannon/productions/film/ledger.json",
+                            "content": "{}"}),
+            ("execute_code", {"code": f"open(r'{home}\\plugins\\slopcannon\\production.py')"}),
+        ):
+            d = gate.pre_tool_call(tool, args)
+            self.assertEqual(d["action"], "block", tool)
+            self.assertIn("slopcannon_production_status", d["message"])
+        self.assertIsNone(gate.pre_tool_call("terminal", {"command": "ls ~/Documents/slopcannon-demo-film"}))
+        bind({"protect_production_files": False})
+        self.assertIsNone(gate.pre_tool_call("terminal", {"command": f"ls {home}/plugin-data/slopcannon"}))
+
     def test_paid_submission_goes_to_the_human_gate_with_the_amount(self):
         d = gate.pre_tool_call(SUBMIT, submit_args(56))
         self.assertEqual(d["action"], "approve")
