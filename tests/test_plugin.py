@@ -877,6 +877,27 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(args[args.index("--concurrency") + 1], "16")
         self.assertEqual(args[args.index("--accept-checks") + 1], "sc03")
 
+    def test_runner_keeps_the_calling_profile_scope(self):
+        # Hermes holds the served profile in context variables; the background run must see the caller's.
+        import contextvars
+        profile = contextvars.ContextVar("profile", default="primary")
+        seen: dict[str, str] = {}
+
+        def node_status():
+            seen["profile"] = profile.get()
+            return {"ok": False, "message": "stop here"}
+
+        production.write_production("film-1", self.spec())
+        token = profile.set("demo")
+        try:
+            with mock.patch.object(production, "node_status", node_status):
+                production.start("film-1")
+                production.wait("film-1", 10)
+        finally:
+            profile.reset(token)
+        self.assertEqual(seen.get("profile"), "demo")
+        self.assertEqual(production.load_state("film-1")["state"], "error")
+
     def test_produce_gate(self):
         production.write_production("film-1", self.spec())
         self.assertIsNone(gate.pre_tool_call("slopcannon_produce", {"production": self.spec()}))

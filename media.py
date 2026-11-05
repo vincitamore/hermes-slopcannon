@@ -22,6 +22,7 @@ studio; that choice is the plugin's own record (``posters.json`` beside the cach
 from __future__ import annotations
 
 import base64
+import contextvars
 import hashlib
 import json
 import math
@@ -373,7 +374,7 @@ def _schedule(kind: str, src: Path, key: str, at_ms: Optional[int] = None) -> No
         if _pool is None:
             _pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="slopcannon-media")
         pool = _pool
-    pool.submit(_job, kind, src, key, at_ms)
+    pool.submit(contextvars.copy_context().run, _job, kind, src, key, at_ms)  # keep the profile scope
 
 
 def artefact(src: Optional[Path], kind: str, *, schedule: bool = True, at_ms: Optional[int] = None) -> dict[str, Any]:

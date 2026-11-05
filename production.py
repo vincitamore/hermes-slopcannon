@@ -20,6 +20,7 @@ Runs happen on a background thread so a render can take as long as it takes.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -256,8 +257,16 @@ class _Runner(threading.Thread):
         self.proc: Optional[subprocess.Popen] = None
         self.stopped = False
         self.done = threading.Event()
+        # Hermes keeps the served profile (its home, secrets and the plugin's sign-in) in context
+        # variables, and a new thread starts with none of them: without this copy a run started from a
+        # chat in a second profile writes its state into the primary profile's folder and Hermes refuses
+        # the sign-in. Taken here, on the tool call's own thread.
+        self._context = contextvars.copy_context()
 
     def run(self) -> None:
+        self._context.run(self._run)
+
+    def _run(self) -> None:
         pid = self.production_id
         folder = _dir(pid)
         state = load_state(pid) or {}
@@ -279,7 +288,7 @@ class _Runner(threading.Thread):
             _save_state(pid, state)
             self.proc = subprocess.Popen(args, cwd=str(folder), env=env, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-            watcher = threading.Thread(target=self._watch_ledger, daemon=True)
+            watcher = threading.Thread(target=contextvars.copy_context().run, args=(self._watch_ledger,), daemon=True)
             watcher.start()
             stdout, stderr = self.proc.communicate()
             code = self.proc.returncode
