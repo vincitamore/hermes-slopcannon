@@ -220,6 +220,9 @@ class GateTest(unittest.TestCase):
         patcher = mock.patch.object(gate, "_approvals_bypassed", return_value=False)
         patcher.start()
         self.addCleanup(patcher.stop)
+        offline = mock.patch.object(client_mod.Client, "rights_policy", return_value={})
+        offline.start()
+        self.addCleanup(offline.stop)
 
     def test_paid_submission_goes_to_the_human_gate_with_the_amount(self):
         d = gate.pre_tool_call(SUBMIT, submit_args(56))
@@ -800,6 +803,7 @@ class ProductionTest(unittest.TestCase):
             mock.patch.object(production, "root", lambda: self.root),
             mock.patch.object(production, "DRIVER", driver),
             mock.patch.object(production, "_broadcast", lambda *a, **k: None),
+            mock.patch.object(client_mod.Client, "rights_policy", return_value={}),
             mock.patch.object(production.auth, "driver_token",
                               lambda pid: auth.Credential(token="slop_live_test", via=auth.VIA_PERSONAL)),
         ]
@@ -894,6 +898,26 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(gate.pre_tool_call("slopcannon_transcribe", {"song": str(self.song),
                                                                       "rights_version": "v1"})["action"], "approve")
 
+    def test_rights_sign_off_is_one_prompt_carrying_the_statement(self):
+        statement = "I confirm that I own or am licensed to use this song."
+        policy = {"requiredVersion": "v1", "statement": statement,
+                  "termsUrl": "https://slop.cc/terms", "acceptableUseUrl": "https://slop.cc/acceptable-use"}
+        with mock.patch.object(client_mod.Client, "rights_policy", return_value={"data": policy}):
+            # The very first call may carry the sign-off: the prompt names the files and quotes the statement.
+            first = gate.pre_tool_call("slopcannon_produce", {"production": self.spec(), "rights_version": "v1"})
+            self.assertEqual(first["action"], "approve")
+            self.assertIn("song.mp3 (7 bytes)", first["message"])
+            self.assertIn(f"\u201c{statement}\u201d", first["message"])
+            self.assertIn("https://slop.cc/acceptable-use", first["message"])
+            # A version the server does not publish gets no statement it never said.
+            stale = gate.pre_tool_call("slopcannon_produce", {"production": self.spec(), "rights_version": "v0"})
+            self.assertNotIn(statement, stale["message"])
+            upload = gate.pre_tool_call("slopcannon_upload", {"path": str(self.song), "kind": "song",
+                                                              "rights_version": "v1"})
+            self.assertIn(statement, upload["message"])
+        # The gate's own next steps never tell the agent to wait for a typed agreement.
+        self.assertIn("same turn", production_tools.NEXT["rights"])
+        self.assertIn("same turn", production_tools.NEXT["approval"])
 
 class TranscribeTest(unittest.TestCase):
     def test_server_words_become_whisper_segments(self):

@@ -90,16 +90,61 @@ def _spend_directive(inner: str, inner_args: dict[str, Any]) -> Optional[dict[st
     }
 
 
+def _policy(version: Any, known: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """The rights statement the person is signing, verbatim: from the production's own gate when it is the
+    same version, otherwise from the public rights-attestation endpoint. Empty when neither is reachable."""
+    if known and known.get("statement") and known.get("requiredVersion") == version:
+        return known
+    try:
+        from .client import Client
+
+        policy = Client().rights_policy()
+        policy = policy.get("data", policy) if isinstance(policy, dict) else {}
+        return policy if policy.get("requiredVersion") == version else {}
+    except Exception:
+        return {}
+
+
+def rights_text(version: Any, files: list[dict[str, Any]], *, label: str = "",
+                known: Optional[dict[str, Any]] = None) -> str:
+    """The approval prompt for a rights sign-off: what is uploaded, then the statement itself, so the person
+    reads exactly what their Approve click attests. Approving is the sign-off; nothing is asked in chat."""
+    policy = _policy(version, known)
+    lines = [f"SLOPCANNON rights sign-off ({version})" + (f" for {label}" if label else "")]
+    if files:
+        lines.append("Files: " + "; ".join(
+            f"{f['name']} ({int(f['bytes']):,} bytes)" if isinstance(f.get("bytes"), int) else str(f["name"])
+            for f in files))
+    statement = str(policy.get("statement") or "").strip()
+    if statement:
+        lines += ["", f"\u201c{statement}\u201d"]
+    else:
+        lines += ["", "Approving confirms you own or are licensed to use this material and agree to "
+                      "slop.cc's Terms of Service and Acceptable Use Policy."]
+    terms = policy.get("termsUrl") or "https://slop.cc/terms"
+    aup = policy.get("acceptableUseUrl") or "https://slop.cc/acceptable-use"
+    lines += ["", f"Terms: {terms} \u00b7 Acceptable Use: {aup}", "Approve to sign; Deny to stop."]
+    return "\n".join(lines)
+
+
 def _rights_directive(label: str, version: Any, files: list[dict[str, Any]]) -> dict[str, Any]:
-    inventory = "; ".join(f"{f['name']} ({f['bytes']} bytes)" for f in files) or "the referenced media"
     return {
         "action": "approve",
-        "message": (
-            f"SLOPCANNON rights sign-off ({version}) for {label}: {inventory}. Approving confirms the "
-            "person owns or is licensed to use this material (slop.cc/v1/rights-attestation)."
-        ),
+        "message": rights_text(version, files, label=label),
         "rule_key": _rule_key("rights", label, version, files),
     }
+
+
+def _spec_files(spec: Any) -> list[dict[str, Any]]:
+    """The local files a production spec names (song, then references), for a sign-off on the first call."""
+    if not isinstance(spec, dict):
+        return []
+    files = []
+    for path in [spec.get("song"), *[r.get("path") for r in spec.get("references") or [] if isinstance(r, dict)]]:
+        p = Path(str(path or "")).expanduser()
+        if path and p.is_file():
+            files.append({"name": p.name, "bytes": p.stat().st_size})
+    return files
 
 
 def _credit_limits(amount: int, what: str) -> Optional[dict[str, Any]]:
@@ -129,18 +174,24 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     if all(v in (None, "", []) for v in (rights, credits, review, accept)):
         return None
     pid = str(args.get("production_id") or "")
-    if not pid:
+    spec = args.get("production")
+    starting = not pid and isinstance(spec, dict)
+    if not pid and not starting:
         return {"action": "block", "message": (
-            "BLOCKED: start the production first (without approvals), show the person what it needs, then call "
-            "again with its production_id and their answer.")}
-    state = production.load_state(pid) or {}
-    title = state.get("title") or pid
+            "BLOCKED: pass the production to start (it may carry rights_version), or the production_id of one "
+            "already started.")}
+    if starting and any(v not in (None, "", []) for v in (credits, review, accept)):
+        return {"action": "block", "message": (
+            "BLOCKED: a new production can carry only rights_version. Credits, reviews and accepted takes "
+            "answer a gate the production has reached; start it, then answer with its production_id.")}
+    state = (production.load_state(pid) if pid else None) or {}
+    title = state.get("title") or (spec.get("title") if isinstance(spec, dict) else None) or pid
     detail = state.get("needsDetail") or {}
     parts: list[str] = []
+    rights_block = ""
     if rights not in (None, ""):
-        files = production.inventory(pid)
-        inventory = ", ".join(f"{f['name']} ({f['bytes']:,} bytes)" for f in files) or "its media"
-        parts.append(f"rights sign-off {rights} for {inventory}: the person owns or is licensed to use it")
+        files = _spec_files(spec) or (production.inventory(pid) if pid else [])
+        rights_block = rights_text(rights, files, known=detail if state.get("needs") == "rights" else None)
     if credits is not None:
         if not isinstance(credits, int) or isinstance(credits, bool) or credits < 0:
             return {"action": "block", "message": "BLOCKED: approve_credits must be a whole number of Cannon Credits."}
@@ -155,10 +206,13 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
         parts.append(f"the person watched {scene} ({str(review)[:12]}) and approves rendering the rest")
     if accept:
         parts.append("keep flagged takes " + ", ".join(str(a) for a in accept))
+    message = f'SLOPCANNON "{title}": ' + "; ".join(parts) if parts else ""
+    if rights_block:
+        message = (message + "\n\n" if message else f'SLOPCANNON "{title}"\n') + rights_block
     return {
         "action": "approve",
-        "message": f'SLOPCANNON "{title}": ' + "; ".join(parts),
-        "rule_key": _rule_key("produce", pid, rights, credits, review, accept),
+        "message": message,
+        "rule_key": _rule_key("produce", pid or title, rights, credits, review, accept),
     }
 
 

@@ -34,10 +34,14 @@ _MAX_WAIT_S = 840
 # What the agent should do next at each gate. Kept beside the tool so the skill and
 # the result never disagree.
 NEXT: dict[str, str] = {
-    "rights": ("Show the person needsDetail.statement and the files, then call slopcannon_produce with this "
-               "production_id and rights_version = needsDetail.requiredVersion. Hermes asks them to approve."),
-    "approval": ("Show every scene's quote and needsDetail.totalCannonCredits, then call slopcannon_produce with "
-                 "approve_credits = the ceiling they agree to (at least the total). Hermes asks them to approve."),
+    "rights": ("Call slopcannon_produce again now, in this same turn, with this production_id and rights_version = "
+               "needsDetail.requiredVersion. Do not ask the person to type their agreement: Hermes shows them the "
+               "statement and the files in an approval prompt, and their Approve is the sign-off. Say one line "
+               "first (what the files are and that the prompt carries the statement)."),
+    "approval": ("Show every scene's quote and needsDetail.totalCannonCredits in a short table, then call "
+                 "slopcannon_produce again now, in this same turn, with approve_credits = "
+                 "needsDetail.totalCannonCredits. Do not ask the person to reply in chat: Hermes shows them the "
+                 "figure in an approval prompt, and Approve or Deny is their answer."),
     "budget": ("The approved ceiling is too low for the work still to buy (needsDetail). Ask the person for a "
                "higher ceiling and pass it as approve_credits, or stop."),
     "first_scene_review": ("The first scene is ready (its MEDIA line is in `media`; put it alone on its own line). "
@@ -143,10 +147,13 @@ PRODUCE = ToolSpec("slopcannon_produce", {
     "description": (
         "Make a whole SLOPCANNON music video from a local song in one call: uploads, scene plan, quotes, a first "
         "scene for review, parallel renders, character checks and assembly, run in the background and resumable. "
-        "Start with `production`; it stops at each human gate (rights, credit approval, first-scene review, "
-        "flagged takes) and says exactly what to ask. Answer a gate by calling again with the same production_id "
-        "and rights_version / approve_credits / review_first / accept_checks; Hermes asks the person to approve "
-        "each answer. Nothing is bought twice. Prefer this over driving the per-scene tools by hand."),
+        "Start with `production` (and `timed_plan` when the person supplied one); pass rights_version "
+        "(slopcannon_account's rights.requiredVersion) on that first call and Hermes shows the person the rights "
+        "statement and files in an approval prompt. It stops at each later human gate (credit approval, "
+        "first-scene review, flagged takes) and says exactly what to do. Answer a gate by calling again at once "
+        "with the same production_id and approve_credits / review_first / accept_checks; Hermes asks the person "
+        "to approve each answer in a prompt, so never ask them to type an agreement in chat. It does the uploads, "
+        "hashing and quotes itself. Nothing is bought twice. Prefer this over driving the per-scene tools by hand."),
     "parameters": {
         "type": "object",
         "properties": {
