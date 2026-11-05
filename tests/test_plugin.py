@@ -1111,6 +1111,29 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(args[args.index("--concurrency") + 1], "16")
         self.assertEqual(args[args.index("--accept-checks") + 1], "sc03")
 
+    def test_every_flag_the_plugin_passes_is_one_the_driver_accepts(self):
+        # The fake driver accepts anything; the real one refuses an unknown flag, so a chained run once
+        # died at its first keep on --reviewed. Read the driver's own verb table and check every call shape.
+        source = production._driver_path(Path(production.__file__).parent).read_text(encoding="utf-8")
+        verbs = {m.group(1): set(re.findall(r'"(--[a-z-]+)"', m.group(2)))
+                 for m in re.finditer(r'^  ([a-z-]+): \[([^\]]*)\],?\r?$', source, re.M)}
+        folder = self.root / "chained"
+        (folder / "work" / "scene-audio" / "scene-plans").mkdir(parents=True)
+        (folder / "production.json").write_text(json.dumps({"title": "t", "continuity": "chain"}), encoding="utf-8")
+        shapes = [
+            {"rights_version": "v1", "approved_credits": 120, "review_first": "b" * 64, "accept_checks": ["sc03"],
+             "reviewed": ["a" * 64]},
+            {"rights_version": "v1", "approved_credits": 120, "reviewed": ["a" * 64],
+             "rerolls": {"sc01": {"take": "sc01r1", "approved": 40}}},
+            {"approved_credits": 120, "rerolls": {"sc02": {"direction": "d", "quote": None, "approved": None}}},
+            {"approved_credits": 120, "rerolls": {"sc02": {"quote": {"amountUnits": 40}, "approved": 40,
+                                                           "submitted": False}}},
+        ]
+        for decisions in shapes:
+            args = production._driver_args(folder, decisions, 3)
+            flags = {a for a in args[1:] if a.startswith("--")}
+            self.assertLessEqual(flags, verbs[args[0]], f"{args[0]} refuses {flags - verbs[args[0]]}")
+
     def test_driver_runs_when_the_plugin_is_installed_as_a_link(self):
         # Hermes installs a local plugin as a link; Node runs a script only from its real path and
         # otherwise exits 0 having done nothing.
