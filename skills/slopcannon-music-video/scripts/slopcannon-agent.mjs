@@ -69,7 +69,7 @@ const VERBS = {
   direct: ["--ledger", "--project", "--scene-id", "--instruction", "--revision"],
   select: ["--ledger", "--project", "--scene-id", "--take", "--revision"],
   check: ["--ledger", "--scene", "--plan", "--cast", "--voice-over", "--force"],
-  reroll: ["--ledger", "--scene", "--plan", "--cast", "--direction", "--bible", "--aspect", "--approve-units", "--max-credits"],
+  reroll: ["--ledger", "--scene", "--plan", "--cast", "--direction", "--bible", "--aspect", "--approve-units", "--max-credits", "--wait"],
   cut: ["--ledger", "--plan", "--takes", "--title", "--output", "--accept-checks", "--end-card", "--end-card-from-ms", "--rights", "--graphics"],
   usage: ["--ledger", "--cursor", "--limit"],
   status: ["--ledger"],
@@ -1779,6 +1779,10 @@ async function verbReroll(options, ledgerFile) {
     }
     await verbSubmit(new Map([["--scene", takeId], ["--approve-units", options.get("--approve-units")], ["--reference", `reroll of ${root}`]]), ledgerFile);
     current = loadLedger(ledgerFile).scenes[takeId];
+  }
+  // --wait no: submitted, collected by a later reroll call, so several rerolls render at once
+  if (options.get("--wait") === "no" && !TERMINAL.has(current.generation.status)) {
+    return { ok: true, submitted: true, scene: takeId, rerollOf: root, status: current.generation.status };
   }
   const polled = TERMINAL.has(current.generation.status)
     ? { status: current.generation.status, errorCode: current.generation.errorCode ?? null }

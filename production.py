@@ -257,21 +257,30 @@ def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str,
         if decisions.get(key) not in (None, "", []):
             current[key] = decisions[key]
     rerolls = current.setdefault("rerolls", {})
-    asked = decisions.get("reroll")
-    if isinstance(asked, dict) and asked.get("scene"):
+    for asked in _reroll_list(decisions.get("reroll")):
         # A new take of a delivered scene: quoted first, bought only on the person's approve_reroll.
-        scene = str(asked["scene"])
-        rerolls[scene] = {"direction": (str(asked.get("direction")).strip() or None) if asked.get("direction") else None,
-                          "approved": None, "take": None}
+        direction = str(asked.get("direction") or "").strip() or None
+        earlier = rerolls.get(str(asked["scene"])) or {}
+        if earlier.get("approved"):  # a scene rerolled again: its earlier take's spend still counts
+            current["reroll_credits_before"] = int(current.get("reroll_credits_before") or 0) + int(earlier["approved"])
+        rerolls[str(asked["scene"])] = {"direction": direction, "quote": None, "approved": None,
+                                        "submitted": False, "take": None}
     approved = decisions.get("approve_reroll")
-    if isinstance(approved, int) and not isinstance(approved, bool):
-        scene = (state.get("needsDetail") or {}).get("scene")
-        if state.get("needs") == "reroll_approval" and scene in rerolls:
-            rerolls[scene]["approved"] = approved
+    if isinstance(approved, int) and not isinstance(approved, bool) and state.get("needs") == "reroll_approval":
+        waiting = {k: r for k, r in rerolls.items() if r.get("quote") and r.get("approved") is None}
+        if waiting and approved == sum(int(r["quote"]["amountUnits"]) for r in waiting.values()):
+            for r in waiting.values():
+                r["approved"] = int(r["quote"]["amountUnits"])
     if not rerolls:
         current.pop("rerolls", None)
     _save_state(production_id, state)
     return current
+
+
+def _reroll_list(raw: Any) -> list[dict[str, Any]]:
+    """reroll as one {scene, direction} or a list of them."""
+    items = raw if isinstance(raw, list) else [raw] if isinstance(raw, dict) else []
+    return [i for i in items if isinstance(i, dict) and i.get("scene")]
 
 
 def reroll_problem(production_id: str, scene: Any) -> Optional[str]:
@@ -300,25 +309,38 @@ def remember_session(production_id: str, session_id: str) -> None:
         _save_state(production_id, state)
 
 
+def _reroll_args(folder: Path, scene: str, ask: dict[str, Any]) -> list[str]:
+    args = ["reroll", "--ledger", str(folder / "ledger.json"), "--scene", scene,
+            "--plan", str(folder / "work" / "scene-audio" / "scene-plans" / f"{scene}.json"),
+            "--cast", str(folder / "work" / "cast.json")]
+    if ask.get("direction"):
+        args += ["--direction", str(ask["direction"])]
+    return args
+
+
 def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> list[str]:
-    """The next driver call: an open reroll, then the cut with the chosen takes, else the film's own run."""
+    """The next driver call. Rerolls go in stages so several render at once: every asked scene is quoted, the
+    person approves them together (an empty list here: the runner stops at that gate), every approved one is
+    submitted without waiting, then each is collected; finally the film is cut with the new takes."""
     ledger = str(folder / "ledger.json")
     checks = decisions.get("accept_checks")
     rerolls = decisions.get("rerolls") or {}
+    # A reroll counts toward the film's ceiling, so the approved takes raise it by exactly their quotes.
+    ceiling = (int(decisions.get("approved_credits") or 0) + int(decisions.get("reroll_credits_before") or 0)
+               + sum(int(r.get("approved") or 0) for r in rerolls.values()))
     for scene, ask in rerolls.items():
-        if ask.get("take"):
-            continue
-        args = ["reroll", "--ledger", ledger, "--scene", scene,
-                "--plan", str(folder / "work" / "scene-audio" / "scene-plans" / f"{scene}.json"),
-                "--cast", str(folder / "work" / "cast.json")]
-        if ask.get("direction"):
-            args += ["--direction", str(ask["direction"])]
-        if isinstance(ask.get("approved"), int):
-            # A reroll counts toward the film's ceiling, so the approved take raises it by exactly its quote.
-            ceiling = int(decisions.get("approved_credits") or 0) + sum(
-                int(r.get("approved") or 0) for r in rerolls.values())
-            args += ["--approve-units", str(ask["approved"]), "--max-credits", str(ceiling)]
-        return args
+        if not ask.get("take") and ask.get("approved") is None and not ask.get("quote"):
+            return _reroll_args(folder, scene, ask)
+    if any(not r.get("take") and r.get("approved") is None for r in rerolls.values()):
+        return []
+    for scene, ask in rerolls.items():
+        if not ask.get("take") and not ask.get("submitted"):
+            return _reroll_args(folder, scene, ask) + ["--approve-units", str(ask["approved"]),
+                                                       "--max-credits", str(ceiling), "--wait", "no"]
+    for scene, ask in rerolls.items():
+        if not ask.get("take"):
+            return _reroll_args(folder, scene, ask) + ["--approve-units", str(ask["approved"]),
+                                                       "--max-credits", str(ceiling)]
     takes = {scene: ask["take"] for scene, ask in rerolls.items() if ask.get("take")}
     if takes:
         title = _film_title(folder)
@@ -381,20 +403,37 @@ class _Runner(threading.Thread):
             env = {**os.environ, settings.TOKEN_ENV: token, "SLOPCANNON_AGENT_ORIGIN": settings.api_origin()}
             while True:
                 verb_args = _driver_args(folder, state.get("decisions") or {}, self.concurrency)
+                if not verb_args:  # every asked reroll is quoted: one approval covers them all
+                    quotes = [{"scene": k, **r["quote"]} for k, r in state["decisions"]["rerolls"].items()
+                              if r.get("quote") and r.get("approved") is None and not r.get("take")]
+                    code, stderr = 2, ""
+                    result = {"ok": False, "needs": "reroll_approval", "quotes": quotes,
+                              "message": "New takes quoted; waiting for the person's approval."}
+                    break
                 code, result, stdout, stderr = self._call([node["node"], str(DRIVER), *verb_args], env, state)
                 state = load_state(pid) or state
                 state["runs"][-1].update(endedAt=int(time.time() * 1000), exitCode=code)
                 state["log"] = (state.get("log") or [])[-_LOG_LINES:] + _log_lines(result, stderr)
-                if verb_args[0] == "reroll" and code == 0 and result.get("ok") and not self.stopped:
+                if verb_args[0] == "reroll" and not self.stopped:
                     ask = state["decisions"]["rerolls"][verb_args[verb_args.index("--scene") + 1]]
-                    ask["take"] = result.get("scene")
-                    ask["check"] = (result.get("check") or {}).get("verdict")
-                    state["log"].append(f"reroll {result.get('rerollOf')} -> {result.get('scene')}")
-                    _save_state(pid, state)
-                    continue  # the next reroll, or the cut with the new takes
+                    if code == 2 and result.get("needs") == "approval":  # quoted (or quoted again: it expired)
+                        ask.update(quote={"take": result.get("scene"), "amountUnits": result.get("amountUnits"),
+                                          "quoteId": result.get("quoteId"), "expiresAt": result.get("expiresAt")},
+                                   approved=None, submitted=False)
+                        _save_state(pid, state)
+                        continue
+                    if code == 0 and result.get("ok") and result.get("submitted"):
+                        ask["submitted"] = True
+                        state["log"].append(f"reroll {result.get('rerollOf')} submitted as {result.get('scene')}")
+                        _save_state(pid, state)
+                        continue
+                    if code == 0 and result.get("ok"):
+                        ask["take"] = result.get("scene")
+                        ask["check"] = (result.get("check") or {}).get("verdict")
+                        state["log"].append(f"reroll {result.get('rerollOf')} -> {result.get('scene')}")
+                        _save_state(pid, state)
+                        continue  # the next reroll, or the cut with the new takes
                 break
-            if verb_args[0] == "reroll" and code == 2 and result.get("needs") == "approval":
-                result = {**result, "needs": "reroll_approval"}
             if self.stopped:
                 state.update(state="idle", needs=None, message="Stopped. Paid work already accepted keeps running "
                              "on the server; continuing the production recovers it without paying again.")
@@ -518,9 +557,10 @@ def _needs_detail(result: dict[str, Any]) -> dict[str, Any]:
                 "clip": {"path": path, "name": Path(path).name} if path else None,
                 "shotCheck": result.get("shotCheck"), "directionWarnings": result.get("directionWarnings")}
     if needs == "reroll_approval":
-        return {"scene": result.get("rerollOf"), "take": result.get("scene"), "amountUnits": result.get("amountUnits"),
-                "quoteId": result.get("quoteId"), "expiresAt": result.get("expiresAt"),
-                "productionCeilingCredits": result.get("productionCeilingCredits")}
+        quotes = [q for q in result.get("quotes") or [] if isinstance(q, dict)]
+        return {"scenes": [q.get("scene") for q in quotes], "quotes": quotes,
+                "amountUnits": sum(int(q.get("amountUnits") or 0) for q in quotes),
+                "quoteIds": [q.get("quoteId") for q in quotes]}
     if needs == "shot_review":
         return {"flagged": [{"scene": f.get("scene"), "verdict": f.get("verdict"), "issues": f.get("issues") or []}
                             for f in result.get("flagged") or [] if isinstance(f, dict)],

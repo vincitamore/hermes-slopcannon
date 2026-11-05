@@ -780,23 +780,28 @@ const ledger = existsSync(ledgerFile) ? JSON.parse(readFileSync(ledgerFile, "utf
 const out = (value, code) => { process.stdout.write(JSON.stringify(value) + "\n"); process.exitCode = code; };
 if (process.env.SLOPCANNON_AGENT_TOKEN !== "slop_live_test") { out({ ok: false, needs: "origin", message: "no token" }, 2); }
 else if (args[0] === "reroll") {
-  const take = flag("--scene") + ".r1";
+  const root = flag("--scene"), take = root + ".r1", price = root === "sc01" ? 44 : 50;
+  const log = path.join(path.dirname(ledgerFile), "reroll-calls.log");
+  writeFileSync(log, (existsSync(log) ? readFileSync(log, "utf8") : "") + [root, flag("--approve-units"), flag("--max-credits"), flag("--wait")].join(" ") + "\n");
   if (!flag("--approve-units")) {
-    ledger.scenes[take] = { rerollOf: flag("--scene"), direction: flag("--direction"), quote: { id: "q9", amountUnits: 44 } };
+    ledger.scenes[take] = { rerollOf: root, quote: { id: "q-" + root, amountUnits: price } };
     writeFileSync(ledgerFile, JSON.stringify(ledger));
-    out({ ok: false, needs: "approval", scene: take, rerollOf: flag("--scene"), quoteId: "q9", amountUnits: 44 }, 2);
-  } else if (flag("--approve-units") !== "44" || flag("--max-credits") !== "144") { out({ ok: false, error: "bad approval " + flag("--max-credits") }, 1); }
-  else {
+    out({ ok: false, needs: "approval", scene: take, rerollOf: root, quoteId: "q-" + root, amountUnits: price }, 2);
+  } else if (Number(flag("--approve-units")) !== price) { out({ ok: false, error: "bad approval" }, 1); }
+  else if (flag("--wait") === "no") {
+    ledger.scenes[take].generation = { id: "gen-" + take, status: "queued" };
+    writeFileSync(ledgerFile, JSON.stringify(ledger));
+    out({ ok: true, submitted: true, scene: take, rerollOf: root, status: "queued" }, 0);
+  } else {
     const clip = path.join(path.dirname(ledgerFile), "work", "clips", take + ".mp4"); writeFileSync(clip, "mp4");
-    ledger.scenes[take].generation = { id: "gen_r1", status: "succeeded" };
+    ledger.scenes[take].generation = { id: "gen-" + take, status: "succeeded" };
     ledger.scenes[take].downloaded = { path: clip, sha256: "b".repeat(64), bytes: 3 };
     writeFileSync(ledgerFile, JSON.stringify(ledger));
-    out({ ok: true, scene: take, rerollOf: flag("--scene"), path: clip, check: { verdict: "pass" } }, 0);
+    out({ ok: true, scene: take, rerollOf: root, path: clip, check: { verdict: "pass" } }, 0);
   }
 }
 else if (args[0] === "cut") {
-  if (flag("--takes") !== "sc01=sc01.r1") out({ ok: false, error: "bad takes " + flag("--takes") }, 1);
-  else { const master = flag("--output"); writeFileSync(master, "mp4cut"); out({ ok: true, output: master, cut: "c1", takes: { sc01: "sc01.r1" } }, 0); }
+  const master = flag("--output"); writeFileSync(master, "cut " + flag("--takes")); out({ ok: true, output: master, cut: "c1" }, 0);
 }
 else if (flag("--rights-accepted") !== "v1") {
   out({ ok: false, needs: "rights", requiredVersion: "v1", statement: "I own it.", files: [{ file: "/x/song.mp3", bytes: 10, role: "master" }] }, 2);
@@ -920,11 +925,29 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(wrong["action"], "block")
         ask = gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "approve_reroll": 44})
         self.assertEqual(ask["action"], "approve")
-        self.assertIn("44 Cannon Credits on a new take of sc01", ask["message"])
+        self.assertIn("44 Cannon Credits on new takes of sc01", ask["message"])
         cut = self.produce(production_id=pid, approve_reroll=44)
         self.assertEqual(cut["production"]["state"], "done", cut)
-        self.assertTrue(cut["production"]["master"]["path"].endswith("Film.mp4"))
+        master = Path(cut["production"]["master"]["path"])
+        self.assertTrue(master.name.endswith("Film.mp4"))
+        self.assertEqual(master.read_text(), "cut sc01=sc01.r1")
         self.assertEqual(cut["production"]["scenes"][0]["clip"]["name"], "sc01.r1.mp4")
+        # Several rerolls in one call: quoted together, one approval for the total, all submitted before any
+        # is waited on (so they render at once), then one cut with every new take.
+        many = self.produce(production_id=pid, reroll=[{"scene": "sc01", "direction": "again"}, {"scene": "sc02"}])
+        self.assertEqual(many["production"]["needs"], "reroll_approval", many)
+        detail = many["production"]["needsDetail"]
+        self.assertEqual((detail["scenes"], detail["amountUnits"]), (["sc01", "sc02"], 94))
+        both = gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "approve_reroll": 94})
+        self.assertIn("94 Cannon Credits on new takes of sc01, sc02 (sc01 44; sc02 50)", both["message"])
+        self.assertEqual(gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "approve_reroll": 44})["action"],
+                         "block")
+        final = self.produce(production_id=pid, approve_reroll=94)
+        self.assertEqual(final["production"]["state"], "done", final)
+        calls = (production._dir(pid) / "reroll-calls.log").read_text().splitlines()[-6:]
+        self.assertEqual([c.split(" ")[3] for c in calls[2:4]], ["no", "no"])  # both sent before either waited
+        self.assertEqual(calls[2].split(" ")[2], "238")  # ceiling: 100 film + 44 + 94 rerolls
+        self.assertEqual(Path(final["production"]["master"]["path"]).read_text(), "cut sc01=sc01.r1,sc02=sc02.r1")
         # Hand-driving the film's own project is refused, and so is a second sign-off for the same files.
         hand = gate.pre_tool_call("mcp_slopcannon_slopcannon_create_quote", {"projectId": "proj_1"})
         self.assertEqual(hand["action"], "block")

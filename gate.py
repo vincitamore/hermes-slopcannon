@@ -196,13 +196,15 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
     reroll, reroll_units = args.get("reroll"), args.get("approve_reroll")
     pid = str(args.get("production_id") or "")
     spec = args.get("production")
-    if reroll not in (None, "", {}):
+    if reroll not in (None, "", {}, []):
         if not pid:
-            return {"action": "block", "message": "BLOCKED: reroll names a scene of a production: pass its production_id."}
-        scene = reroll.get("scene") if isinstance(reroll, dict) else None
-        problem = production.reroll_problem(pid, scene) if scene else "reroll needs the scene id, such as sc03"
-        if problem:
-            return {"action": "block", "message": f"BLOCKED: cannot reroll now: {problem}."}
+            return {"action": "block", "message": "BLOCKED: reroll names scenes of a production: pass its production_id."}
+        asked = production._reroll_list(reroll)
+        problems = [p for p in (production.reroll_problem(pid, a["scene"]) for a in asked) if p]
+        if not asked:
+            problems.append("reroll needs scene ids, such as [{\"scene\": \"sc03\"}]")
+        if problems:
+            return {"action": "block", "message": f"BLOCKED: cannot reroll now: {'; '.join(problems)}."}
     if all(v in (None, "", []) for v in (rights, credits, review, accept, reroll_units)):
         return None
     starting = not pid and isinstance(spec, dict)
@@ -236,14 +238,16 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
                 "BLOCKED: approve_reroll answers a reroll's quote. Ask for the reroll first (reroll = {scene, "
                 "direction}); the production quotes it and stops for the approval.")}
         quoted = detail.get("amountUnits")
+        scenes = ", ".join(str(q.get("scene")) for q in detail.get("quotes") or []) or "the scene"
         if reroll_units != quoted:
             return {"action": "block", "message": (
-                f"BLOCKED: approve_reroll must be the quoted {quoted} Cannon Credits for {detail.get('scene')}.")}
-        limited = _credit_limits(reroll_units, f"a new take of {detail.get('scene')}")
+                f"BLOCKED: approve_reroll must be the quoted total of {quoted} Cannon Credits ({scenes}).")}
+        limited = _credit_limits(reroll_units, f"new takes of {scenes}")
         if limited is not None and limited["action"] == "block":
             return limited
-        parts.append(f"spend {reroll_units:,} Cannon Credits on a new take of {detail.get('scene')}; the first "
-                     "take stays available")
+        each = "; ".join(f"{q.get('scene')} {q.get('amountUnits')}" for q in detail.get("quotes") or [])
+        parts.append(f"spend {reroll_units:,} Cannon Credits on new takes of {scenes} ({each}); they render "
+                     "together and the first takes stay available")
     if credits is not None:
         if not isinstance(credits, int) or isinstance(credits, bool) or credits < 0:
             return {"action": "block", "message": "BLOCKED: approve_credits must be a whole number of Cannon Credits."}
@@ -268,7 +272,7 @@ def _produce_directive(args: dict[str, Any]) -> Optional[dict[str, Any]]:
         "action": "approve",
         "message": message,
         "rule_key": _rule_key("produce", pid or title, rights, credits, review, accept, reroll_units,
-                              detail.get("quoteId") if reroll_units is not None else None),
+                              detail.get("quoteIds") if reroll_units is not None else None),
     }
 
 

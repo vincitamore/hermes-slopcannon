@@ -49,18 +49,16 @@ NEXT: dict[str, str] = {
                            "Hermes asks the person in an approval prompt to watch the scene and approve rendering "
                            "the rest. Do not ask them to reply in chat. If they deny, ask what to change and start "
                            "a new production_id with the revised direction."),
-    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second). If "
-                    "needsDetail.unchecked lists takes the check could not reach, call slopcannon_produce with the "
-                    "production_id first: it checks them again (never check, quote or look up a scene by hand). "
-                    "Show each flagged one and "
-                    "ask the person, per scene, to keep it or replace it. Keep: call slopcannon_produce with "
-                    "accept_checks naming those scenes. Replace: call slopcannon_produce with reroll = {scene, "
-                    "direction (optional, what to change)}; it quotes the new take and stops for their approval, then "
-                    "cuts it into the film. Never quote, upload or submit a production's scenes with the per-scene "
-                    "tools."),
-    "reroll_approval": ("The new take of needsDetail.scene is quoted at needsDetail.amountUnits Cannon Credits. Say "
-                        "so in one line, then call slopcannon_produce again now with approve_reroll = "
-                        "needsDetail.amountUnits: Hermes asks the person in an approval prompt. Do not ask in chat."),
+    "shot_review": ("The character check flagged takes (needsDetail.flagged: issue and second); each flagged clip is "
+                    "in `show`. If needsDetail.unchecked lists takes the check could not reach, call "
+                    "slopcannon_produce with the production_id first: it checks them again (never check, quote or "
+                    "look up a scene by hand). Ask the person, per flagged scene, to keep it or replace it. Then make "
+                    "ONE slopcannon_produce call with accept_checks (the scenes kept) and reroll (a list of every "
+                    "scene to replace, each {scene, direction}); it quotes all the new takes and stops for one "
+                    "approval. Never quote, upload or submit a production's scenes with the per-scene tools."),
+    "reroll_approval": ("The new takes (needsDetail.quotes) are quoted at needsDetail.amountUnits Cannon Credits in "
+                        "all. Say so in one line, then call slopcannon_produce again now with approve_reroll = "
+                        "needsDetail.amountUnits: Hermes asks the person in one approval prompt. Do not ask in chat."),
     "review": "Some scenes did not deliver. Show needsDetail.failed; run slopcannon_production_status later, or "
               "revise the direction in a new production_id.",
     "new_revision": "The inputs changed after paid work began. Use a new production_id for the revision.",
@@ -151,8 +149,8 @@ def _produce(args: dict[str, Any], session_id: str = "") -> str:
         "reroll": args.get("reroll"),
         "approve_reroll": args.get("approve_reroll"),
     }
-    if isinstance(args.get("reroll"), dict):
-        problem = production.reroll_problem(pid, args["reroll"].get("scene"))
+    for asked in production._reroll_list(args.get("reroll")):
+        problem = production.reroll_problem(pid, asked["scene"])
         if problem:
             raise production.ProductionError(f"cannot reroll now: {problem}", "reroll_unavailable")
     if any(v not in (None, "", [], {}) for v in decisions.values()):
@@ -242,14 +240,16 @@ PRODUCE = ToolSpec("slopcannon_produce", {
             "review_first": {"type": "string", "description": "sha256 of the first scene the person reviewed."},
             "accept_checks": {"type": "array", "items": {"type": "string"},
                               "description": "Flagged scene ids (sc03) the person accepts as they are."},
-            "reroll": {"type": "object", "description": (
-                "Replace one delivered scene with a new take (at the take check or after the film is done). It is "
-                "quoted first and bought only on approve_reroll; the film is then cut with the new take."),
-                "properties": {"scene": {"type": "string", "description": "The scene id, such as sc08."},
-                               "direction": {"type": "string", "description": "What to change in the new take."}},
-                "required": ["scene"], "additionalProperties": False},
+            "reroll": {"type": "array", "description": (
+                "Replace delivered scenes with new takes (at the take check or after the film is done): every scene "
+                "the person wants replaced, in ONE call. They are quoted together, approved together with "
+                "approve_reroll, render at the same time, and the film is then cut with the new takes."),
+                "items": {"type": "object",
+                          "properties": {"scene": {"type": "string", "description": "The scene id, such as sc08."},
+                                         "direction": {"type": "string", "description": "What to change in the new take."}},
+                          "required": ["scene"], "additionalProperties": False}},
             "approve_reroll": {"type": "integer", "minimum": 0,
-                               "description": "The reroll's quoted Cannon Credits the person approved."},
+                               "description": "needsDetail.amountUnits: the rerolls' quoted total the person approved."},
             "concurrency": {"type": "integer", "minimum": 1, "maximum": 16},
             "wait_s": {"type": "integer", "minimum": 0, "maximum": _MAX_WAIT_S,
                        "description": f"How long to wait for the next stop (default {_DEFAULT_WAIT_S})."},
