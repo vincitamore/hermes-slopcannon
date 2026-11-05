@@ -3214,7 +3214,7 @@ function verbStatus(ledgerFile) {
  * is bought, so a rerolled scene hands its own last frame on.
  */
 export const CHAIN_NAME = "PREVIOUS SHOT";
-export const CHAIN_LEAD = "Continue exactly from the PREVIOUS SHOT picture, the last frame of the scene before: the same sky colour, light, palette, drawing style and camera framing, with everyone where it left them; never restyle or recolour. Then: ";
+export const CHAIN_LEAD = "Continue from the PREVIOUS SHOT picture, the last frame of the scene before: keep its exact sky colour, light, palette and drawing style, and pick up where it left off (who is where, moving which way); never restyle or recolour it. Then: ";
 
 /** What a quote was made from, so a quote of other scene text or cast is never submitted as this one. */
 export function quoteInputsDigest(params) {
