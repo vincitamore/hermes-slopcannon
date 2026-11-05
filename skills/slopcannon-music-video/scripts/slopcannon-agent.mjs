@@ -402,8 +402,25 @@ function endpoint(ledger, name, fallbackPath) {
 
 // ---------------------------------------------------------------- transport
 
-async function fetchJson(url, init = {}) {
-  const response = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(30_000), ...init });
+// A read that never reached the server (DNS, refused or reset connection: undici's "fetch failed") is tried again;
+// a write is not, since it may have landed.
+export const READ_RETRY_DELAYS_MS = [1000, 3000, 8000];
+export async function fetchJson(url, init = {}, { call = fetch, wait = sleep } = {}) {
+  const method = String(init.method ?? "GET").toUpperCase();
+  let response;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      response = await call(url, { redirect: "manual", signal: AbortSignal.timeout(30_000), ...init });
+      break;
+    } catch (error) {
+      const unreached = error?.name === "TypeError" && /fetch failed/i.test(String(error?.message));
+      if (!unreached || (method !== "GET" && method !== "HEAD") || attempt >= READ_RETRY_DELAYS_MS.length) {
+        if (!unreached) throw error;
+        throw Object.assign(new Error(`${new URL(url).origin} could not be reached (${error?.cause?.code ?? error?.message}). Nothing was changed; try again.`, { cause: error }), { code: "unreachable", retryable: true });
+      }
+      await wait(READ_RETRY_DELAYS_MS[attempt]);
+    }
+  }
   if (response.status >= 300 && response.status < 400) {
     throw new Error(`Unexpected redirect from ${new URL(url).origin}; credentials were not forwarded.`);
   }

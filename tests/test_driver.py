@@ -66,3 +66,34 @@ class SubmitRetryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+READ_SCRIPT = r"""
+const { fetchJson } = await import(process.argv[1]);
+const down = () => Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNRESET" } });
+const run = async (failures, method) => {
+  let calls = 0;
+  const call = async () => { calls += 1; if (calls <= failures) throw down(); return new Response('{"ok":true}', { status: 200 }); };
+  try {
+    const got = await fetchJson("https://api.slop.cc/api/v1/capabilities", method ? { method } : {}, { call, wait: async () => {} });
+    return { ok: true, calls, status: got.status };
+  } catch (error) {
+    return { ok: false, calls, error: error.message };
+  }
+};
+console.log(JSON.stringify({ blip: await run(2), write: await run(1, "POST"), down: await run(99) }));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class ReadRetryTest(unittest.TestCase):
+    def test_a_read_that_never_reached_the_server_is_tried_again(self):
+        out = subprocess.run([str(NODE), "--input-type=module", "-e", READ_SCRIPT, DRIVER.as_uri()],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["blip"], {"ok": True, "calls": 3, "status": 200})
+        self.assertEqual(result["write"]["calls"], 1)  # a write may have landed: never sent twice
+        self.assertFalse(result["down"]["ok"])
+        self.assertEqual(result["down"]["calls"], 4)
+        self.assertIn("could not be reached (ECONNRESET)", result["down"]["error"])
