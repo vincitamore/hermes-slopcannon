@@ -4,6 +4,8 @@ Music videos from a song, inside Hermes. Ask for a film; the agent writes the di
 
 [Install in Hermes](hermes://plugin/install?repo=vincitamore/hermes-slopcannon&enable=1)
 
+![A film card in a Hermes chat: scene 2 is ready, keep it or reroll it](docs/screenshots/3-scene-review.png)
+
 ## What you get
 
 - **A whole film in one request.** `slopcannon_produce` runs SLOPCANNON's own production driver: uploads, scene audio cut on the server, a timed scene plan, quotes, one first scene for your review, parallel renders, character checks and assembly. It is resumable and never buys a scene twice.

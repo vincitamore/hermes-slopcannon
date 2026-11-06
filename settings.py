@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_API_ORIGIN = "https://api.slop.cc"
 TOKEN_ENV = "SLOPCANNON_AGENT_TOKEN"
-USER_AGENT = "hermes-slopcannon/0.3.0"
+USER_AGENT = "hermes-slopcannon/1.0.0"
 
 _DEFAULTS: dict[str, Any] = {
     "api_origin": DEFAULT_API_ORIGIN,
