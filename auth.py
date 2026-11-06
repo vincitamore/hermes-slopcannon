@@ -17,14 +17,22 @@ The plugin runs no sign-in, stores no token and reads no ``.env``:
   API origin is not ``https://api.slop.cc`` (the sign-in is bound to that host).
 
 A production's Node driver runs for hours as a child process, so it gets its own
-twelve-hour session in its environment instead of the in-process one.
+twelve-hour session in its environment instead of the in-process one. On the
+hosted API that is always a minted session, never the personal token itself;
+it is kept in memory per production and reused while it has more than an hour
+left, so a run of driver starts does not spend the account's hourly mint budget.
+
+A refused mint (rate limited, sessions unavailable, network) is remembered for
+a minute and raised again without a new request, so a burst of calls after one
+refusal does not hammer the server; ``reset()`` or ``credential(fresh=True)``
+clears it.
 """
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -51,7 +59,13 @@ DEFAULT_SCOPES = (
 SESSION_TTL_S = 2 * 60 * 60
 DRIVER_TTL_S = 12 * 60 * 60  # the server's maximum: a production never loses its session mid-run
 _REMINT_MARGIN_S = 10 * 60
+DRIVER_REUSE_MIN_S = 60 * 60  # a cached driver session is handed out again only with this much left
 _MINT_TIMEOUT_S = 20
+_BACKOFF_S = 60.0
+# Refusals worth waiting out rather than retrying at once. Configuration errors (a missing client
+# id, a rejected client) are not here: they need the person, and re-checking them sends nothing.
+_TRANSIENT_CODES = frozenset({"agent_session_rate_limited", "agent_sessions_unavailable", "network",
+                              "sign_in_unavailable", "http_429"})
 SESSION_NAME = "Hermes - SLOPCANNON plugin"
 
 VIA_SIGN_IN = "hermes sign-in"
@@ -65,9 +79,10 @@ class NotSignedIn(RuntimeError):
 class CredentialError(RuntimeError):
     """A credential exists but could not be used (refused, rate limited, misconfigured)."""
 
-    def __init__(self, message: str, code: str = "credential_error"):
+    def __init__(self, message: str, code: str = "credential_error", status: Optional[int] = None):
         super().__init__(message)
         self.code = code
+        self.status = status  # the HTTP status of a server refusal, when there was one
 
 
 @dataclass(frozen=True)
@@ -88,6 +103,12 @@ class Credential:
 _lock = threading.Lock()
 _cached: Optional[Credential] = None
 _session_ttl_s = SESSION_TTL_S
+# Guarded by _lock. Driver sessions by production id (hosted API only).
+_drivers: dict[str, Credential] = {}
+# Guarded by _lock. The last transient refusal per mint route (VIA_SIGN_IN / VIA_PERSONAL):
+# (monotonic deadline, code, message, status).
+_refusals: dict[str, tuple[float, str, str, Optional[int]]] = {}
+_monotonic = time.monotonic  # a module attribute so tests can move the clock
 
 
 def set_session_ttl(seconds: int) -> None:
@@ -170,7 +191,7 @@ def _session_from(status: int, payload: Any, *, via: str) -> Credential:
         raise CredentialError("slop.cc refused the personal token (invalid, revoked or expired). "
                               "Make a new one at slop.cc/account.", "invalid_token")
     text = _REFUSALS.get(code) or message or f"SLOPCANNON could not start an agent session (HTTP {status})."
-    raise CredentialError(text, (code or f"http_{status}").lower())
+    raise CredentialError(text, (code or f"http_{status}").lower(), status)
 
 
 def _session_body(ttl_s: int, name: str) -> dict[str, Any]:
@@ -243,23 +264,64 @@ def _mint_with_personal(token: str, ttl_s: int, name: str) -> Credential:
 # --------------------------------------------------------------------------- resolution
 
 
+def _transient(exc: BaseException) -> bool:
+    """A refusal that a minute's wait may cure (rate limit, outage, network), not one that needs the person."""
+    if not isinstance(exc, CredentialError):
+        return False  # NotSignedIn is never waited out: signing in fixes it at once
+    status = exc.status
+    return exc.code in _TRANSIENT_CODES or (status is not None and (status == 429 or status >= 500))
+
+
+def _mint_backed_off(route: str, mint: Callable[[], Credential]) -> Credential:
+    """``mint()``, unless *route* was refused transiently in the last minute: then that refusal again.
+
+    The caller holds ``_lock``. The replayed error is a new exception with the same message and code,
+    raised without a request.
+    """
+    held = _refusals.get(route)
+    if held is not None:
+        deadline, code, message, status = held
+        if _monotonic() < deadline:
+            raise CredentialError(message, code, status)
+        del _refusals[route]
+    try:
+        minted = mint()
+    except CredentialError as exc:
+        if _transient(exc):
+            _refusals[route] = (_monotonic() + _BACKOFF_S, exc.code, str(exc), exc.status)
+        raise
+    _refusals.pop(route, None)
+    return minted
+
+
+def _custom_origin_not_connected() -> NotSignedIn:
+    return NotSignedIn(
+        f"SLOPCANNON is not connected. The API origin {settings.api_origin()} takes a personal token only: "
+        "enter a token from that service as the plugin's Agent token setting. Never paste a token into chat.")
+
+
 def credential(*, fresh: bool = False) -> Credential:
     """The bearer for in-process API calls: a cached sign-in session, else the personal token.
 
     Raises NotSignedIn when neither exists, and CredentialError when the sign-in exists but
-    cannot be used and there is no personal token to fall back on.
+    cannot be used and there is no personal token to fall back on. A transient refusal is
+    remembered for a minute (see ``_mint_backed_off``); *fresh* forces a new mint and clears it.
     """
     global _cached
     with _lock:  # one mint at a time: the server limits sessions per hour
         problem: Optional[RuntimeError] = None
+        if fresh:
+            _refusals.clear()
         if _hosted():
             cached = _cached
             if cached is not None and not fresh and cached.remaining() > _remint_margin():
                 return cached
             try:
-                _cached = _mint_with_sign_in(_session_ttl_s, SESSION_NAME)
+                _cached = _mint_backed_off(VIA_SIGN_IN, lambda: _mint_with_sign_in(_session_ttl_s, SESSION_NAME))
                 return _cached
             except (NotSignedIn, CredentialError) as exc:
+                if _transient(exc) and cached is not None and not fresh and cached.remaining() > 60:
+                    return cached  # due for renewal but still good: keep using it while the mint is refused
                 _cached = None
                 problem = exc
         personal = _personal_token()
@@ -267,9 +329,7 @@ def credential(*, fresh: bool = False) -> Credential:
             return Credential(token=personal, via=VIA_PERSONAL)
         if problem is not None:
             raise problem
-        raise NotSignedIn(
-            f"SLOPCANNON is not connected. The API origin {settings.api_origin()} takes a personal token only: "
-            "enter a token from that service as the plugin's Agent token setting. Never paste a token into chat.")
+        raise _custom_origin_not_connected()
 
 
 def get_token() -> str:
@@ -280,6 +340,9 @@ def invalidate(token: str) -> bool:
     """Forget the cached session if *token* is it (the API answered 401); True when a retry can help."""
     global _cached
     with _lock:
+        for production_id, held in list(_drivers.items()):
+            if held.token == token:
+                del _drivers[production_id]
         if _cached is not None and _cached.token == token:
             _cached = None
             return True
@@ -287,32 +350,65 @@ def invalidate(token: str) -> bool:
 
 
 def reset() -> None:
-    """Drop the in-memory session (nothing is stored anywhere else)."""
+    """Drop every in-memory session and remembered refusal (nothing is stored anywhere else)."""
     global _cached
     with _lock:
         _cached = None
+        _drivers.clear()
+        _refusals.clear()
 
 
 def driver_token(production_id: str) -> Credential:
-    """A dedicated long session for a production driver child, never the in-process one."""
-    name = f"Hermes - SLOPCANNON production {production_id}"
-    problem: Optional[RuntimeError] = None
-    if _hosted():
+    """The credential for a production's driver child process, never the in-process session.
+
+    On the hosted API this is always a minted session of twelve hours (the server's maximum),
+    minted with the Hermes sign-in or else with the personal token; the personal token itself is
+    never handed to the child. When no session can be minted this raises (a rate limit, for
+    instance, says to try again later) rather than fall back to the personal token. The session is
+    kept in memory per production and handed out again while it has more than an hour left, so
+    restarting a production (chain mode starts a run per scene) does not mint a session each time.
+
+    On any other origin (self-hosted, loopback) the sign-in does not apply and agent sessions may
+    not exist, so the personal token is the only credential and the child gets it as is.
+    """
+    with _lock:  # shares the in-process lock: one mint at a time against the hourly limit
+        if not _hosted():
+            personal = _personal_token()
+            if personal:
+                return Credential(token=personal, via=VIA_PERSONAL)
+            raise _custom_origin_not_connected()
+        held = _drivers.get(production_id)
+        if held is not None and held.remaining() > DRIVER_REUSE_MIN_S:
+            return held
+        _drivers.pop(production_id, None)
+        name = f"Hermes - SLOPCANNON production {production_id}"
         try:
-            return _mint_with_sign_in(DRIVER_TTL_S, name)
-        except (NotSignedIn, CredentialError) as exc:
-            problem = exc
-    personal = _personal_token()
-    if personal:
-        if _hosted():
+            minted = _mint_backed_off(VIA_SIGN_IN, lambda: _mint_with_sign_in(DRIVER_TTL_S, name))
+        except (NotSignedIn, CredentialError):
+            personal = _personal_token()
+            if not personal:
+                raise
             try:
-                return _mint_with_personal(personal, DRIVER_TTL_S, name)
-            except CredentialError:
-                pass  # sessions unavailable or rate limited: the personal token itself, as before
-        return Credential(token=personal, via=VIA_PERSONAL)
-    if problem is not None:
-        raise problem
-    raise NotSignedIn(_not_signed_in_message())
+                minted = _mint_backed_off(
+                    VIA_PERSONAL, lambda: _mint_with_personal(personal, DRIVER_TTL_S, name))
+            except CredentialError as exc:
+                raise CredentialError(
+                    f"The production needs its own SLOPCANNON session and none could be started: {exc} "
+                    "(On slop.cc the driver is never given the personal token itself.)",
+                    exc.code, exc.status) from None
+        _drivers[production_id] = minted
+        return minted
+
+
+def forget_driver(production_id: str) -> None:
+    """Drop a production's cached driver session (call when the production ends).
+
+    The session is not revoked at slop.cc: the API has no route an agent host can use to revoke
+    an agent session (``DELETE /v1/tokens/{id}`` takes a signed-in browser session only). It ends
+    at its expiry or with its parent, and the server retires a parent's oldest sessions past ten.
+    """
+    with _lock:
+        _drivers.pop(production_id, None)
 
 
 def token_summary() -> dict[str, Any]:

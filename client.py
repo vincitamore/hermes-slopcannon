@@ -9,14 +9,20 @@ Two transports, one origin:
 The bearer token is only ever sent to the configured API origin. Redirects
 are never followed with it, and capability links on other origins are fetched
 without credentials.
+
+Every failure leaves as a ``SlopcannonError``: a refused request with the
+server's code, and a transport failure (no connection, a timeout, a dropped
+stream) with code ``network`` and a message naming only the exception type,
+never a URL (a capability link carries its own credential).
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -53,6 +59,32 @@ class NotConnected(SlopcannonError):
                 "setting; never ask them to paste a token into chat."),
             code="not_connected",
         )
+
+
+@contextmanager
+def _network(peer: str = "SLOPCANNON") -> Iterator[None]:
+    """Turn an httpx transport failure into a SlopcannonError(code="network").
+
+    The message names the exception type only: httpx's own text can carry the request URL.
+    A timed-out request may still have reached the server, so the message says to check before
+    repeating it; the original exception is not chained, for the same reason as the message.
+    """
+    try:
+        yield
+    except httpx.TimeoutException as exc:
+        raise SlopcannonError(f"{peer} did not answer in time ({type(exc).__name__}). The request may still "
+                              "have arrived, so check its result before repeating it.", code="network") from None
+    except httpx.HTTPError as exc:
+        raise SlopcannonError(f"Could not reach {peer} ({type(exc).__name__}); try again shortly.",
+                              code="network") from None
+
+
+def _json(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        raise SlopcannonError(f"SLOPCANNON answered HTTP {response.status_code} without a JSON body",
+                              code="bad_response", status=response.status_code) from None
 
 
 def _error_from(response: httpx.Response) -> SlopcannonError:
@@ -124,14 +156,14 @@ class Client:
 
     def get_json(self, path: str, *, authenticated: bool = True) -> Any:
         url = self._url(path)
-        with self._http() as http:
+        with _network(), self._http() as http:
             if authenticated:
                 response = self._authed(lambda auth_headers: http.get(
                     url, headers={"Accept": "application/json", **auth_headers}))
             else:
                 response = http.get(url, headers={"Accept": "application/json"})
             response = self._check(response)
-        payload = response.json()
+        payload = _json(response)
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             return payload["data"]
         return payload
@@ -159,10 +191,10 @@ class Client:
         if duration_ms:
             headers["X-Media-Duration-Ms"] = str(int(duration_ms))
         url = self._url(f"/v1/assets?{query}")
-        with self._http(_UPLOAD_TIMEOUT) as http:
+        with _network(), self._http(_UPLOAD_TIMEOUT) as http:
             response = self._check(self._authed(
                 lambda auth_headers: http.post(url, headers={**headers, **auth_headers}, content=data)))
-        return response.json()
+        return _json(response)
 
     def download(self, url: str, dest: Path) -> dict[str, Any]:
         """Stream ``url`` to ``dest``. Own-origin URLs carry the token; others are capability links."""
@@ -178,19 +210,25 @@ class Client:
                        **({"Authorization": f"Bearer {token}"} if token else {})}
             digest = hashlib.sha256()
             size = 0
-            with self._http(_DOWNLOAD_TIMEOUT) as http:
-                with http.stream("GET", url, headers=headers) as response:
-                    if response.status_code == 401 and token and attempt == 0 and not self._token \
-                            and auth.invalidate(token):
-                        continue  # the session lapsed: re-mint once
-                    if response.status_code >= 300:
-                        response.read()
-                        self._check(response)
-                    with partial.open("wb") as handle:
-                        for chunk in response.iter_bytes(1 << 20):
-                            handle.write(chunk)
-                            digest.update(chunk)
-                            size += len(chunk)
+            try:
+                with _network("SLOPCANNON" if own else "the download link's host"), \
+                        self._http(_DOWNLOAD_TIMEOUT) as http:
+                    with http.stream("GET", url, headers=headers) as response:
+                        if response.status_code == 401 and token and attempt == 0 and not self._token \
+                                and auth.invalidate(token):
+                            continue  # the session lapsed: re-mint once
+                        if response.status_code >= 300:
+                            response.read()
+                            self._check(response)
+                        with partial.open("wb") as handle:
+                            for chunk in response.iter_bytes(1 << 20):
+                                handle.write(chunk)
+                                digest.update(chunk)
+                                size += len(chunk)
+            except SlopcannonError as exc:
+                if exc.code == "network":
+                    partial.unlink(missing_ok=True)  # a dropped stream leaves no half file behind
+                raise
             break
         partial.replace(dest)
         return {"path": str(dest), "bytes": size, "sha256": digest.hexdigest()}
@@ -206,7 +244,7 @@ class Client:
             "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
         }
         url, content = self._url("/api/mcp"), json.dumps(body)
-        with self._http(timeout) as http:
+        with _network(), self._http(timeout) as http:
             response = self._authed(
                 lambda auth_headers: http.post(url, headers={**headers, **auth_headers}, content=content))
         if 300 <= response.status_code < 400:
