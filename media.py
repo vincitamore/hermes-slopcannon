@@ -59,7 +59,8 @@ _TIMEOUT_S = 90
 _VIDEO = {".mp4", ".mov", ".webm", ".mkv", ".m4v"}
 _AUDIO = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 _NAME = re.compile(r"^[a-f0-9]{24}-(poster|strip|thumb)\.jpg$")
-_SCENE = re.compile(r"^sc\d{1,3}$")
+_SCENE = re.compile(r"^sc\d{1,3}$")  # a scene's own id; its takes are sc09, sc09.r1, sc09.r2 ...
+_TAKE = re.compile(r"^sc\d{1,3}(\.r\d{1,4})?$")
 _KINDS = {"clip": ("poster", "strip", "thumb"), "film": ("poster", "thumb"), "wave": ()}
 
 POSTERS_FILE = "posters.json"
@@ -79,7 +80,7 @@ class MediaError(RuntimeError):
 
 
 def tools() -> tuple[Optional[str], Optional[str]]:
-    """ffmpeg and ffprobe, from SLOPCANNON_FFMPEG's folder when set, else PATH."""
+    """ffmpeg and ffprobe, from the folder SLOPCANNON_FFMPEG_DIR names when it holds both, else PATH."""
     folder = os.environ.get("SLOPCANNON_FFMPEG_DIR")
     if folder:
         found = [shutil.which(name, path=folder) for name in ("ffmpeg", "ffprobe")]
@@ -478,20 +479,28 @@ def _records(production_id: str) -> tuple[dict[str, Any], dict[str, Any], dict[s
     return state, ledger, spec
 
 
-def _clips(ledger: dict[str, Any]) -> dict[str, Path]:
+def _clips(ledger: dict[str, Any], state: dict[str, Any]) -> dict[str, Path]:
+    """Each scene's clip, keyed by the scene's own id (sc09) and in scene order (sc100 after sc11): the file of the
+    take the film uses now (``production.current_take``), so a rerolled scene shows its new take, not the first."""
+    scenes = ledger.get("scenes")
+    if not isinstance(scenes, dict):
+        return {}
     out = {}
-    for sid, entry in sorted((ledger.get("scenes") or {}).items()):
-        if _SCENE.match(sid) and isinstance(entry, dict):
-            clip = _media_file((entry.get("downloaded") or {}).get("path"), _VIDEO)
-            if clip:
-                out[sid] = clip
+    for sid in sorted(scenes, key=production.scene_order):
+        if not (_SCENE.match(sid) and isinstance(scenes[sid], dict)):
+            continue
+        entry = scenes.get(production.current_take(ledger, state, sid))
+        downloaded = entry.get("downloaded") if isinstance(entry, dict) else None
+        clip = _media_file((downloaded if isinstance(downloaded, dict) else {}).get("path"), _VIDEO)
+        if clip:
+            out[sid] = clip
     return out
 
 
 def production_media(production_id: str) -> dict[str, Any]:
     state, ledger, spec = _records(production_id)
     master = _media_file((state.get("master") or {}).get("path"), _VIDEO)
-    scenes = {sid: artefact(path, "clip") for sid, path in _clips(ledger).items()}
+    scenes = {sid: artefact(path, "clip") for sid, path in _clips(ledger, state).items()}
     chosen = poster_choice(production_id)
     film = artefact(master, "film", at_ms=chosen) if master else {"state": "missing"}
     film["posterChosen"] = chosen is not None
@@ -517,8 +526,9 @@ def thumbs(production_ids: list[str]) -> dict[str, Any]:
         except Exception:
             continue
         master = _media_file((state.get("master") or {}).get("path"), _VIDEO)
-        clips = _clips(ledger)
-        src, kind = (master, "film") if master else ((clips[max(clips)], "clip") if clips else (None, "clip"))
+        clips = _clips(ledger, state)
+        last = list(clips)[-1] if clips else None  # _clips is in scene order: the film's last rendered scene
+        src, kind = (master, "film") if master else ((clips[last], "clip") if last else (None, "clip"))
         art = artefact(src, kind, at_ms=choices.get(pid) if master else None)
         pending = pending or art["state"] == "pending"
         out[pid] = art.get("thumb") if art["state"] == "ready" else None
@@ -538,19 +548,22 @@ def frame_data_url(name: str) -> str:
 
 def locate(*, path: Optional[str] = None, generation_id: Optional[str] = None) -> Optional[dict[str, str]]:
     """Which production and scene a clip belongs to, by comparing against recorded paths and generation ids
-    (the given path is only compared as text, never opened)."""
+    (the given path is only compared as text, never opened). Any take of a scene matches, a reroll (sc09.r1)
+    included, and the scene is reported by its own id (sc09)."""
     want = os.path.normcase(os.path.normpath(path)) if isinstance(path, str) and path else None
     for pid in production.list_ids()[:50]:
         try:
             _, ledger, _ = _records(pid)
         except Exception:
             continue
-        for sid, entry in (ledger.get("scenes") or {}).items():
-            if not (_SCENE.match(sid) and isinstance(entry, dict)):
+        for take, entry in (ledger.get("scenes") or {}).items():
+            if not (_TAKE.match(take) and isinstance(entry, dict)):
                 continue
             recorded = (entry.get("downloaded") or {}).get("path")
             gid = (entry.get("generation") or {}).get("id")
             if (want and isinstance(recorded, str) and os.path.normcase(os.path.normpath(recorded)) == want) or \
                     (generation_id and gid == generation_id):
-                return {"productionId": pid, "sceneId": sid}
+                root = str(entry.get("rerollOf") or take)
+                if _SCENE.match(root):
+                    return {"productionId": pid, "sceneId": root}
     return None

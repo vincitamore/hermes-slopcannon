@@ -9,9 +9,11 @@ conformance suite does.
 
 The driver stops at each human gate with ``{"ok": false, "needs": ...}``. Gate
 answers (rights assent, the approved credit ceiling, first-scene review,
-accepted check flags) are taken only from its command line, so here they come
-only from decisions a person confirmed through Hermes's approval prompt
-(``gate.py``), never from the production file the model writes.
+accepted check flags, rerolls) are taken only from its command line, so here
+they come only from decisions a person made: a click on the film card
+(``decide``, through the dashboard's decide route) or an answer confirmed in
+Hermes's approval prompt (``gate.py``), never from the production file the
+model writes.
 
 Each production lives in ``<plugin data>/productions/<id>/``: ``production.json``
 (model-authored direction), ``ledger.json`` (the driver's paid-work record),
@@ -20,6 +22,8 @@ Runs happen on a background thread so a render can take as long as it takes.
 """
 from __future__ import annotations
 
+import atexit
+import contextlib
 import contextvars
 import json
 import os
@@ -31,7 +35,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from . import auth, settings
 
@@ -48,9 +52,14 @@ _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _LOG_LINES = 40
 _HEARTBEAT_S = 3
 _STALE_S = 20
+_STOP_WAIT_S = 5
+CONCURRENCY = 4  # scenes rendered at once, wherever a run is started without an explicit number
+_MAX_CARRIED_QUOTES = 1  # times an approved reroll's approval may carry over to a re-quote of the same take
 
 _runners: dict[str, "_Runner"] = {}
 _runners_lock = threading.Lock()
+_state_locks: dict[str, threading.RLock] = {}
+_state_locks_guard = threading.Lock()
 
 
 class ProductionError(RuntimeError):
@@ -99,22 +108,77 @@ def _read_json(path: Path, default: Any = None) -> Any:
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
-    # On Windows a replace onto a file another process has open (the studio polling it, an indexer) fails for a
-    # moment with PermissionError; the driver's ledger save stopped a paid run that way once. Wait it out briefly.
-    for attempt in range(25):
+    # A temp name of its own per write: two threads saving the same file never share (or delete) one temp file.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(value, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
+        # On Windows a replace onto a file another process has open (the studio polling it, an indexer) fails for
+        # a moment with PermissionError; the driver's ledger save stopped a paid run that way once. Wait it out.
+        for attempt in range(25):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 24:
+                    raise
+                time.sleep(0.2)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _state_lock(production_id: str) -> threading.RLock:
+    """The lock every read-modify-write of one production's state holds (the runner thread, a chat's tool call
+    and the film card can all change it at once)."""
+    with _state_locks_guard:
+        return _state_locks.setdefault(production_id, threading.RLock())
+
+
+def _read_state(production_id: str) -> Optional[dict[str, Any]]:
+    """The production's state, or None when it has none. A state file that exists but cannot be read raises:
+    every caller that writes state starts from this, so an unreadable file is never replaced by a fresh one."""
+    path = _dir(production_id) / "state.json"
+    text = ""
+    for attempt in range(10):
         try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == 24:
-                raise
-            time.sleep(0.2)
+            text = path.read_text(encoding="utf-8")
+            break
+        except FileNotFoundError:
+            return None
+        except PermissionError:  # Windows: another process has it open for a moment
+            if attempt == 9:
+                raise ProductionError(f"{path} is held open by another program; nothing was changed. Call the "
+                                      "tool again with the same id.", "state_unreadable") from None
+            time.sleep(0.1)
+        except OSError as exc:
+            raise ProductionError(f"{path} cannot be read ({exc}); nothing was changed.", "state_unreadable") from None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        raise ProductionError(f"{path} is not a production record; nothing was changed or reset.", "state_unreadable")
+    return value
 
 
 def load_state(production_id: str) -> Optional[dict[str, Any]]:
-    return _read_json(_dir(production_id) / "state.json")
+    """The production's state for reading, or None when it has none or its file cannot be read."""
+    try:
+        return _read_state(production_id)
+    except ProductionError as exc:
+        if exc.code == "invalid_id":
+            raise
+        return None
+
+
+@contextlib.contextmanager
+def _editing(production_id: str) -> Iterator[dict[str, Any]]:
+    """Change a production's state: read fresh under its lock, changed by the caller, saved on leaving."""
+    with _state_lock(production_id):
+        state = _read_state(production_id)
+        if state is None:
+            raise ProductionError(f"no production {production_id}", "unknown_production")
+        yield state
+        _save_state(production_id, state)
 
 
 def _save_state(production_id: str, state: dict[str, Any]) -> None:
@@ -144,8 +208,26 @@ def _broadcast(event: str, payload: dict[str, Any]) -> None:
 
 # --------------------------------------------------------------------------- environment
 
+_node_lock = threading.Lock()
+_node_checked: Optional[tuple[float, dict[str, Any]]] = None
+_NODE_RECHECK_S = 60
+
 
 def node_status() -> dict[str, Any]:
+    """Whether Node.js can run the driver. A good answer holds for the life of the process; a failed one is checked
+    again at most once a minute, so installing Node is noticed without running ``node`` on every status read."""
+    global _node_checked
+    with _node_lock:
+        if _node_checked is not None:
+            checked_at, status = _node_checked
+            if status["ok"] or time.monotonic() - checked_at < _NODE_RECHECK_S:
+                return dict(status)
+        status = _check_node()
+        _node_checked = (time.monotonic(), status)
+        return dict(status)
+
+
+def _check_node() -> dict[str, Any]:
     node = shutil.which("node")
     if not node:
         return {"ok": False, "message": "Node.js 22.13 or newer is required for whole productions (nodejs.org)."}
@@ -157,6 +239,23 @@ def node_status() -> dict[str, Any]:
     if (major, minor) < MIN_NODE:
         return {"ok": False, "message": f"Node.js {out} is too old; 22.13 or newer is required."}
     return {"ok": True, "node": node, "version": out}
+
+
+# What the driver child inherits from Hermes: what Node and the OS need to run, and nothing else. Hermes's own
+# variables (HERMES_*) and every other provider's keys stay out of a process that only talks to SLOPCANNON.
+_ENV_KEEP = {"PATH", "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "WINDIR", "TEMP", "TMP", "TMPDIR", "HOME",
+             "USERPROFILE", "APPDATA", "LOCALAPPDATA", "LANG", "LC_ALL", "TZ"}
+
+
+def _driver_env(token: str) -> dict[str, str]:
+    """The driver's environment: the allowlist above, the user's own SLOPCANNON_* settings, and the session the
+    plugin minted for this production (never a token inherited from Hermes's environment)."""
+    env = {key: value for key, value in os.environ.items()
+           if key.upper() in _ENV_KEEP
+           or (key.upper().startswith("SLOPCANNON_") and key.upper() != settings.TOKEN_ENV.upper())}
+    env[settings.TOKEN_ENV] = token
+    env["SLOPCANNON_AGENT_ORIGIN"] = settings.api_origin()
+    return env
 
 
 # --------------------------------------------------------------------------- production file
@@ -244,50 +343,97 @@ def write_production(production_id: str, production: dict[str, Any],
     _write_json(folder / "production.json", clean)
     if timed_plan is not None:
         _write_json(folder / "work" / "timed-plan.json", timed_plan)
-    state = load_state(production_id) or {
-        "id": production_id, "createdAt": int(time.time() * 1000), "state": "idle", "needs": None,
-        "decisions": {}, "runs": [], "log": [],
-    }
-    state["title"] = clean["title"]
-    state["aspectRatio"] = clean.get("aspectRatio")
-    _save_state(production_id, state)
+    with _state_lock(production_id):
+        state = _read_state(production_id) or {  # an unreadable state file raises: its decisions are never reset
+            "id": production_id, "createdAt": int(time.time() * 1000), "state": "idle", "needs": None,
+            "decisions": {}, "runs": [], "log": [],
+        }
+        state["title"] = clean["title"]
+        state["aspectRatio"] = clean.get("aspectRatio")
+        _save_state(production_id, state)
     return state
 
 
-# --------------------------------------------------------------------------- decisions (from the gate only)
+# --------------------------------------------------------------------------- takes
+
+
+_TAKE_ID = re.compile(r"^sc(\d+)(?:\.r(\d+))?$")
+
+
+def scene_order(scene_id: str) -> tuple[int, int, int, str]:
+    """Sort key for scene and take ids by their numbers: sc02 < sc11 < sc100, sc09 < sc09.r2 < sc09.r10."""
+    match = _TAKE_ID.match(scene_id or "")
+    if not match:
+        return (1, 0, 0, str(scene_id))
+    return (0, int(match.group(1)), int(match.group(2) or 0), scene_id)
+
+
+def chosen_takes(decisions: dict[str, Any]) -> dict[str, str]:
+    """The take the person chose for each rerolled scene ({root: take}). ``decisions['takes']`` is the record;
+    a reroll's own ``take`` is read too, for productions recorded before that map existed."""
+    out = {str(scene): str(ask["take"]) for scene, ask in (decisions.get("rerolls") or {}).items()
+           if isinstance(ask, dict) and ask.get("take")}
+    out.update({str(k): str(v) for k, v in (decisions.get("takes") or {}).items() if v})
+    return out
+
+
+def current_take(ledger: dict[str, Any], state: Optional[dict[str, Any]], root: str) -> str:
+    """The take of scene ``root`` the film uses now (``sc09``, ``sc09.r1``, ...): the take the person chose, else
+    the newest delivered reroll of it (by reroll number), else the scene's first take. Every view of a scene (the
+    studio's rows, its frames, a reroll's derived direction) reads its take from here."""
+    scenes = ledger.get("scenes")
+    if not isinstance(scenes, dict):
+        scenes = {}
+    chosen = chosen_takes((state or {}).get("decisions") or {}).get(root)
+    if chosen and (chosen == root or (scenes.get(chosen) or {}).get("rerollOf") == root):
+        return chosen
+    delivered = [take for take, entry in scenes.items()
+                 if isinstance(entry, dict) and entry.get("rerollOf") == root
+                 and (entry.get("generation") or {}).get("status") == "succeeded"]
+    return max(delivered, key=scene_order) if delivered else root
+
+
+# --------------------------------------------------------------------------- decisions (from the person only)
 
 
 def record_decisions(production_id: str, decisions: dict[str, Any]) -> dict[str, Any]:
-    state = load_state(production_id)
-    if state is None:
-        raise ProductionError(f"no production {production_id}", "unknown_production")
-    current = state.setdefault("decisions", {})
-    for key in ("rights_version", "approved_credits", "review_first", "accept_checks"):
-        if decisions.get(key) not in (None, "", []):
-            current[key] = decisions[key]
-    # chain continuity: every take the person kept, by its bytes (a later reroll of a scene is a new take to keep)
-    kept = decisions.get("reviewed")
-    kept = [kept] if isinstance(kept, str) else kept if isinstance(kept, list) else []
-    if kept:
-        current["reviewed"] = sorted(set(current.get("reviewed") or []) | {str(k) for k in kept if k})
-    rerolls = current.setdefault("rerolls", {})
-    for asked in _reroll_list(decisions.get("reroll")):
-        # A new take of a delivered scene: quoted first, bought only on the person's approve_reroll.
-        direction = str(asked.get("direction") or "").strip() or None
-        earlier = rerolls.get(str(asked["scene"])) or {}
-        if earlier.get("approved"):  # a scene rerolled again: its earlier take's spend still counts
-            current["reroll_credits_before"] = int(current.get("reroll_credits_before") or 0) + int(earlier["approved"])
-        rerolls[str(asked["scene"])] = {"direction": direction, "quote": None, "approved": None,
-                                        "submitted": False, "take": None}
-    approved = decisions.get("approve_reroll")
-    if isinstance(approved, int) and not isinstance(approved, bool) and state.get("needs") == "reroll_approval":
-        waiting = {k: r for k, r in rerolls.items() if r.get("quote") and r.get("approved") is None}
-        if waiting and approved == sum(int(r["quote"]["amountUnits"]) for r in waiting.values()):
+    """Record answers the person gave (the film card's click, or Hermes's approval prompt via ``gate.py``)."""
+    with _editing(production_id) as state:
+        current = state.setdefault("decisions", {})
+        for key in ("rights_version", "approved_credits", "review_first", "accept_checks"):
+            if decisions.get(key) not in (None, "", []):
+                current[key] = decisions[key]
+        # chain continuity: every take the person kept, by its bytes (a later reroll of a scene is a new take to keep)
+        kept = decisions.get("reviewed")
+        kept = [kept] if isinstance(kept, str) else kept if isinstance(kept, list) else []
+        if kept:
+            current["reviewed"] = sorted(set(current.get("reviewed") or []) | {str(k) for k in kept if k})
+        rerolls = current.setdefault("rerolls", {})
+        for asked in _reroll_list(decisions.get("reroll")):
+            # A new take of a delivered scene: quoted first, bought only on the person's approve_reroll. The take the
+            # film uses now stays in decisions['takes'] until the new one is delivered.
+            direction = str(asked.get("direction") or "").strip() or None
+            earlier = rerolls.get(str(asked["scene"])) or {}
+            if earlier.get("approved"):  # a scene rerolled again: its earlier take's spend still counts
+                current["reroll_credits_before"] = (int(current.get("reroll_credits_before") or 0)
+                                                    + int(earlier["approved"]))
+            rerolls[str(asked["scene"])] = {"direction": direction, "quote": None, "approved": None,
+                                            "submitted": False, "take": None}
+        approved = decisions.get("approve_reroll")
+        if isinstance(approved, int) and not isinstance(approved, bool):
+            waiting = {k: r for k, r in rerolls.items() if r.get("quote") and r.get("approved") is None}
+            quoted = sum(int(r["quote"]["amountUnits"]) for r in waiting.values())
+            if state.get("needs") != "reroll_approval" or not waiting:
+                raise ProductionError("the production is not waiting on a reroll approval; nothing was approved",
+                                      "stale_decision")
+            if approved != quoted:
+                raise ProductionError(f"the new takes' quote is {quoted} Cannon Credits, not {approved}; nothing "
+                                      "was approved", "stale_decision")
             for r in waiting.values():
                 r["approved"] = int(r["quote"]["amountUnits"])
-    if not rerolls:
-        current.pop("rerolls", None)
-    _save_state(production_id, state)
+                r["carried"] = 0  # a fresh approval: it may carry over to one re-quote of this take
+        if not rerolls:
+            current.pop("rerolls", None)
     return current
 
 
@@ -299,8 +445,11 @@ DECISION_GATES = ("rights", "approval", "budget", "first_scene_review", "scene_r
 
 
 def _derived_direction(production_id: str, scene: str) -> str:
-    """A reroll's direction when the person asked from the card: fix what the character check found."""
-    entry = ((_read_json(_dir(production_id) / "ledger.json") or {}).get("scenes") or {}).get(scene) or {}
+    """A reroll's direction when the person asked from the card: fix what the character check found on the take
+    the film uses now (after an earlier reroll, that take's check, not the first take's)."""
+    ledger = _read_json(_dir(production_id) / "ledger.json") or {}
+    take = current_take(ledger, load_state(production_id), scene)
+    entry = (ledger.get("scenes") or {}).get(take) or {}
     issues = [str(i.get("description") or "").strip() for i in (entry.get("shotCheck") or {}).get("issues") or []
               if isinstance(i, dict)]
     issues = [i for i in issues if i]
@@ -315,7 +464,7 @@ def decide(production_id: str, answer: dict[str, Any]) -> dict[str, Any]:
     Every answer must match the gate the production is stopped at (the exact quoted figure, the exact rights
     version, the exact first-scene file), so a stale card can never approve something else; the seat's
     max_credits_per_action ceiling still applies."""
-    state = load_state(production_id)
+    state = _read_state(production_id)
     if state is None:
         raise ProductionError(f"no production {production_id}", "unknown_production")
     if state.get("state") == "running" or is_running(production_id):
@@ -384,16 +533,18 @@ def decide(production_id: str, answer: dict[str, Any]) -> dict[str, Any]:
                                      f"asked for new takes of {', '.join(asked)}" if asked else "") if x)
     elif gate == "reroll_approval":
         if answer.get("cancel"):
-            current = state.setdefault("decisions", {})
-            rerolls = current.get("rerolls") or {}
-            dropped = sorted(k for k, r in rerolls.items() if r.get("approved") is None and not r.get("take"))
-            for k in dropped:
-                rerolls.pop(k, None)
-            if current.get("accept_checks") != "all":
-                current["accept_checks"] = sorted(set(current.get("accept_checks") or []) | set(dropped))
-            if not rerolls:
-                current.pop("rerolls", None)
-            _save_state(production_id, state)
+            # Only the takes still waiting for approval are dropped; the takes the film uses (decisions['takes'])
+            # stay as they are, so cancelling a second reroll keeps the first one in the cut.
+            with _editing(production_id) as fresh:
+                current = fresh.setdefault("decisions", {})
+                rerolls = current.get("rerolls") or {}
+                dropped = sorted(k for k, r in rerolls.items() if r.get("approved") is None and not r.get("take"))
+                for k in dropped:
+                    rerolls.pop(k, None)
+                if current.get("accept_checks") != "all":
+                    current["accept_checks"] = sorted(set(current.get("accept_checks") or []) | set(dropped))
+                if not rerolls:
+                    current.pop("rerolls", None)
             said = f"kept the current takes of {', '.join(dropped)}"
         else:
             decisions["approve_reroll"] = credits(detail.get("amountUnits"), "the new takes' quote")
@@ -411,10 +562,9 @@ def decide(production_id: str, answer: dict[str, Any]) -> dict[str, Any]:
         raise ProductionError(f"unknown decision {gate!r}", "bad_decision")
     if any(v not in (None, "", []) for v in decisions.values()):
         record_decisions(production_id, decisions)
-    state = load_state(production_id) or state
-    state["log"] = (state.get("log") or [])[-_LOG_LINES:] + [f"on the film card the person {said}"]
-    _save_state(production_id, state)
-    start(production_id, concurrency=3)
+    with _editing(production_id) as fresh:
+        fresh["log"] = (fresh.get("log") or [])[-_LOG_LINES:] + [f"on the film card the person {said}"]
+    start(production_id, concurrency=CONCURRENCY)
     return summary(production_id, detail=True)
 
 
@@ -444,10 +594,11 @@ def _film_title(folder: Path) -> str:
 
 
 def remember_session(production_id: str, session_id: str) -> None:
-    state = load_state(production_id)
-    if state is not None and state.get("sessionId") != session_id:
-        state["sessionId"] = session_id
-        _save_state(production_id, state)
+    with _state_lock(production_id):
+        state = _read_state(production_id)
+        if state is not None and state.get("sessionId") != session_id:
+            state["sessionId"] = session_id
+            _save_state(production_id, state)
 
 
 def _chain(folder: Path) -> bool:
@@ -489,12 +640,13 @@ def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> l
         if not ask.get("take"):
             return _reroll_args(folder, scene, ask) + ["--approve-units", str(ask["approved"]),
                                                        "--max-credits", str(ceiling)]
-    takes = {scene: ask["take"] for scene, ask in rerolls.items() if ask.get("take")}
+    # the takes the person chose, from their own record: cancelling a later reroll never drops an earlier take
+    chosen = chosen_takes(decisions)
+    pairs = ",".join(f"{scene}={chosen[scene]}" for scene in sorted(chosen, key=scene_order))
     chain = _chain(folder)
-    if takes and not chain:
+    if chosen and not chain:
         title = _film_title(folder)
-        args = ["cut", "--ledger", ledger, "--plan", str(folder / "work" / "timed-plan.json"),
-                "--takes", ",".join(f"{scene}={take}" for scene, take in takes.items()),
+        args = ["cut", "--ledger", ledger, "--plan", str(folder / "work" / "timed-plan.json"), "--takes", pairs,
                 "--title", title, "--output", str(folder / "work" / f"{re.sub(r'[^A-Za-z0-9._-]+', '-', title)}.mp4")]
         if checks:
             args += ["--accept-checks", "all" if checks == "all" else ",".join(checks)]
@@ -510,8 +662,8 @@ def _driver_args(folder: Path, decisions: dict[str, Any], concurrency: int) -> l
         args += ["--review-first", str(decisions["review_first"])]
     if chain and decisions.get("reviewed"):
         args += ["--reviewed", ",".join(decisions["reviewed"])]
-    if chain and takes:
-        args += ["--takes", ",".join(f"{scene}={take}" for scene, take in sorted(takes.items()))]
+    if chain and chosen:
+        args += ["--takes", pairs]
     checks = decisions.get("accept_checks")
     if checks:
         args += ["--accept-checks", "all" if checks == "all" else ",".join(checks)]
@@ -528,6 +680,7 @@ class _Runner(threading.Thread):
         self.concurrency = concurrency
         self.proc: Optional[subprocess.Popen] = None
         self.stopped = False
+        self._proc_lock = threading.Lock()  # between starting a driver call and stop()
         self.done = threading.Event()
         # Hermes keeps the served profile (its home, secrets and the plugin's sign-in) in context
         # variables, and a new thread starts with none of them: without this copy a run started from a
@@ -542,7 +695,7 @@ class _Runner(threading.Thread):
     def _run(self) -> None:
         pid = self.production_id
         folder = _dir(pid)
-        state = load_state(pid) or {}
+        ended = False  # finished, failed or stopped: the driver's session is no longer needed
         try:
             node = node_status()
             if not node["ok"]:
@@ -554,90 +707,93 @@ class _Runner(threading.Thread):
                 raise ProductionError(str(exc), "not_connected") from None
             except auth.CredentialError as exc:
                 raise ProductionError(str(exc), exc.code) from None
-            env = {**os.environ, settings.TOKEN_ENV: token, "SLOPCANNON_AGENT_ORIGIN": settings.api_origin()}
-            while True:
-                verb_args = _driver_args(folder, state.get("decisions") or {}, self.concurrency)
+            env = _driver_env(token)
+            code, result, stdout, stderr = 0, {}, "", ""
+            while not self.stopped:  # a Stop between two driver calls launches nothing new
+                decisions = (_read_state(pid) or {}).get("decisions") or {}
+                verb_args = _driver_args(folder, decisions, self.concurrency)
                 if not verb_args:  # every asked reroll is quoted: one approval covers them all
-                    quotes = [{"scene": k, **r["quote"]} for k, r in state["decisions"]["rerolls"].items()
+                    quotes = [{"scene": k, **r["quote"]} for k, r in (decisions.get("rerolls") or {}).items()
                               if r.get("quote") and r.get("approved") is None and not r.get("take")]
-                    code, stderr = 2, ""
+                    code, stdout, stderr = 2, "", ""
                     result = {"ok": False, "needs": "reroll_approval", "quotes": quotes,
                               "message": "New takes quoted; waiting for the person's approval."}
                     break
-                code, result, stdout, stderr = self._call([node["node"], str(DRIVER), *verb_args], env, state)
-                state = load_state(pid) or state
-                state["runs"][-1].update(endedAt=int(time.time() * 1000), exitCode=code)
-                state["log"] = (state.get("log") or [])[-_LOG_LINES:] + _log_lines(result, stderr)
-                if verb_args[0] == "reroll" and not self.stopped:
-                    ask = state["decisions"]["rerolls"][verb_args[verb_args.index("--scene") + 1]]
-                    if code == 2 and result.get("needs") == "approval":  # quoted (or quoted again: it expired)
-                        # An approved take whose quote expired is quoted again; the approval stands when the new
-                        # price is no higher, so the person is not asked twice for the same take.
-                        held = ask.get("approved")
-                        units = result.get("amountUnits")
-                        keep = isinstance(held, int) and isinstance(units, int) and units <= held
-                        ask.update(quote={"take": result.get("scene"), "amountUnits": units,
-                                          "quoteId": result.get("quoteId"), "expiresAt": result.get("expiresAt")},
-                                   approved=units if keep else None, submitted=False)
-                        if keep:
-                            state["log"].append(f"the quote for {result.get('scene')} expired; quoted again at "
-                                                f"{units}, within the approved {held}")
-                        _save_state(pid, state)
-                        continue
-                    if code == 0 and result.get("ok") and result.get("submitted"):
-                        ask["submitted"] = True
-                        state["log"].append(f"reroll {result.get('rerollOf')} submitted as {result.get('scene')}")
-                        _save_state(pid, state)
-                        continue
-                    if code == 0 and result.get("ok"):
-                        ask["take"] = result.get("scene")
-                        ask["check"] = (result.get("check") or {}).get("verdict")
-                        state["log"].append(f"reroll {result.get('rerollOf')} -> {result.get('scene')}")
-                        _save_state(pid, state)
-                        continue  # the next reroll, or the cut with the new takes
-                break
-            if self.stopped:
-                state.update(state="idle", needs=None, message="Stopped. Paid work already accepted keeps running "
-                             "on the server; continuing the production recovers it without paying again.")
-            elif code == 0 and result.get("ok"):
-                output = result.get("output") or (result.get("report") or {}).get("output")
-                state.update(state="done", needs=None, message=result.get("message"),
-                             master=({"path": output, "name": Path(output).name} if output else None),
-                             report=_compact_report(result.get("report")))
-            elif code == 2 and result.get("needs"):
-                state.update(state="needs", needs=result["needs"], message=result.get("message"),
-                             needsDetail=_needs_detail(result))
-            else:
-                silent = not result and not stdout.strip() and not stderr.strip()
-                state.update(state="error", needs=None,
-                             message=str(result.get("error") or result.get("advice") or stderr.strip()[-600:]
-                                         or (f"the driver exited {code} without a result: {DRIVER}" if silent
-                                             else f"driver exited {code}")))
-            _save_state(pid, state)
+                called = self._call([node["node"], str(DRIVER), *verb_args], env)
+                if called is None:  # stopped just before the driver started
+                    break
+                code, result, stdout, stderr = called
+                with _editing(pid) as state:
+                    state["runs"][-1].update(endedAt=int(time.time() * 1000), exitCode=code)
+                    state["log"] = (state.get("log") or [])[-_LOG_LINES:] + _log_lines(result, stderr)
+                    goes_on = (verb_args[0] == "reroll" and not self.stopped
+                               and _record_reroll(state, verb_args[verb_args.index("--scene") + 1], code, result))
+                if not goes_on:  # the next reroll, or the cut with the new takes, comes from the loop's next call
+                    break
+            with _editing(pid) as state:
+                if self.stopped:
+                    state.update(state="idle", needs=None, message="Stopped. Paid work already accepted keeps "
+                                 "running on the server; continuing the production recovers it without paying again.")
+                elif code == 0 and result.get("ok"):
+                    output = result.get("output") or (result.get("report") or {}).get("output")
+                    state.update(state="done", needs=None, message=result.get("message"),
+                                 master=({"path": output, "name": Path(output).name} if output else None),
+                                 report=_compact_report(result.get("report")))
+                elif code == 2 and result.get("needs"):
+                    state.update(state="needs", needs=result["needs"], message=result.get("message"),
+                                 needsDetail=_needs_detail(result))
+                else:
+                    silent = not result and not stdout.strip() and not stderr.strip()
+                    state.update(state="error", needs=None,
+                                 message=str(result.get("error") or result.get("advice") or stderr.strip()[-600:]
+                                             or (f"the driver exited {code} without a result: {DRIVER}" if silent
+                                                 else f"driver exited {code}")))
+                ended = state["state"] != "needs"
         except ProductionError as exc:
-            state.update(state="error", needs=None, message=str(exc), errorCode=exc.code)
-            _save_state(pid, state)
+            ended = True
+            self._fail(str(exc), exc.code)
         except Exception as exc:  # never leave a production stuck in "running"
-            state.update(state="error", needs=None, message=f"{type(exc).__name__}: {exc}")
-            _save_state(pid, state)
+            ended = True
+            self._fail(f"{type(exc).__name__}: {exc}", None)
         finally:
             (folder / "heartbeat").unlink(missing_ok=True)
+            if ended or self.stopped:
+                _forget_driver(pid)
             self.done.set()
             with _runners_lock:
                 if _runners.get(pid) is self:
                     _runners.pop(pid, None)
 
-    def _call(self, args: list[str], env: dict[str, str], state: dict[str, Any]) -> tuple[int, dict[str, Any], str, str]:
-        state.update(state="running", needs=None, message=None)
-        state.pop("errorCode", None)  # a resumed production no longer carries the last run's failure
-        state.setdefault("runs", []).append({"startedAt": int(time.time() * 1000), "verb": args[2]})
-        _save_state(self.production_id, state)
-        self.proc = subprocess.Popen(args, cwd=str(_dir(self.production_id)), env=env, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+    def _fail(self, message: str, code: Optional[str]) -> None:
+        """Record a failed run. A state file that cannot be read is left exactly as it is."""
+        try:
+            with _editing(self.production_id) as state:
+                state.update(state="error", needs=None, message=message)
+                if code:
+                    state["errorCode"] = code
+                else:
+                    state.pop("errorCode", None)
+        except ProductionError:
+            pass
+
+    def _call(self, args: list[str], env: dict[str, str]) -> Optional[tuple[int, dict[str, Any], str, str]]:
+        """Run one driver call to its end; None when the production was stopped before it started."""
+        if self.stopped:
+            return None
+        with _editing(self.production_id) as state:
+            state.update(state="running", needs=None, message=None)
+            state.pop("errorCode", None)  # a resumed production no longer carries the last run's failure
+            state.setdefault("runs", []).append({"startedAt": int(time.time() * 1000), "verb": args[2]})
+        with self._proc_lock:  # stop() either sees this child and ends it, or this sees the stop and starts none
+            if self.stopped:
+                return None
+            proc = self.proc = subprocess.Popen(
+                args, cwd=str(_dir(self.production_id)), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace")
         watcher = threading.Thread(target=contextvars.copy_context().run, args=(self._watch_ledger,), daemon=True)
         watcher.start()
-        stdout, stderr = self.proc.communicate()
-        return self.proc.returncode, _last_json(stdout) or _last_json(stderr) or {}, stdout, stderr
+        stdout, stderr = proc.communicate()
+        return proc.returncode, _last_json(stdout) or _last_json(stderr) or {}, stdout, stderr
 
     def _watch_ledger(self) -> None:
         folder = _dir(self.production_id)
@@ -658,9 +814,114 @@ class _Runner(threading.Thread):
             time.sleep(_HEARTBEAT_S)
 
     def stop(self) -> None:
-        self.stopped = True
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.terminate()
+        """Stop the run: no further driver call starts, and a driver running now is ended.
+
+        A terminated driver never reaches the ``finally`` that removes its ledger lock (on Windows terminate is
+        immediate; elsewhere Node exits on SIGTERM without unwinding), so once it has exited its lock is removed
+        here, and only when the lock names that very process."""
+        with self._proc_lock:
+            self.stopped = True
+            proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=_STOP_WAIT_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=_STOP_WAIT_S)
+            except subprocess.TimeoutExpired:
+                return  # still alive: its lock is still its own
+        _release_driver_lock(_dir(self.production_id) / "ledger.json", proc.pid)
+
+
+def _record_reroll(state: dict[str, Any], scene: str, code: int, result: dict[str, Any]) -> bool:
+    """Fold one reroll call's answer into the production's record; True when the runner should go on."""
+    decisions = state.setdefault("decisions", {})
+    ask = (decisions.get("rerolls") or {}).get(scene)
+    if not isinstance(ask, dict):
+        return False
+    if code == 2 and result.get("needs") == "approval":  # quoted (or quoted again: the quote expired)
+        _record_quote(state, ask, result)
+        return True
+    if code == 0 and result.get("ok") and result.get("submitted"):
+        ask["submitted"] = True
+        state["log"].append(f"reroll {result.get('rerollOf')} submitted as {result.get('scene')}")
+        return True
+    if code == 0 and result.get("ok"):
+        ask["take"] = result.get("scene")
+        ask["check"] = (result.get("check") or {}).get("verdict")
+        decisions.setdefault("takes", {})[scene] = result.get("scene")  # the film uses the new take from now on
+        state["log"].append(f"reroll {result.get('rerollOf')} -> {result.get('scene')}")
+        return True
+    return False
+
+
+def _record_quote(state: dict[str, Any], ask: dict[str, Any], result: dict[str, Any]) -> None:
+    """A reroll's quote, or a new quote after the approved one expired before it was bought.
+
+    The person's approval carries over to the new quote only when it is for the very take they approved, that take
+    was never sent, the price is no higher, and the approval has not carried over before. Anything else (another
+    take, which the driver opens when the approved one failed or was already sent) is asked again, so approving one
+    take can never buy two."""
+    decisions = state["decisions"]
+    held, units, take = ask.get("approved"), result.get("amountUnits"), result.get("scene")
+    carried = int(ask.get("carried") or 0)
+    keep = (isinstance(held, int) and isinstance(units, int) and units <= held
+            and take == (ask.get("quote") or {}).get("take") and not ask.get("submitted")
+            and carried < _MAX_CARRIED_QUOTES)
+    if isinstance(held, int) and ask.get("submitted") and not keep:
+        # the approved take was sent and its spend stands; the new take is a separate purchase
+        decisions["reroll_credits_before"] = int(decisions.get("reroll_credits_before") or 0) + held
+    ask.update(quote={"take": take, "amountUnits": units, "quoteId": result.get("quoteId"),
+                      "expiresAt": result.get("expiresAt")},
+               approved=units if keep else None, submitted=False, carried=carried + 1 if keep else 0)
+    if keep:
+        state["log"].append(f"the quote for {take} expired; quoted again at {units}, within the approved {held}")
+
+
+def _release_driver_lock(ledger: Path, pid: int) -> bool:
+    """Remove ``<ledger>.lock`` when it names process ``pid`` (the driver writes ``{"pid", "startedAt"}`` there).
+    A lock held by any other command, or one that cannot be read, is left alone."""
+    lock = Path(f"{ledger}.lock")
+    try:
+        held = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(held, dict) or held.get("pid") != pid:
+        return False
+    try:
+        lock.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def _forget_driver(production_id: str) -> None:
+    """Drop the driver session minted for this production, where the installed auth module can."""
+    forget = getattr(auth, "forget_driver", None)
+    if callable(forget):
+        try:
+            forget(production_id)
+        except Exception:
+            pass
+
+
+def _stop_children_at_exit() -> None:
+    """Hermes is exiting: end every driver this process started, so none outlives it holding its session and the
+    ledger lock. The runners are daemon threads and would otherwise just vanish mid-call."""
+    with _runners_lock:
+        runners = list(_runners.values())
+    for runner in runners:
+        try:
+            runner.stop()
+        except Exception:
+            pass
+        _forget_driver(runner.production_id)
+
+
+atexit.register(_stop_children_at_exit)
 
 
 def _last_json(text: str) -> Optional[dict[str, Any]]:
@@ -732,7 +993,8 @@ def _needs_detail(result: dict[str, Any]) -> dict[str, Any]:
                 "amountUnits": sum(int(q.get("amountUnits") or 0) for q in quotes),
                 "quoteIds": [q.get("quoteId") for q in quotes]}
     if needs == "shot_review":
-        return {"flagged": [{"scene": f.get("scene"), "verdict": f.get("verdict"), "issues": f.get("issues") or []}
+        return {"flagged": [{"scene": f.get("scene"), "take": f.get("take"), "verdict": f.get("verdict"),
+                             "issues": f.get("issues") or []}
                             for f in result.get("flagged") or [] if isinstance(f, dict)],
                 "unchecked": [{"scene": u.get("scene"), "retryable": u.get("retryable")}
                               for u in result.get("unchecked") or [] if isinstance(u, dict)]}
@@ -744,8 +1006,8 @@ def _needs_detail(result: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- public operations
 
 
-def start(production_id: str, *, concurrency: int = 4) -> dict[str, Any]:
-    if load_state(production_id) is None:
+def start(production_id: str, *, concurrency: int = CONCURRENCY) -> dict[str, Any]:
+    if _read_state(production_id) is None:
         raise ProductionError(f"no production {production_id}", "unknown_production")
     with _runners_lock:
         existing = _runners.get(production_id)
@@ -754,12 +1016,11 @@ def start(production_id: str, *, concurrency: int = 4) -> dict[str, Any]:
         if is_running(production_id):  # driven by another Hermes process on this machine
             return summary(production_id)
         (_dir(production_id) / "stop.request").unlink(missing_ok=True)
+        with _editing(production_id) as state:
+            state.update(state="running", needs=None, message=None)
+            state.pop("errorCode", None)  # a resumed production no longer carries the last run's failure
         runner = _Runner(production_id, concurrency)
         _runners[production_id] = runner
-        state = load_state(production_id) or {}
-        state.update(state="running", needs=None, message=None)
-        state.pop("errorCode", None)  # a resumed production no longer carries the last run's failure
-        _save_state(production_id, state)
         runner.start()
     return summary(production_id)
 
@@ -810,27 +1071,29 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
     raw_scenes = plan.get("scenes")
     plan_scenes: list[Any] = raw_scenes if isinstance(raw_scenes, list) else []
     entries = {k: v for k, v in (ledger.get("scenes") or {}).items() if k.startswith("sc") and isinstance(v, dict)}
-    # A reroll is a newer take of its scene, not a scene of its own: the row shows the take the film will use
-    # (the newest reroll once asked for), so a replaced scene never still reads as flagged.
-    rerolls: dict[str, list[dict[str, Any]]] = {}
-    for key, value in entries.items():
-        if value.get("rerollOf"):
-            rerolls.setdefault(str(value["rerollOf"]), []).append(value)
-    ids = sorted({k for k in entries if not entries[k].get("rerollOf")} | {f"sc{i + 1:02d}" for i in range(len(plan_scenes))})
+    # A reroll is a newer take of its scene, not a scene of its own. The row shows a reroll while it is in flight
+    # (quoted, rendering), and otherwise the take the film uses (current_take), so a replaced scene never still
+    # reads as flagged and a cancelled or failed reroll never stands in for the take that is kept.
+    roots = {k for k in entries if not entries[k].get("rerollOf")} | {f"sc{i + 1:02d}" for i in range(len(plan_scenes))}
     asked = (state.get("decisions") or {}).get("rerolls") or {}
+    accepted = (state.get("decisions") or {}).get("accept_checks")
     rows = []
-    for sid in ids:
-        entry = entries.get(sid, {})
-        takes = rerolls.get(sid) or []
-        if takes:
-            entry = takes[-1]
-        elif sid in asked:
-            entry = {}  # asked for, not yet quoted
+    for sid in sorted(roots, key=scene_order):
+        ask = asked.get(sid) if isinstance(asked.get(sid), dict) else None
+        if ask is not None and not ask.get("take"):
+            shown = (ask.get("quote") or {}).get("take")  # None: asked for, not yet quoted
+            shown = shown if shown in entries else None
+        else:
+            shown = current_take(ledger, state, sid)
+        entry = entries.get(shown, {}) if shown else {}
+        sent = [scene_order(k)[2] for k, v in entries.items()
+                if v.get("rerollOf") == sid and (v.get("generation") or {}).get("id")]
+        number = scene_order(shown)[2] if shown else max(sent, default=0) + 1  # 0 for the first take
         try:
-            index = int(sid[2:].split(".")[0]) - 1
+            index = int(sid[2:]) - 1
         except ValueError:
             index = -1
-        planned = plan_scenes[index] if 0 <= index < len(plan_scenes) and "." not in sid else {}
+        planned = plan_scenes[index] if 0 <= index < len(plan_scenes) else {}
         generation = entry.get("generation") or {}
         status = generation.get("status")
         downloaded = entry.get("downloaded") or {}
@@ -848,7 +1111,6 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             row_status = "quoted"
         else:
             row_status = "unsubmitted"
-        accepted = (state.get("decisions") or {}).get("accept_checks")
         rows.append({
             "id": sid, "index": index,
             "startMs": planned.get("startMs"), "endMs": planned.get("endMs"),
@@ -860,8 +1122,8 @@ def _scenes(folder: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             "clip": {"path": downloaded["path"], "name": Path(downloaded["path"]).name} if downloaded.get("path") else None,
             "check": _check_row(entry),
             "checkAccepted": accepted == "all" or (isinstance(accepted, list) and sid in accepted),
-            "take": len([a for a in entry.get("attempts") or [] if isinstance(a, dict)]) + 1 + len(takes),
-            "rerolled": bool(takes) or sid in asked,
+            "take": len([a for a in entry.get("attempts") or [] if isinstance(a, dict)]) + 1 + number,
+            "rerolled": ask is not None or any(v.get("rerollOf") == sid for v in entries.values()),
             **_scene_times(entry),
         })
     return rows
@@ -930,7 +1192,7 @@ def _committed_credits(ledger: dict[str, Any]) -> int:
 
 def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
     folder = _dir(production_id)
-    state = load_state(production_id)
+    state = _read_state(production_id)  # an unreadable state file is reported as such, not as a missing production
     if state is None:
         raise ProductionError(f"no production {production_id}", "unknown_production")
     if state.get("state") == "running" and not is_running(production_id):
@@ -963,6 +1225,8 @@ def summary(production_id: str, *, detail: bool = False) -> dict[str, Any]:
         "quotedCredits": sum(quoted) if quoted else None,
         "master": state.get("master"),
         "sessionId": _live_session(state.get("sessionId")),
+        # tells the desktop this backend already dropped a deleted chat, so it must not fall back to a chat id it
+        # remembered itself (an older backend leaves this out, and the desktop then does its own remembering)
         "sessionChecked": True,
         "assembly": _assembly(ledger),
         "continuity": "chain" if _chain(folder) else None,
@@ -1021,22 +1285,28 @@ def managing(project_id: Any) -> Optional[str]:
 
 def _live_session(session_id: Any) -> Optional[str]:
     """The chat a production came from, or None once that chat is deleted: the studio then sends to a new chat
-    instead of opening one that can no longer load. Unknown (no readable session store) keeps the id."""
+    instead of opening one that can no longer load. When Hermes cannot say, the id is kept."""
     if not session_id:
         return None
+    return None if _session_exists(str(session_id)) is False else str(session_id)
+
+
+def _session_exists(session_id: str) -> Optional[bool]:
+    """Whether this profile's Hermes still has the chat ``session_id``: True, False, or None when that cannot be told
+    (an older Hermes, no session store yet, the store busy). It reads one session row through
+    ``hermes_state.SessionDB``, which Hermes lists as public plugin API, opened read-only; nothing is written."""
     try:
-        import sqlite3
+        from hermes_state import SessionDB
 
-        from hermes_constants import get_hermes_home
-
-        db = Path(get_hermes_home()) / "state.db"
-        if not db.is_file():
-            return str(session_id)
-        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True, timeout=2)
-        try:
-            row = con.execute("select 1 from sessions where id = ?", (str(session_id),)).fetchone()
-        finally:
-            con.close()
-        return str(session_id) if row else None
+        db = SessionDB(read_only=True)
     except Exception:
-        return str(session_id)
+        return None
+    try:
+        return db.get_session(session_id) is not None
+    except Exception:
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
