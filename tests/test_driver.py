@@ -121,3 +121,42 @@ class CheckRetryTest(unittest.TestCase):
         self.assertEqual(result["limited"], {"calls": 3, "verdict": "pass"})
         self.assertEqual(result["refused"], {"calls": 1, "verdict": "unchecked"})
         self.assertEqual(result["down"], {"calls": 4, "verdict": "unchecked"})
+
+
+FRAME_SCRIPT = r"""
+const { lastFrame } = await import(process.argv[1]);
+const fs = await import("node:fs");
+const os = await import("node:os");
+const path = await import("node:path");
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "chain-frame-"));
+const seeks = [];
+const run = (fails) => async (_tool, args) => {
+  const seek = args.slice(4, 6);
+  seeks.push(seek);
+  if (seeks.length <= fails) throw new Error("past the end");
+  fs.writeFileSync(args.at(-1), "jpeg");
+};
+const shown = (await lastFrame("take.mp4", path.join(dir, "a.jpg"), { run: run(0), untilMs: 5640 }), seeks.splice(0));
+const short = (await lastFrame("take.mp4", path.join(dir, "b.jpg"), { run: run(3), untilMs: 5640 }), seeks.splice(0));
+const plain = (await lastFrame("take.mp4", path.join(dir, "c.jpg"), { run: run(0) }), seeks.splice(0));
+console.log(JSON.stringify({ shown, short, plain }));
+"""
+
+
+@unittest.skipUnless(NODE, "node is not installed")
+class ChainFrameTest(unittest.TestCase):
+    def setUp(self):
+        out = subprocess.run([str(NODE), "--input-type=module", "-e", FRAME_SCRIPT, DRIVER.as_uri()],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.result = json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_the_next_scene_continues_from_the_last_frame_the_film_shows(self):
+        # A 6.6 s take in a 5.64 s scene: the film cuts it at 5.64 s, so the frame is taken there, not at the take's end.
+        self.assertEqual(self.result["shown"], [["-ss", "5.520"]])
+
+    def test_a_take_shorter_than_its_scene_falls_back_to_its_own_end(self):
+        self.assertEqual(self.result["short"][-1], ["-sseof", "-0.12"])
+
+    def test_without_a_scene_length_the_take_end_is_used(self):
+        self.assertEqual(self.result["plain"], [["-sseof", "-0.12"]])

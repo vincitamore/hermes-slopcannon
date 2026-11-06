@@ -3261,12 +3261,21 @@ export function chainTakes(ledger, sceneIds, value) {
 }
 
 /** The last frame of a take (a few frames before its end, clear of any fade), as a set picture under the upload cap. */
-export async function lastFrame(clip, out, { maxBytes = 786_432, run = runMediaTool } = {}) {
+// The frame the next scene continues from is the last one the film shows. A take runs past its scene (the cut keeps
+// only the scene's length from its start), so with untilMs the frame is taken just before that point, never from
+// the take's own tail, which the film never shows; the take's end is the fallback when it is shorter.
+export async function lastFrame(clip, out, { maxBytes = 786_432, run = runMediaTool, untilMs = null } = {}) {
   mkdirSync(path.dirname(out), { recursive: true });
-  for (const [from, quality] of [["-0.12", "3"], ["-0.4", "3"], ["-0.4", "7"], ["-1", "9"]]) {
+  const until = Number(untilMs) > 0 ? Number(untilMs) / 1000 : null;
+  const at = (back) => ["-ss", Math.max(0, until - back).toFixed(3)];
+  const tries = [
+    ...(until ? [[at(0.12), "3"], [at(0.4), "3"], [at(0.4), "7"]] : []),
+    [["-sseof", "-0.12"], "3"], [["-sseof", "-0.4"], "3"], [["-sseof", "-0.4"], "7"], [["-sseof", "-1"], "9"]
+  ];
+  for (const [seek, quality] of tries) {
     rmSync(out, { force: true });
     try {
-      await run("ffmpeg", ["-v", "error", "-nostdin", "-y", "-sseof", from, "-i", clip, "-frames:v", "1", "-vf", "scale=1280:-2", "-q:v", quality, out]);
+      await run("ffmpeg", ["-v", "error", "-nostdin", "-y", ...seek, "-i", clip, "-frames:v", "1", "-vf", "scale=1280:-2", "-q:v", quality, out]);
     } catch { continue; }
     if (existsSync(out) && statSync(out).size > 0 && statSync(out).size <= maxBytes) return out;
   }
@@ -3310,7 +3319,8 @@ async function runChain({ options, ledgerFile, production, sceneIds, prepDir, ca
       if (before) {
         const previous = loadLedger(ledgerFile).scenes[before];
         if (!await verifiedLocalArtifact(previous?.downloaded)) throw new Error(`${before} has no verified take to continue from.`);
-        const frame = await lastFrame(previous.downloaded.path, path.join(workDir, "chain", `${before}-last.jpg`));
+        const shownMs = JSON.parse(readFileSync(scenePlanFile(sceneIds[index - 1]), "utf8")).durationMs;
+        const frame = await lastFrame(previous.downloaded.path, path.join(workDir, "chain", `${before}-last.jpg`), { untilMs: shownMs });
         const label = `chain-${before}`;
         await verbUpload(new Map([["--scene", id], ["--kind", "set_reference"], ["--file", frame], ["--label", label], ["--rights", rightsVersion]]), ledgerFile);
         const continued = chainInputs(JSON.parse(readFileSync(scenePlanFile(id), "utf8")), cast, label);
