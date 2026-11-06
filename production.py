@@ -612,6 +612,7 @@ class _Runner(threading.Thread):
 
     def _call(self, args: list[str], env: dict[str, str], state: dict[str, Any]) -> tuple[int, dict[str, Any], str, str]:
         state.update(state="running", needs=None, message=None)
+        state.pop("errorCode", None)  # a resumed production no longer carries the last run's failure
         state.setdefault("runs", []).append({"startedAt": int(time.time() * 1000), "verb": args[2]})
         _save_state(self.production_id, state)
         self.proc = subprocess.Popen(args, cwd=str(_dir(self.production_id)), env=env, stdout=subprocess.PIPE,
@@ -740,6 +741,7 @@ def start(production_id: str, *, concurrency: int = 4) -> dict[str, Any]:
         _runners[production_id] = runner
         state = load_state(production_id) or {}
         state.update(state="running", needs=None, message=None)
+        state.pop("errorCode", None)  # a resumed production no longer carries the last run's failure
         _save_state(production_id, state)
         runner.start()
     return summary(production_id)

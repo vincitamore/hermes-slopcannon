@@ -939,7 +939,7 @@ class ProductionTest(unittest.TestCase):
         state = production.load_state(pid)
         production._save_state(pid, {**state, "state": "error", "message": "fetch failed"})
         self.assertIsNone(production.reroll_problem(pid, "sc01"))  # a stopped film's delivered scene can be rerolled
-        production._save_state(pid, state)
+        production._save_state(pid, {**state, "errorCode": "sign_in_refused"})  # a failure from an earlier run
         self.assertIsNone(gate.pre_tool_call("slopcannon_produce", {"production_id": pid, "reroll": {"scene": "sc01"},
                                                                     "rights_version": "v1"}))  # already signed
         quote = self.produce(production_id=pid, reroll={"scene": "sc01", "direction": "keep the helmet"})
@@ -956,6 +956,7 @@ class ProductionTest(unittest.TestCase):
         cut = self.produce(production_id=pid, approve_reroll=44)
         self.assertEqual(cut["production"]["state"], "done", cut)
         master = Path(cut["production"]["master"]["path"])
+        self.assertNotIn("errorCode", production.load_state(pid))  # the next run cleared it
         self.assertTrue(master.name.endswith("Film.mp4"))
         self.assertEqual(master.read_text(), "cut sc01=sc01.r1")
         self.assertEqual(cut["production"]["scenes"][0]["clip"]["name"], "sc01.r1.mp4")
