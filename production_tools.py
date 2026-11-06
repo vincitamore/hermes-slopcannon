@@ -10,26 +10,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 from . import production
 from .client import Client, SlopcannonError
-from .tools import _CONTENT_TYPES, ToolSpec, _fail
-
-
-def _guard(fn):
-    """Like tools._guard, but hands the chat's session_id on so the studio can answer in that chat."""
-    def handler(args: dict[str, Any], session_id: str = "", **_: Any) -> str:
-        try:
-            return fn(args or {}, session_id=str(session_id or ""))
-        except Exception as exc:  # every failure is a structured result, never a crash
-            return _fail(exc)
-    return handler
+from .tools import _CONTENT_TYPES, MAX_BLOCK_S, ToolSpec, _guard, media_line
 
 _DEFAULT_WAIT_S = 90  # well inside Hermes's 420 s tool deadline, approvals included
-_MAX_WAIT_S = 300
 
 # What the agent should do next at each gate. Kept beside the tool so the skill and
 # the result never disagree.
@@ -100,7 +90,7 @@ def _result(info: dict[str, Any]) -> str:
         for row in info.get("scenes") or []:
             clip = row.get("clip") if isinstance(row, dict) else None
             if row.get("id") in flagged and clip and clip.get("path"):
-                show.append(f"MEDIA:{Path(clip['path']).resolve().as_posix()}")
+                show.append(media_line(clip["path"]))
     elif state == "done" and out["media"]:
         show.append(out["media"][-1])
     out["show"] = show
@@ -164,9 +154,9 @@ def _produce(args: dict[str, Any], session_id: str = "") -> str:
         production.record_decisions(pid, decisions)
     if session_id:
         production.remember_session(pid, session_id)
-    production.start(pid, concurrency=int(args.get("concurrency") or 4))
+    production.start(pid, concurrency=int(args.get("concurrency") or production.CONCURRENCY))
     raw_wait = args.get("wait_s")
-    wait_s = min(max(_DEFAULT_WAIT_S if raw_wait is None else int(raw_wait), 0), _MAX_WAIT_S)
+    wait_s = min(max(_DEFAULT_WAIT_S if raw_wait is None else int(raw_wait), 0), MAX_BLOCK_S)
     production.wait(pid, wait_s)
     return _owe(session_id, _result(production.summary(pid, detail=True)))
 
@@ -179,13 +169,13 @@ def _status(args: dict[str, Any], session_id: str = "") -> str:
     pid = str(pid)
     if session_id and production.load_state(pid) is not None:
         production.remember_session(pid, session_id)  # the chat talking about a film is the one the studio answers
-    wait_s = min(max(int(args.get("wait_s") or 0), 0), _MAX_WAIT_S)
+    wait_s = min(max(int(args.get("wait_s") or 0), 0), MAX_BLOCK_S)
     if wait_s:
         production.wait(pid, wait_s)
     return _owe(session_id, _result(production.summary(pid, detail=True)))
 
 
-def _stop(args: dict[str, Any], session_id: str = "") -> str:
+def _stop(args: dict[str, Any]) -> str:
     pid = str(args.get("production_id") or "")
     stopped = production.stop(pid)
     return json.dumps({"ok": True, "stopped": stopped, "note": (
@@ -216,9 +206,11 @@ _PRODUCTION_SCHEMA = {
         }},
         "transcript": {"type": "string"},
         "continuity": {"type": "string", "enum": ["chain"], "description": (
-            "chain: scenes render one at a time, each continuing from the last frame of the scene before (one "
-            "world, one look), and each waits for the person's keep or reroll before the next is bought. Omit to "
-            "render every scene at once after the first.")},
+            "Omit (the default) to render every scene at once after the first-scene review. 'chain' renders one "
+            "scene at a time, each from the last frame of the scene before, and stops at scene_review for each "
+            "(keep_scene or reroll) before the next is bought. For a consistent look without chain, storyboard "
+            "first: one keyframe per scene with image_generate, each passed as that scene's set picture, as "
+            "skill_view('slopcannon:hermes-workflow') explains.")},
         "scenes": {"type": "array", "items": {"type": "object"}},
         "aspectRatio": {"type": "string", "description": "One of the ratios slopcannon_account lists; default 16:9."},
     },
@@ -231,10 +223,11 @@ PRODUCE = ToolSpec("slopcannon_produce", {
         "Make a whole SLOPCANNON music video from a local song in one call: uploads, scene plan, quotes, a first "
         "scene for review, parallel renders, character checks and assembly, run in the background and resumable. "
         "Start with `production` (and `timed_plan` when the person supplied one). It stops at each human gate "
-        "(rights sign-off, credit approval, first-scene review, flagged takes, a reroll's quote) and says exactly "
-        "what to do: on Hermes desktop the person answers on the film card, so show the card and end the turn. "
-        "When the person answers in chat, pass it with the same production_id as rights_version / approve_credits / "
-        "review_first / accept_checks / reroll / approve_reroll; Hermes asks them to approve it in a prompt. It does the uploads, "
+        "(rights sign-off, credit approval, first-scene review, each chained scene's review (scene_review), "
+        "flagged takes, a reroll's quote) and says exactly what to do: on Hermes desktop the person answers on "
+        "the film card, so show the card and end the turn. When the person answers in chat, pass it with the same "
+        "production_id as rights_version / approve_credits / review_first / keep_scene / accept_checks / reroll / "
+        "approve_reroll; Hermes asks them to approve it in a prompt. It does the uploads, "
         "hashing and quotes itself, and validates the production and timed_plan before anything is signed: do not "
         "run node or the skill's scripts yourself. Nothing is bought twice. Prefer this over driving the per-scene "
         "tools by hand."),
@@ -264,28 +257,29 @@ PRODUCE = ToolSpec("slopcannon_produce", {
             "approve_reroll": {"type": "integer", "minimum": 0,
                                "description": "needsDetail.amountUnits: the rerolls' quoted total the person approved."},
             "concurrency": {"type": "integer", "minimum": 1, "maximum": 16},
-            "wait_s": {"type": "integer", "minimum": 0, "maximum": _MAX_WAIT_S,
-                       "description": f"How long to wait for the next stop (default {_DEFAULT_WAIT_S})."},
+            "wait_s": {"type": "integer", "minimum": 0, "maximum": MAX_BLOCK_S, "description": (
+                f"Seconds to wait for the next stop (default {_DEFAULT_WAIT_S}, max {MAX_BLOCK_S}); if it is "
+                "still running then, the result says so and slopcannon_production_status keeps watching.")},
         },
         "additionalProperties": False,
     },
-}, _guard(_produce))
+}, _guard(_produce, pass_session=True))
 
 PRODUCTION_STATUS = ToolSpec("slopcannon_production_status", {
     "name": "slopcannon_production_status",
     "description": (
         "Where a SLOPCANNON production stands: phase, the gate it waits on, every scene's status, credits "
         "committed, and the master as MEDIA when finished. Without production_id, lists recent productions. "
-        "wait_s blocks until the next stop."),
+        f"wait_s blocks until the next stop, at most {MAX_BLOCK_S} s; if it is still running then, call again."),
     "parameters": {
         "type": "object",
         "properties": {
             "production_id": {"type": "string"},
-            "wait_s": {"type": "integer", "minimum": 0, "maximum": _MAX_WAIT_S},
+            "wait_s": {"type": "integer", "minimum": 0, "maximum": MAX_BLOCK_S},
         },
         "additionalProperties": False,
     },
-}, _guard(_status))
+}, _guard(_status, pass_session=True))
 
 PRODUCTION_STOP = ToolSpec("slopcannon_production_stop", {
     "name": "slopcannon_production_stop",
@@ -303,7 +297,21 @@ PRODUCTION_STOP = ToolSpec("slopcannon_production_stop", {
 
 
 _PHRASE_GAP_S = 0.7
-_ANALYSIS_TIMEOUT_S = 600
+_ANALYSIS_POLL_S = 8
+# A BCP-47-shaped language tag (en, pt-BR, zh-Hant-TW). It names the cached transcript file, so nothing else may
+# reach the path.
+_LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*")
+_LANGUAGE_MAX = 35
+
+
+def _language(value: Any) -> str:
+    """The validated language tag, or "" when none was given."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str) or len(value) > _LANGUAGE_MAX or not _LANGUAGE_TAG.fullmatch(value):
+        raise SlopcannonError(f"language must be a BCP-47 tag such as en or pt-BR (letters, digits and hyphens, at "
+                              f"most {_LANGUAGE_MAX} characters), not {value!r}", code="invalid_language")
+    return value
 
 
 def _asset_id(value: Any) -> str:
@@ -339,13 +347,14 @@ def whisper_json(words: list[dict[str, Any]]) -> dict[str, Any]:
     return {"segments": segments}
 
 
-def _transcribe(args: dict[str, Any], session_id: str = "") -> str:
+def _transcribe(args: dict[str, Any]) -> str:
+    deadline = time.monotonic() + max(30, min(int(args.get("timeout_s") or MAX_BLOCK_S), MAX_BLOCK_S))
+    language = _language(args.get("language"))
     song = Path(str(args.get("song") or "")).expanduser()
     if not song.is_file():
         raise SlopcannonError(f"no file at {song}", code="file_not_found")
     data = song.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
-    language = args.get("language")
     out = production.root().parent / "transcripts" / f"{digest[:24]}{'-' + language if language else ''}.words.json"
     if out.is_file():
         cached = json.loads(out.read_text(encoding="utf-8"))
@@ -378,7 +387,6 @@ def _transcribe(args: dict[str, Any], session_id: str = "") -> str:
         or (started.get("analysisId") if isinstance(started, dict) else None)
     if not analysis_id:
         raise SlopcannonError("song analysis did not start", code="analysis_failed", details=started)
-    deadline = time.monotonic() + min(int(args.get("timeout_s") or _ANALYSIS_TIMEOUT_S), _ANALYSIS_TIMEOUT_S)
     words: list[dict[str, Any]] = []
     while True:
         page = client.call_tool("slopcannon_get_song_analysis",
@@ -392,10 +400,14 @@ def _transcribe(args: dict[str, Any], session_id: str = "") -> str:
             if transcription.get("nextOffset") is None:
                 break
             continue
-        if time.monotonic() >= deadline:
-            return json.dumps({"ok": False, "error": "analysis_running", "analysisId": analysis_id,
-                               "message": "Song analysis is still running; call slopcannon_transcribe again."})
-        time.sleep(8)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            again = {"song": str(song), "rights_version": required, **({"language": language} if language else {})}
+            return json.dumps({"ok": True, "status": "running", "analysisId": analysis_id, "call_again": again,
+                               "message": ("Song analysis is still running. Call slopcannon_transcribe again with the "
+                                           "arguments in call_again: it picks up the same analysis and uploads "
+                                           "nothing twice.")})
+        time.sleep(min(_ANALYSIS_POLL_S, remaining))
     doc = whisper_json(words)
     if not doc["segments"]:
         raise SlopcannonError("the analysis found no timed words (an instrumental?); write a timed_plan instead",
@@ -411,14 +423,17 @@ TRANSCRIBE = ToolSpec("slopcannon_transcribe", {
     "description": (
         "Word-timed lyrics for a local song, from SLOPCANNON's song analysis (no credits): uploads the song under the "
         "person's rights sign-off and returns `transcript`, a local JSON path to pass as production.transcript to "
-        "slopcannon_produce. Cached per song. Read the excerpt to write each scene's direction against the words."),
+        "slopcannon_produce. Cached per song. Read the excerpt to write each scene's direction against the words. "
+        f"Waits at most timeout_s (default and max {MAX_BLOCK_S} s); if the analysis is still running then, the "
+        "result has status running and `call_again`: call again with those arguments."),
     "parameters": {
         "type": "object",
         "properties": {
             "song": {"type": "string", "description": "Absolute path of the song."},
             "rights_version": {"type": "string", "description": "requiredVersion from slopcannon_account."},
-            "language": {"type": "string", "description": "BCP-47 code such as en, when known."},
-            "timeout_s": {"type": "integer", "minimum": 30, "maximum": _ANALYSIS_TIMEOUT_S},
+            "language": {"type": "string", "maxLength": _LANGUAGE_MAX, "pattern": f"^{_LANGUAGE_TAG.pattern}$",
+                         "description": "BCP-47 code such as en or pt-BR, when known."},
+            "timeout_s": {"type": "integer", "minimum": 30, "maximum": MAX_BLOCK_S},
         },
         "required": ["song"],
         "additionalProperties": False,

@@ -179,7 +179,7 @@ class RegistrationTest(unittest.TestCase):
             {"name": "slopcannon_get_project", "description": "newer words", "inputSchema": {"type": "object"}},
             {"name": "slopcannon_new_thing", "description": "d", "inputSchema": {"type": "object"}}]})
         specs = {s[0]: s[1] for s in server_tools.specs(set())}
-        self.assertEqual(list(specs), ["slopcannon_get_project"])   # a tool only the server lists waits for a release
+        self.assertEqual(set(specs), {t["name"] for t in server_tools._bundled()})   # a sync never adds or drops a tool
         self.assertEqual(specs["slopcannon_get_project"]["description"], "newer words")
 
     def test_synced_copy_with_no_declared_tool_falls_back_to_the_snapshot(self):
@@ -266,7 +266,7 @@ class GateTest(unittest.TestCase):
     def test_unattended_spend_needs_an_allowance(self):
         with mock.patch.object(gate, "_approvals_bypassed", return_value=True):
             self.assertEqual(gate.pre_tool_call(SUBMIT, submit_args(40))["action"], "block")
-            bind({"auto_approve_max_credits": 48})
+            bind({"unattended_max_credits": 48})
             self.assertIsNone(gate.pre_tool_call(SUBMIT, submit_args(40)))
             self.assertEqual(gate.pre_tool_call(SUBMIT, submit_args(56))["action"], "block")
 
@@ -613,10 +613,10 @@ class SessionTest(unittest.TestCase):
             auth.credential()
         self.assertEqual(err.exception.code, "agent_session_rate_limited")
         with self.assertRaises(auth.CredentialError) as err:
-            auth.credential()
+            auth.credential(fresh=True)
         self.assertEqual(err.exception.code, "agent_sessions_unavailable")
         with self.assertRaises(auth.NotSignedIn):  # the grant was revoked at slop.cc
-            auth.credential()
+            auth.credential(fresh=True)
 
     def test_personal_token_when_not_signed_in(self):
         self.helper(ProviderNotSignedIn("Run `hermes auth add slopcannon:slop`."),
@@ -662,7 +662,8 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(mint.call_args.args[1], auth.DRIVER_TTL_S)
         self.helper(ProviderNotSignedIn("x"))
         with mock.patch.object(auth, "_mint_with_personal", side_effect=auth.CredentialError("down", "http_503")):
-            self.assertEqual(auth.driver_token("film-2").token, "slop_live_personal")
+            with self.assertRaises(auth.CredentialError):  # never the raw personal token on slop.cc
+                auth.driver_token("film-2")
 
     def test_cli_sessions_are_short(self):
         self.helper(ProviderResponse(201, session_payload()))
@@ -1211,19 +1212,19 @@ class ProductionTest(unittest.TestCase):
                                                                       "rights_version": "v1"})["action"], "approve")
 
     def test_a_deleted_chat_is_not_reported_as_the_films_chat(self):
-        try:
-            import hermes_constants  # noqa: F401
-        except ImportError:
-            self.skipTest("hermes_constants is not importable here")
-        import sqlite3
-        home = Path(self.tmp.name) / "home"
-        home.mkdir()
-        con = sqlite3.connect(home / "state.db")
-        con.execute("create table sessions (id text primary key)")
-        con.execute("insert into sessions values ('local-alive')")
-        con.commit()
-        con.close()
-        with mock.patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+        class SessionDB:
+            def __init__(self, read_only=False):
+                pass
+
+            def get_session(self, sid):
+                return {"id": sid} if sid == "local-alive" else None
+
+            def close(self):
+                pass
+
+        fake = types.ModuleType("hermes_state")
+        fake.SessionDB = SessionDB
+        with mock.patch.dict(sys.modules, {"hermes_state": fake}):
             self.assertEqual(production._live_session("local-alive"), "local-alive")
             self.assertIsNone(production._live_session("local-deleted"))
             self.assertIsNone(production._live_session(None))

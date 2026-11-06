@@ -26,7 +26,9 @@ _CONTENT_TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
 }
 _POLL_S = 20
-_MAX_WAIT_S = 900
+# The longest any one tool call blocks. Hermes cuts a concurrent tool batch off at 420 s, approval prompts
+# included, so every waiting tool stops here and returns what is still running and how to resume it.
+MAX_BLOCK_S = 300
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -47,16 +49,23 @@ def _fail(exc: Exception) -> str:
     return json.dumps({"ok": False, "error": type(exc).__name__, "message": str(exc)})
 
 
-def _guard(fn: Callable[[dict[str, Any]], str]) -> Callable[..., str]:
-    def handler(args: dict[str, Any], **_: Any) -> str:
+def _guard(fn: Callable[..., str], *, pass_session: bool = False) -> Callable[..., str]:
+    """Wrap a tool function so every failure is a structured result, never a crash.
+
+    With ``pass_session`` the chat's session_id goes on to ``fn``, so the studio can answer in that chat.
+    """
+    def handler(args: dict[str, Any], session_id: str = "", **_: Any) -> str:
         try:
+            if pass_session:
+                return fn(args or {}, session_id=str(session_id or ""))
             return fn(args or {})
         except Exception as exc:  # every failure is a structured result, never a crash
             return _fail(exc)
     return handler
 
 
-def _media_line(path: str) -> str:
+def media_line(path: str | Path) -> str:
+    """The line that makes Hermes show a local video: inline on desktop, a native video in messaging."""
     return f"MEDIA:{Path(path).resolve().as_posix()}"
 
 
@@ -220,7 +229,7 @@ def _download_generation(client: Client, generation_id: str, project_id: Optiona
     if not url:
         raise SlopcannonError("the generation has no downloadable clip yet", code="not_ready", details=meta)
     saved = client.download(url, _project_dir(project_id) / f"{_safe(generation_id)}.mp4")
-    return {**saved, "generationId": generation_id, "media": _media_line(saved["path"])}
+    return {**saved, "generationId": generation_id, "media": media_line(saved["path"])}
 
 
 def _download_assembly(client: Client, assembly_id: str, project_id: Optional[str]) -> dict[str, Any]:
@@ -229,7 +238,7 @@ def _download_assembly(client: Client, assembly_id: str, project_id: Optional[st
     if not url:
         raise SlopcannonError("no download link was issued for this assembly", code="not_ready", details=links)
     saved = client.download(url, _project_dir(project_id) / f"master-{_safe(assembly_id)}.mp4")
-    return {**saved, "assemblyId": assembly_id, "media": _media_line(saved["path"])}
+    return {**saved, "assemblyId": assembly_id, "media": media_line(saved["path"])}
 
 
 def _download(args: dict[str, Any]) -> str:
@@ -267,7 +276,8 @@ def _wait(args: dict[str, Any]) -> str:
     assembly_id = args.get("assembly_id")
     if not generation_ids and not assembly_id:
         raise SlopcannonError("pass generation_ids and/or assembly_id", code="missing_target")
-    deadline = time.monotonic() + max(30, min(int(args.get("timeout_s") or 600), _MAX_WAIT_S))
+    timeout_s = max(30, min(int(args.get("timeout_s") or MAX_BLOCK_S), MAX_BLOCK_S))
+    deadline = time.monotonic() + timeout_s
     fetch = args.get("download", True) is not False
     project_id = args.get("project_id")
     done: dict[str, Any] = {}
@@ -304,31 +314,43 @@ def _wait(args: dict[str, Any]) -> str:
                     current["download"] = exc.to_dict()
             assembly = current
         assembly_done = not assembly_id or (assembly or {}).get("status") in ASSEMBLY_TERMINAL
-        if (not pending and assembly_done) or time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if (not pending and assembly_done) or remaining <= 0:
             break
-        time.sleep(_POLL_S)
+        time.sleep(min(_POLL_S, remaining))
     media = [v["media"] for v in done.values() if v.get("media")]
     if assembly and assembly.get("media"):
         media.append(assembly["media"])
-    return _ok(finished=done, still_running=pending, assembly=assembly, media=media,
-               note=("Still running; call slopcannon_wait again with the remaining IDs. Never "
-                     "resubmit a running generation." if pending or not assembly_done else None))
+    if not pending and assembly_done:
+        return _ok(finished=done, still_running=[], assembly=assembly, media=media, note=None)
+    call_again: dict[str, Any] = {}
+    if pending:
+        call_again["generation_ids"] = pending
+    if not assembly_done:
+        call_again["assembly_id"] = assembly_id
+    if project_id:
+        call_again["project_id"] = project_id
+    return _ok(finished=done, still_running=pending, assembly=assembly, media=media, call_again=call_again,
+               note=(f"Still running after {timeout_s} s. Show any media above, then call slopcannon_wait again "
+                     "with the arguments in call_again. Never resubmit a running generation."))
 
 
 WAIT = ToolSpec("slopcannon_wait", {
     "name": "slopcannon_wait",
     "description": (
         "Wait for submitted scene generations and/or a final assembly to finish (polls every "
-        f"{_POLL_S}s, up to timeout_s, max {_MAX_WAIT_S}), then download finished clips and the "
-        "master. Returns `media` lines: put each MEDIA: line alone on its own line in your reply to "
-        "show the videos. On timeout, call again with still_running; never resubmit."),
+        f"{_POLL_S} s for up to timeout_s, default and max {MAX_BLOCK_S} s), then download finished clips and "
+        "the master. Returns `media` lines: put each MEDIA: line alone on its own line in your reply to "
+        "show the videos. If anything is still running when the time is up, the result says so and "
+        "carries `call_again`: call slopcannon_wait again with exactly those arguments; never resubmit."),
     "parameters": {
         "type": "object",
         "properties": {
             "generation_ids": {"type": "array", "items": {"type": "string"}},
             "assembly_id": {"type": "string"},
             "project_id": {"type": "string"},
-            "timeout_s": {"type": "integer", "minimum": 30, "maximum": _MAX_WAIT_S},
+            "timeout_s": {"type": "integer", "minimum": 30, "maximum": MAX_BLOCK_S,
+                          "description": f"Seconds to wait before returning what is still running (default {MAX_BLOCK_S})."},
             "download": {"type": "boolean", "description": "Default true."},
         },
         "additionalProperties": False,
