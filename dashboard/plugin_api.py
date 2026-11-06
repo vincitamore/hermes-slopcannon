@@ -22,16 +22,19 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import FileResponse
 
-_PACKAGE_DIR = Path(__file__).resolve().parents[1]
+# The path as Hermes gave it, never resolved: Hermes lends the sign-in only to code whose file lies
+# under a plugins folder, so a plugin installed as a link (a junction or symlink to a checkout) that
+# loads itself from the resolved target is refused ("must be called from an installed plugin's code").
+_PACKAGE_DIR = Path(__file__).absolute().parents[1]
 _ALIAS = "hermes_slopcannon_studio"
 
 
 def _package() -> ModuleType:
     """The plugin package: the copy Hermes already loaded, else one loaded from this folder."""
-    init = (_PACKAGE_DIR / "__init__.py").resolve()
+    init = _PACKAGE_DIR / "__init__.py"
     for name, module in list(sys.modules.items()):
         file = getattr(module, "__file__", None)
-        if file and name.count(".") <= 1 and Path(file).resolve() == init:
+        if file and name.count(".") <= 1 and Path(file).resolve() == init.resolve():
             return module
     if _ALIAS not in sys.modules:
         spec = importlib.util.spec_from_file_location(_ALIAS, init, submodule_search_locations=[str(_PACKAGE_DIR)])
