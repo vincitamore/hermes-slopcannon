@@ -19,7 +19,7 @@ _DEFAULTS: dict[str, Any] = {
     "api_origin": DEFAULT_API_ORIGIN,
     "download_dir": "",
     "max_credits_per_action": 0,
-    "auto_approve_max_credits": 0,
+    "unattended_max_credits": 0,
     "protect_production_files": True,
 }
 

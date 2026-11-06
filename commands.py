@@ -5,7 +5,7 @@ import argparse
 import sys
 from typing import Any
 
-from . import auth, server_tools
+from . import auth, gate, server_tools
 from .client import Client, SlopcannonError
 
 HELP = "\n".join([
@@ -78,6 +78,10 @@ def _status_text() -> str:
 
     if summary["connected"]:
         rows.append(_row("top-up", "slop.cc/account#buy-credits"))
+    if not gate.bypass_check_available():
+        rows.append(_row("approvals", "cannot see YOLO / approvals off in this Hermes "
+                                      f"({gate.bypass_check_problem()}); Hermes's own prompt decides each spend, "
+                                      "and max_credits_per_action still applies"))
     return "\n".join(rows)
 
 

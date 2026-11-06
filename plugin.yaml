@@ -101,6 +101,18 @@ optional_env:
     description: "slop.cc's public OAuth client id for Hermes: set it to hermes-agent (`hermes config set SLOPCANNON_OAUTH_CLIENT_ID hermes-agent`), then run `hermes auth add slopcannon:slop`. Not a secret. Not needed with a personal Agent token."
     url: "https://slop.cc/for-agents"
     password: false
+  - name: SLOPCANNON_FFMPEG_DIR
+    description: "Folder holding ffmpeg and ffprobe for posters, previews and local cuts. Empty means the ones on PATH."
+  - name: SLOPCANNON_FFMPEG_PATH
+    description: "Full path to the ffmpeg the production driver uses. Empty means ffmpeg on PATH."
+  - name: SLOPCANNON_FFPROBE_PATH
+    description: "Full path to the ffprobe the production driver uses. Empty means ffprobe on PATH."
+  - name: SLOPCANNON_X264_PRESET
+    description: "x264 preset for the final local cut (default veryfast); slower presets give smaller files."
+  - name: SLOPCANNON_AGENT_CAPS_RETRY_MS
+    description: "Comma-separated waits in milliseconds before the driver retries a capabilities read (default 3000,10000)."
+  - name: SLOPCANNON_AGENT_SPOT_POLL_MS
+    description: "Milliseconds between audio-spot status reads, overriding the 15 s default. Meant for tests."
 config_schema:
   agent_token:
     type: secret
@@ -118,12 +130,12 @@ config_schema:
   max_credits_per_action:
     type: int
     default: 0
-    description: "Hard ceiling in Cannon Credits for any one spending call; above it the call is blocked before the approval prompt. 0 means no ceiling."
-  auto_approve_max_credits:
+    description: "Hard ceiling in Cannon Credits for any one spending call; above it the call is blocked before the approval prompt. Always applies, attended or not. 0 means no ceiling."
+  unattended_max_credits:
     type: int
     default: 0
-    description: "When approvals are bypassed (YOLO / approvals.mode off), spending calls at or under this many credits proceed; anything larger is blocked. 0 blocks every unattended spend."
+    description: "The most one spend may be when no person can be asked: approvals bypassed (YOLO, /yolo, approvals.mode off) or inside a cron job. At or under it the spend proceeds; above it the call is blocked. 0 blocks every spend the plugin sees as unattended. Rights sign-offs are always blocked there. Hermes's approvals.single_query_mode: approve and approvals.unattended_mode: approve are operator opt-ins that Hermes honours and the plugin cannot see; under them only max_credits_per_action limits a spend."
   protect_production_files:
     type: bool
     default: true
-    description: "Refuse any other tool (shell, file edits, code) whose arguments name the plugin's production folders or its installed copy, so the agent reads and resumes films only through the SLOPCANNON tools. Turn off only to develop the plugin."
+    description: "Refuse tools that act on files, processes or the network (shell, file edits, code, browser, MCP; unknown tools count as acting) when their arguments name the plugin's production folders or its installed copy, so the agent reads and resumes films only through the SLOPCANNON tools. Text-only tools such as delegate_task may quote those paths. Turn off only to develop the plugin."
