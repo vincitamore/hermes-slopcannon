@@ -364,6 +364,7 @@ function useStatus() {
     queryKey: keys.status(scope),
     queryFn: async () => normStatus(await api('/status')),
     refetchInterval: SLOW_POLL_MS,
+    refetchIntervalInBackground: true,
     staleTime: 4_000,
     retry: 1
   })
@@ -383,6 +384,7 @@ function useProductions() {
       const list = query && query.state ? query.state.data : null
       return Array.isArray(list) && list.some(p => p.state === 'running') ? FAST_POLL_MS : SLOW_POLL_MS
     },
+    refetchIntervalInBackground: true,
     staleTime: 2_000,
     retry: 1
   })
@@ -409,8 +411,11 @@ function useProduction(id) {
     },
     refetchInterval: query => {
       const p = query && query.state ? query.state.data : null
+      // A run started from the card is driven outside the gateway's event bus, so polling is what tells a
+      // window in the background that a scene is ready: keep it going while the window is hidden.
       return p && p.state === 'running' ? FAST_POLL_MS : SLOW_POLL_MS
     },
+    refetchIntervalInBackground: true,
     staleTime: 2_000,
     retry: (count, error) => count < 1 && !isNotFound(error)
   })
@@ -1198,6 +1203,7 @@ function useMedia(id, running) {
       const d = query && query.state ? query.state.data : null
       return d && d.pending ? 2_500 : running ? 2 * FAST_POLL_MS : 60_000
     },
+    refetchIntervalInBackground: true,
     staleTime: 2_000,
     retry: 1
   })
