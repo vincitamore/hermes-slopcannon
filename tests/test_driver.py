@@ -124,7 +124,7 @@ class CheckRetryTest(unittest.TestCase):
 
 
 FRAME_SCRIPT = r"""
-const { lastFrame } = await import(process.argv[1]);
+const { lastFrame, sceneShownMs } = await import(process.argv[1]);
 const fs = await import("node:fs");
 const os = await import("node:os");
 const path = await import("node:path");
@@ -139,7 +139,9 @@ const run = (fails) => async (_tool, args) => {
 const shown = (await lastFrame("take.mp4", path.join(dir, "a.jpg"), { run: run(0), untilMs: 5640 }), seeks.splice(0));
 const short = (await lastFrame("take.mp4", path.join(dir, "b.jpg"), { run: run(3), untilMs: 5640 }), seeks.splice(0));
 const plain = (await lastFrame("take.mp4", path.join(dir, "c.jpg"), { run: run(0) }), seeks.splice(0));
-console.log(JSON.stringify({ shown, short, plain }));
+// sc02 of a film: its one-scene plan keeps the song clock (durationMs is where it ends, 15114), the slot is 5644.
+const slot = sceneShownMs({ schemaVersion: 1, durationMs: 15114, scenes: [{ startMs: 9470, endMs: 15114 }] });
+console.log(JSON.stringify({ shown, short, plain, slot }));
 """
 
 
@@ -160,3 +162,6 @@ class ChainFrameTest(unittest.TestCase):
 
     def test_without_a_scene_length_the_take_end_is_used(self):
         self.assertEqual(self.result["plain"], [["-sseof", "-0.12"]])
+
+    def test_the_scene_length_is_its_slot_not_the_plans_clock(self):
+        self.assertEqual(self.result["slot"], 5644)

@@ -3264,6 +3264,14 @@ export function chainTakes(ledger, sceneIds, value) {
 // The frame the next scene continues from is the last one the film shows. A take runs past its scene (the cut keeps
 // only the scene's length from its start), so with untilMs the frame is taken just before that point, never from
 // the take's own tail, which the film never shows; the take's end is the fallback when it is shorter.
+// How long the film shows a scene: its slot on the song clock. A one-scene plan's durationMs is the song time where
+// the scene ENDS (the plan keeps the film's clock), so it is never the length.
+export function sceneShownMs(scenePlan) {
+  const scene = scenePlan?.scenes?.[0];
+  const ms = Number(scene?.endMs) - Number(scene?.startMs);
+  return Number.isFinite(ms) && ms > 0 ? ms : null;
+}
+
 export async function lastFrame(clip, out, { maxBytes = 786_432, run = runMediaTool, untilMs = null } = {}) {
   mkdirSync(path.dirname(out), { recursive: true });
   const until = Number(untilMs) > 0 ? Number(untilMs) / 1000 : null;
@@ -3319,7 +3327,7 @@ async function runChain({ options, ledgerFile, production, sceneIds, prepDir, ca
       if (before) {
         const previous = loadLedger(ledgerFile).scenes[before];
         if (!await verifiedLocalArtifact(previous?.downloaded)) throw new Error(`${before} has no verified take to continue from.`);
-        const shownMs = JSON.parse(readFileSync(scenePlanFile(sceneIds[index - 1]), "utf8")).durationMs;
+        const shownMs = sceneShownMs(JSON.parse(readFileSync(scenePlanFile(sceneIds[index - 1]), "utf8")));
         const frame = await lastFrame(previous.downloaded.path, path.join(workDir, "chain", `${before}-last.jpg`), { untilMs: shownMs });
         const label = `chain-${before}`;
         await verbUpload(new Map([["--scene", id], ["--kind", "set_reference"], ["--file", frame], ["--label", label], ["--rights", rightsVersion]]), ledgerFile);
