@@ -1279,3 +1279,21 @@ class TranscribeTest(unittest.TestCase):
             {"word": "again", "start": 4.0, "end": 4.3}, {"word": "", "start": 5, "end": 6}, {"text": "x"}])
         self.assertEqual([s["text"] for s in doc["segments"]], ["Hello world", "again"])
         self.assertEqual(doc["segments"][0]["start"], 0.5)
+
+
+class StateWriteTest(unittest.TestCase):
+    def test_a_state_file_held_open_for_a_moment_is_still_written(self):
+        real, calls = os.replace, []
+
+        def replace(src, dst):
+            calls.append(dst)
+            if len(calls) <= 2:  # Windows: another process has the file open
+                raise PermissionError(13, "Access is denied")
+            real(src, dst)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "state.json"
+            with mock.patch.object(production.os, "replace", replace), mock.patch.object(production.time, "sleep"):
+                production._write_json(target, {"state": "running"})
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"state": "running"})
+            self.assertEqual(len(calls), 3)

@@ -101,7 +101,16 @@ def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, indent=1, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    # On Windows a replace onto a file another process has open (the studio polling it, an indexer) fails for a
+    # moment with PermissionError; the driver's ledger save stopped a paid run that way once. Wait it out briefly.
+    for attempt in range(25):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 24:
+                raise
+            time.sleep(0.2)
 
 
 def load_state(production_id: str) -> Optional[dict[str, Any]]:
