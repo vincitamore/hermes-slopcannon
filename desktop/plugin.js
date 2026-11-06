@@ -770,7 +770,8 @@ function needsModel(p, extra = {}) {
         primary: str(d.sha256)
           ? { label: next ? `Keep it, render scene ${index !== null ? index + 1 : 'next'}` : 'Keep it, cut the film', decide: { gate: 'scene_review', sha256: str(d.sha256) } }
           : null,
-        secondary: scene ? [{ label: 'Reroll this scene', decide: { gate: 'reroll', reroll: [scene] } }] : []
+        noteScene: scene || null,
+        secondary: scene ? [{ label: 'Reroll this scene', decide: { gate: 'reroll', reroll: [scene] }, note: true }] : []
       }
     }
     case 'shot_review': {
@@ -952,6 +953,9 @@ const CSS = `
 .sc-cell-r{text-align:right;font-variant-numeric:tabular-nums}
 .sc-flagrow{display:flex;flex-direction:column;gap:4px;padding:8px 0;border-top:1px solid var(--ui-stroke-tertiary)}
 .sc-flagrow-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sc-note{width:100%;min-height:44px;padding:7px 9px;resize:vertical;font:inherit;font-size:.8125rem;line-height:1.45;color:var(--ui-text-primary,inherit);background:transparent;border:1px solid var(--ui-stroke-secondary);border-radius:6px;outline:none}
+.sc-note:focus{border-color:var(--ui-accent)}
+.sc-note::placeholder{color:var(--ui-text-tertiary,var(--ui-text-secondary))}
 .sc-chooser-go{display:flex;justify-content:flex-end;padding-top:8px;border-top:1px solid var(--ui-stroke-tertiary)}
 .sc-issues{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;list-style:none;font-size:.75rem;color:var(--ui-text-secondary)}
 .sc-issues li{display:flex;gap:6px}
@@ -1885,9 +1889,11 @@ function pickScene(p) {
 // -----------------------------------------------------------------------------
 // The decision (studio: actions inside, on the right; chat: actions below the card)
 
-function decisionActions(production, model, send, { inChat, busy } = {}) {
+function decisionActions(production, model, send, { inChat, busy, note } = {}) {
   const out = []
-  const run = a => (a.decide ? decideOnCard(production, a.decide) : send(a.text))
+  // A reroll asked with a note: the note is the new take's direction (else the production derives one).
+  const said = a => (a.note && str(note).trim() && model.noteScene ? { ...a.decide, reroll: [{ scene: model.noteScene, direction: str(note).trim().slice(0, 600) }] } : a.decide)
+  const run = a => (a.decide ? decideOnCard(production, said(a)) : send(a.text))
   if (model.primary) out.push({ key: 'primary', label: model.primary.label, variant: 'default', disabled: busy, loading: busy && Boolean(model.primary.decide), onClick: () => run(model.primary) })
   arr(model.secondary).forEach(s => out.push({ key: s.label, label: s.label, variant: inChat ? 'ghost' : 'secondary', disabled: busy, onClick: () => run(s) }))
   if (inChat) {
@@ -2478,7 +2484,10 @@ function FilmCard({ productionId, sessionId }) {
   const q = useProduction(productionId)
   const status = useStatus()
   const busy = useDeciding(productionId)
+  const [note, setNote] = useState('')
   const p = q.data
+  const noteFor = p ? `${p.needs || ''}:${str(obj(p.needsDetail).sha256)}` : ''
+  useEffect(() => setNote(''), [noteFor])
   const media = useMedia(p ? p.id : null, p && p.state === 'running').data || null
   if (!p) {
     return h(
@@ -2519,9 +2528,25 @@ function FilmCard({ productionId, sessionId }) {
       h('div', { className: 'sc-wc-decide', 'data-tone': model.tone }, h('b', null, model.headline), h('span', null, model.body)),
       ['rights', 'approval', 'reroll_approval', 'shot_review'].includes(p.needs)
         ? h('div', { className: 'sc-wc-body' }, guard(h(NeedsDetail, { production: p, send }), null, `${p.id}:${p.needs}`))
+        : null,
+      model.noteScene
+        ? h(
+            'div',
+            { className: 'sc-wc-body' },
+            h('textarea', {
+              className: 'sc-note',
+              rows: 2,
+              value: note,
+              disabled: busy,
+              'aria-label': 'What should change in a new take',
+              placeholder: 'Not quite right? Say what to change, then reroll.',
+              onKeyDown: e => e.stopPropagation(),
+              onChange: e => setNote(e.target.value)
+            })
+          )
         : null
     )
-    actions = decisionActions(p, model, send, { inChat: true, busy })
+    actions = decisionActions(p, model, send, { inChat: true, busy, note })
   } else if (p.state === 'running') {
     body = h(Fragment, null, player, h('div', { className: 'sc-wc-body' }, track, h(Progress, { production: p })))
     actions = [{ key: 'studio', label: 'Open in studio', onClick: () => openStudio(p.id) }, { key: 'stop', node: h(StopControl, { production: p }) }]
