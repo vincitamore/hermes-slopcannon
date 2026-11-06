@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import time
 import shutil
 import subprocess
 import unittest
@@ -165,3 +168,31 @@ class ChainFrameTest(unittest.TestCase):
 
     def test_the_scene_length_is_its_slot_not_the_plans_clock(self):
         self.assertEqual(self.result["slot"], 5644)
+
+
+LOCK_SCRIPT = r"""
+const { saveLedger } = await import(process.argv[1]);
+const file = process.argv[2];
+const ledger = { version: 1, scenes: { sc01: { assets: {}, log: ["saved"] } } };
+saveLedger(file, ledger, "sc01");
+console.log(JSON.stringify({ ok: true }));
+"""
+
+
+@unittest.skipUnless(NODE and os.name == "nt", "a held file blocks a rename only on Windows")
+class LedgerLockTest(unittest.TestCase):
+    def test_a_ledger_held_open_for_a_moment_is_still_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "ledger.json"
+            file.write_text(json.dumps({"version": 1, "scenes": {}}), encoding="utf-8")
+            held = open(file, "rb")  # Python opens without FILE_SHARE_DELETE: a rename onto it fails meanwhile
+            try:
+                proc = subprocess.Popen([str(NODE), "--input-type=module", "-e", LOCK_SCRIPT, DRIVER.as_uri(), str(file)],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                time.sleep(1.0)
+            finally:
+                held.close()
+            out, err = proc.communicate(timeout=60)
+            self.assertEqual(proc.returncode, 0, err)
+            self.assertEqual(json.loads(file.read_text(encoding="utf-8"))["scenes"]["sc01"]["log"], ["saved"])
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["ledger.json"])  # no candidate left behind

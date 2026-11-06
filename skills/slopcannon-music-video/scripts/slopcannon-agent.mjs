@@ -343,6 +343,23 @@ export function loadLedger(file) {
 }
 
 /**
+ * Replace a file by rename, waiting out a brief lock. On Windows a rename onto a file another process holds open
+ * (a reader, an indexer, antivirus) fails with EPERM, EACCES or EBUSY for a moment; one such failure once stopped
+ * a paid production after its scene was bought. Waits up to about five seconds, then rethrows.
+ */
+export function replaceFile(from, to, { attempts = 25, waitMs = 200 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(from, to);
+      return attempt;
+    } catch (error) {
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error?.code) || attempt >= attempts) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, waitMs);
+    }
+  }
+}
+
+/**
  * Merge-save by scene so a fresh read preserves unrelated state. Separate
  * mutating processes must still serialize access to one ledger; filesystem
  * writes alone are not a cross-process transaction.
@@ -370,7 +387,7 @@ export function saveLedger(file, ledger, sceneId) {
       writeFileSync(descriptor, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
       fsyncSync(descriptor);
     } finally { closeSync(descriptor); }
-    renameSync(candidate, file);
+    replaceFile(candidate, file);
   } finally {
     if (existsSync(candidate)) unlinkSync(candidate);
   }
