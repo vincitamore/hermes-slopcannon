@@ -771,7 +771,7 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------- productions
 
 FAKE_DRIVER = r"""
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import path from "node:path";
 const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i < 0 ? null : args[i + 1]; };
@@ -783,7 +783,11 @@ else if (args[0] === "reroll") {
   const root = flag("--scene"), take = root + ".r1", price = root === "sc01" ? 44 : 50;
   const log = path.join(path.dirname(ledgerFile), "reroll-calls.log");
   writeFileSync(log, (existsSync(log) ? readFileSync(log, "utf8") : "") + [root, flag("--approve-units"), flag("--max-credits"), flag("--wait")].join(" ") + "\n");
-  if (!flag("--approve-units")) {
+  const expire = path.join(path.dirname(ledgerFile), "expire-once");
+  if (flag("--approve-units") && existsSync(expire)) {  // the approved quote expired: quoted again
+    unlinkSync(expire);
+    out({ ok: false, needs: "approval", scene: take, rerollOf: root, quoteId: "q2-" + root, amountUnits: price }, 2);
+  } else if (!flag("--approve-units")) {
     ledger.scenes[take] = { rerollOf: root, quote: { id: "q-" + root, amountUnits: price } };
     writeFileSync(ledgerFile, JSON.stringify(ledger));
     out({ ok: false, needs: "approval", scene: take, rerollOf: root, quoteId: "q-" + root, amountUnits: price }, 2);
@@ -1014,7 +1018,13 @@ class ProductionTest(unittest.TestCase):
         self.assertEqual(kept["state"], "done", kept)
         self.assertNotIn("sc01.r1=", Path(kept["master"]["path"]).read_text())
         card(pid, gate="reroll", reroll=["sc01"])
+        # The approved quote expired before it was bought: quoted again at the same price, the approval stands.
+        (production._dir(pid) / "expire-once").write_text("")
         cut = card(pid, gate="reroll_approval", credits=44)["detail"]
+        self.assertFalse((production._dir(pid) / "expire-once").exists())
+        self.assertEqual(cut["state"], "done", cut)
+        self.assertIn("the quote for sc01.r1 expired; quoted again at 44, within the approved 44",
+                      production.load_state(pid)["log"])
         self.assertEqual(Path(cut["master"]["path"]).read_text(), "cut sc01=sc01.r1")
         # At the take check every flagged scene needs an answer, and the card's routes are never the agent's.
         state = production.load_state(pid)

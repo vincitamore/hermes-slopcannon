@@ -562,9 +562,17 @@ class _Runner(threading.Thread):
                 if verb_args[0] == "reroll" and not self.stopped:
                     ask = state["decisions"]["rerolls"][verb_args[verb_args.index("--scene") + 1]]
                     if code == 2 and result.get("needs") == "approval":  # quoted (or quoted again: it expired)
-                        ask.update(quote={"take": result.get("scene"), "amountUnits": result.get("amountUnits"),
+                        # An approved take whose quote expired is quoted again; the approval stands when the new
+                        # price is no higher, so the person is not asked twice for the same take.
+                        held = ask.get("approved")
+                        units = result.get("amountUnits")
+                        keep = isinstance(held, int) and isinstance(units, int) and units <= held
+                        ask.update(quote={"take": result.get("scene"), "amountUnits": units,
                                           "quoteId": result.get("quoteId"), "expiresAt": result.get("expiresAt")},
-                                   approved=None, submitted=False)
+                                   approved=units if keep else None, submitted=False)
+                        if keep:
+                            state["log"].append(f"the quote for {result.get('scene')} expired; quoted again at "
+                                                f"{units}, within the approved {held}")
                         _save_state(pid, state)
                         continue
                     if code == 0 and result.get("ok") and result.get("submitted"):
