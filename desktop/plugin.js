@@ -13,16 +13,21 @@
 //     that changes in place (needs you, rendering, done)
 //   - tool media renderer for this package's own tools' MEDIA files (scene card)
 //
-// Design: Hermes's own primitives (Button, Badge, Loader, Tip, ConfirmDialog) and
-// live theme variables only; the film's frames carry the colour. Frames and
-// the song envelope come from the backend (media.py) by opaque cache name.
+// Design: Hermes's own primitives (Button, Badge, Loader, Tip, ConfirmDialog,
+// Textarea, StatusDot, DisclosureCaret, RowButton, SegmentedControl, the status
+// bar's own item) and live theme variables only; the film's frames carry the
+// colour. Frames and the song envelope come from the backend (media.py) by
+// opaque cache name.
 //
-// Backend: dashboard/plugin_api.py, reached with ctx.rest('/...'). Live updates
-// arrive as `plugin.slopcannon.*` gateway events; React Query polling is the
-// fallback (5 s while anything renders, 30 s otherwise).
+// Backend: dashboard/plugin_api.py, reached with ctx.rest('/...'). Every
+// decision is the person's click on the film card, posted to the production's
+// `/decide` route. Live updates arrive as `plugin.slopcannon.*` gateway events;
+// React Query polling is the fallback (5 s while a production renders, 30 s
+// otherwise), and only the one rendering production on screen keeps polling
+// while the window is hidden.
 
 import * as sdk from '@hermes/plugin-sdk'
-import { Component, createElement as h, Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, createElement as h, Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 const ID = 'slopcannon'
 const ROUTE = '/slopcannon'
@@ -50,6 +55,11 @@ const {
   ConfirmDialog,
   Loader,
   LogView,
+  Textarea,
+  StatusDot,
+  DisclosureCaret,
+  RowButton,
+  SegmentedControl,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   STATUSBAR_AREAS,
@@ -64,8 +74,36 @@ const PRODUCTION_TOOLS = new Set(['slopcannon_produce', 'slopcannon_production_s
 
 let CTX = null
 const $selected = atom(null)
-const lastSeenNeeds = new Map()
-const savers = new Map()
+// Both regenerable, so bounded (the renderer stays open for days): a lost entry costs one skipped
+// notification or one re-captured save action.
+let lastSeenNeeds = boundedMap(200)
+let savers = boundedMap(50)
+
+function boundedMap(max) {
+  if (typeof sdk.LruCache === 'function') return new sdk.LruCache(max)
+  const entries = new Map()
+  return {
+    get: key => entries.get(key),
+    set: (key, value) => {
+      entries.delete(key)
+      entries.set(key, value)
+      if (entries.size > max) entries.delete(entries.keys().next().value)
+    }
+  }
+}
+
+// Timers through the plugin context, so none outlives the plugin; each returns its canceller.
+function wait(fn, ms) {
+  if (CTX && typeof CTX.setTimeout === 'function') return CTX.setTimeout(fn, ms)
+  const id = setTimeout(fn, ms)
+  return () => clearTimeout(id)
+}
+
+function every(fn, ms) {
+  if (CTX && typeof CTX.setInterval === 'function') return CTX.setInterval(fn, ms)
+  const id = setInterval(fn, ms)
+  return () => clearInterval(id)
+}
 
 // -----------------------------------------------------------------------------
 // Defensive readers
@@ -262,6 +300,7 @@ function normScene(raw, i) {
     check: normCheck(o.check),
     checkAccepted: o.checkAccepted === true,
     take: int(o.take),
+    rerolled: o.rerolled === true,
     submittedAt: num(o.submittedAt),
     renderedAt: num(o.renderedAt)
   }
@@ -327,14 +366,22 @@ function api(path, opts) {
   return CTX.rest(path, opts)
 }
 
+// The cache scope: the gateway connection and the profile, so two sources that both serve a profile of the
+// same name never share cached reads.
 function useScopeKey() {
   let profile = ''
+  let connection = ''
   try {
     profile = useValue(host.state.profile) || ''
   } catch {
     profile = ''
   }
-  return profile
+  try {
+    connection = host.state.connectionId ? useValue(host.state.connectionId) || '' : ''
+  } catch {
+    connection = ''
+  }
+  return `${connection}::${profile}`
 }
 
 const keys = {
@@ -364,7 +411,6 @@ function useStatus() {
     queryKey: keys.status(scope),
     queryFn: async () => normStatus(await api('/status')),
     refetchInterval: SLOW_POLL_MS,
-    refetchIntervalInBackground: true,
     staleTime: 4_000,
     retry: 1
   })
@@ -384,14 +430,45 @@ function useProductions() {
       const list = query && query.state ? query.state.data : null
       return Array.isArray(list) && list.some(p => p.state === 'running') ? FAST_POLL_MS : SLOW_POLL_MS
     },
-    refetchIntervalInBackground: true,
     staleTime: 2_000,
     retry: 1
   })
 }
 
+// A run started from the card is driven outside the gateway's event bus, so polling is what tells a window in
+// the background that a scene is ready. Only one reader keeps polling while hidden: the first mounted reader of
+// a running production. When it unmounts the next one takes over; every other read waits for the events.
+const $hiddenPoller = atom(null)
+
+function usePollWhileHidden(id, running) {
+  const token = useMemo(() => ({}), [])
+  const owner = useValue($hiddenPoller)
+  useEffect(() => {
+    if (!id || !running) return undefined
+    const claim = () => {
+      if ($hiddenPoller.get() === null) $hiddenPoller.set(token)
+    }
+    claim()
+    const off = $hiddenPoller.listen(value => {
+      if (value === null) claim()
+    })
+    return () => {
+      off()
+      if ($hiddenPoller.get() === token) $hiddenPoller.set(null)
+    }
+  }, [id, running, token])
+  return owner === token
+}
+
 function useProduction(id) {
   const scope = useScopeKey()
+  let cached = null
+  try {
+    cached = id ? queryClient.getQueryData(keys.detail(scope, id)) : null
+  } catch {
+    cached = null
+  }
+  const hidden = usePollWhileHidden(id, Boolean(cached && cached.state === 'running'))
   return useQuery({
     queryKey: keys.detail(scope, id || ''),
     enabled: Boolean(id),
@@ -411,23 +488,42 @@ function useProduction(id) {
     },
     refetchInterval: query => {
       const p = query && query.state ? query.state.data : null
-      // A run started from the card is driven outside the gateway's event bus, so polling is what tells a
-      // window in the background that a scene is ready: keep it going while the window is hidden.
       return p && p.state === 'running' ? FAST_POLL_MS : SLOW_POLL_MS
     },
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: hidden,
     staleTime: 2_000,
-    retry: (count, error) => count < 1 && !isNotFound(error)
+    retry: (count, error) => count < 1 && httpStatus(error) !== 404
   })
 }
 
-function isNotFound(error) {
-  const text = String((error && (error.message || error.detail)) || error || '')
-  return /\b404\b|not found/i.test(text)
+// ctx.rest rejects with "<status>: <body>" (plus `statusCode` when it survives the bridge); our routes answer
+// FastAPI's {"detail": "..."}.
+function httpStatus(error) {
+  const code = Number(error && error.statusCode)
+  if (Number.isInteger(code) && code > 0) return code
+  const m = /\b([1-5]\d\d):/.exec(String((error && error.message) || ''))
+  return m ? Number(m[1]) : null
+}
+
+function errorDetail(error) {
+  const m = /\b[1-5]\d\d:\s*([\s\S]*)$/.exec(String((error && error.message) || ''))
+  const text = m ? m[1].trim() : ''
+  try {
+    const body = JSON.parse(text)
+    return isObj(body) && typeof body.detail === 'string' ? body.detail : text
+  } catch {
+    return text
+  }
+}
+
+// A 404 from our own routes names what is missing ("no production ..."); any other 404 (FastAPI's bare
+// "Not Found") means the route is absent: the plugin's backend is not mounted for this profile.
+function isMissingProduction(error) {
+  return httpStatus(error) === 404 && /^no production\b/i.test(errorDetail(error))
 }
 
 function backendDownText(error) {
-  if (isNotFound(error)) {
+  if (httpStatus(error) === 404 && !isMissingProduction(error)) {
     return 'The SLOPCANNON backend is not loaded for this profile. Enable the slopcannon plugin for the agent (plugins.enabled) and restart the gateway.'
   }
   return 'The SLOPCANNON backend is not answering. It may be starting, or the gateway is restarting.'
@@ -494,9 +590,11 @@ async function copyFallback(text) {
   )
 }
 
-// From a transcript card: the card's own chat, fail closed (SDK contract).
+// From a transcript card: the card's own chat, fail closed (SDK contract). A card that does not know its chat
+// sends nothing (it would land in whichever chat is active); it shows a quiet line instead of the button.
 function sendFromCard(sessionId, text) {
-  const sent = trySubmit(sessionId === undefined ? null : sessionId, text)
+  if (!sessionId) return false
+  const sent = trySubmit(sessionId, text)
   if (!sent) notify('warning', 'Open that chat to send this.')
   return sent
 }
@@ -533,6 +631,7 @@ function useDeciding(id) {
 // using, else that chat opened, else a new chat in this profile (a deleted chat is never opened: it cannot load),
 // and failing all of those, the clipboard.
 async function sendFromStudio(production, text) {
+  if (waitingSends.has(text)) return undefined // already on its way to a chat that is opening
   const remembered = production && production.sessionChecked ? null : rememberedSession(production && production.id)
   const target = (production && production.sessionId) || remembered || null
   if (target && trySubmit(target, text)) return notify('success', 'Sent to the chat.')
@@ -557,15 +656,28 @@ async function sendFromStudio(production, text) {
   return copyFallback(text)
 }
 
-// Retry a send while the chat it opened mounts its composer (about two seconds), then the clipboard.
-function later(attempt, text, tries = 0) {
+// Retry a send while the chat it opened mounts its composer (about two seconds), then the clipboard. A message
+// already waiting is never queued twice (a second click while the chat opens).
+const waitingSends = new Set()
+
+function later(attempt, text) {
+  if (waitingSends.has(text)) return undefined
+  waitingSends.add(text)
+  let tries = 0
   const tick = () => {
-    if (attempt()) return notify('success', 'Sent to the chat.')
-    if (tries >= 7) return void copyFallback(text)
-    later(attempt, text, tries + 1)
+    if (attempt()) {
+      waitingSends.delete(text)
+      return notify('success', 'Sent to the chat.')
+    }
+    tries += 1
+    if (tries > 7) {
+      waitingSends.delete(text)
+      return void copyFallback(text)
+    }
+    wait(tick, 300)
+    return undefined
   }
-  if (CTX && typeof CTX.setTimeout === 'function') CTX.setTimeout(tick, 300)
-  else setTimeout(tick, 300)
+  wait(tick, 300)
   return undefined
 }
 
@@ -662,11 +774,15 @@ function needsTotalCredits(p) {
     const sum = quotes.reduce((acc, q) => acc + (int(obj(q).amountUnits) || 0), 0)
     if (sum > 0) return sum
   }
-  return p && p.spend ? p.spend.approvedCredits : null
+  return null
 }
 
-// One description per need: what the person decides, and the single message
-// the primary button sends.
+// One description per need: what the person decides and the answer each button
+// posts to the production's /decide route. When the record lacks what an answer
+// must name (the statement version, the quoted figure, the take), the model is
+// `pending`: the card reads the production again and says 'Updating', never
+// guessing and never asking through the chat. A `text` action is a question or
+// a request only the agent can act on; it goes to the card's own chat.
 function needsModel(p, extra = {}) {
   if (!p) return null
   const ref = filmRef(p)
@@ -689,13 +805,13 @@ function needsModel(p, extra = {}) {
         icon: 'law',
         headline: 'Agree to the rights statement',
         body: `SLOPCANNON renders nothing until you confirm you hold the rights to the files below${version ? ` (statement ${version})` : ''}.`,
-        primary: version
-          ? { label: 'I agree, continue', decide: { gate: 'rights', version } }
-          : { label: 'I agree, continue', text: `I agree to the SLOPCANNON rights statement for these files; continue the film ${ref}.` }
+        primary: version ? { label: 'I agree, continue', decide: { gate: 'rights', version } } : null,
+        pending: !version
       }
     }
     case 'approval': {
       const n = needsTotalCredits(p)
+      const total = int(d.totalCannonCredits) // the exact figure the gate accepts
       const scenes = arr(d.quotes).length || (p.counts && p.counts.total) || 0
       const have = int(extra.available)
       const parts = []
@@ -712,10 +828,8 @@ function needsModel(p, extra = {}) {
         headline: n !== null ? `Approve ${fmtCredits(n)} Cannon Credits` : 'Approve the quote',
         body: parts.join(' \u00b7 '),
         planActions: true,
-        primary:
-          n !== null
-            ? { label: `Approve ${fmtCredits(n)} credits`, decide: { gate: 'approval', credits: n } }
-            : { label: 'Approve the quote', text: `Approve the quoted Cannon Credits for ${ref}.` }
+        primary: total !== null ? { label: `Approve ${fmtCredits(total)} credits`, decide: { gate: 'approval', credits: total } } : null,
+        pending: total === null
       }
     }
     case 'budget': {
@@ -732,10 +846,8 @@ function needsModel(p, extra = {}) {
         icon: 'credit-card',
         headline: 'The approved budget is used up',
         body: `${parts.length ? `Cannon Credits: ${parts.join(', ')}. ` : ''}Continuing needs a higher ceiling${exposure !== null ? ` of ${fmtCredits(exposure)} credits` : ''}.`,
-        primary:
-          exposure !== null
-            ? { label: `Approve ${fmtCredits(exposure)} credits`, decide: { gate: 'budget', credits: exposure } }
-            : { label: 'Raise the budget', text: `Raise the approved Cannon Credits budget for ${ref} enough to finish it.` }
+        primary: exposure !== null ? { label: `Approve ${fmtCredits(exposure)} credits`, decide: { gate: 'budget', credits: exposure } } : null,
+        pending: exposure === null
       }
     }
     case 'first_scene_review':
@@ -744,9 +856,9 @@ function needsModel(p, extra = {}) {
         icon: 'eye',
         headline: 'Review the first scene',
         body: 'The first scene is rendered. Watch it before the rest of the film is rendered.',
-        primary: str(d.sha256)
-          ? { label: 'Looks good, render the rest', decide: { gate: 'first_scene_review', sha256: str(d.sha256) } }
-          : { label: 'Looks good, continue', text: `I reviewed the first scene; continue the film ${ref}.` },
+        primary: str(d.sha256) ? { label: 'Looks good, render the rest', decide: { gate: 'first_scene_review', sha256: str(d.sha256) } } : null,
+        pending: !str(d.sha256),
+        // No gate rewrites a direction before the rest is bought: that is the agent's work.
         secondary: [{ label: 'Change the direction', text: `I want to change the direction of the first scene of ${ref}.` }]
       }
     case 'scene_review': {
@@ -770,6 +882,7 @@ function needsModel(p, extra = {}) {
         primary: str(d.sha256)
           ? { label: next ? `Keep it, render scene ${index !== null ? index + 1 : 'next'}` : 'Keep it, cut the film', decide: { gate: 'scene_review', sha256: str(d.sha256) } }
           : null,
+        pending: !str(d.sha256),
         noteScene: scene || null,
         secondary: scene ? [{ label: 'Reroll this scene', decide: { gate: 'reroll', reroll: [scene] }, note: true }] : []
       }
@@ -793,6 +906,7 @@ function needsModel(p, extra = {}) {
         headline: n !== null ? `Approve ${fmtCredits(n)} credits for ${plural(scenes.length || 1, 'new take')}` : 'Approve the new takes',
         body: `${scenes.length ? `${scenes.map(s => s.toUpperCase()).join(', ')} render` : 'They render'} again together, then the film is cut with them. The current takes stay available.`,
         primary: n !== null ? { label: `Approve ${fmtCredits(n)} credits`, decide: { gate: 'reroll_approval', credits: n } } : null,
+        pending: n === null,
         secondary: [{ label: 'Keep the current takes', decide: { gate: 'reroll_approval', cancel: true } }]
       }
     }
@@ -810,6 +924,7 @@ function needsModel(p, extra = {}) {
         icon: 'sync',
         headline: 'Start a new revision',
         body: p.message ? redact(p.message) : 'The direction changed since the last render. A new revision is needed to continue.',
+        // A revision is a new production the agent sets up; no gate answers it.
         primary: { label: 'Start a new revision', text: `Start a new revision of ${ref}.` }
       }
     case 'origin':
@@ -818,7 +933,7 @@ function needsModel(p, extra = {}) {
         icon: 'question',
         headline: 'Your decision is needed',
         body: p.message ? redact(p.message) : 'The production is waiting for a decision about its source.',
-        primary: { label: 'Continue', text: `Continue ${ref}.` }
+        primary: { label: 'Continue', decide: { gate: 'resume' } }
       }
     case 'recovery':
       return {
@@ -835,7 +950,7 @@ function needsModel(p, extra = {}) {
           icon: 'bell-dot',
           headline: 'Your decision is needed',
           body: p.message ? redact(p.message) : 'The production is waiting for you.',
-          primary: { label: 'Continue', text: `Continue ${ref}.` }
+          primary: { label: 'Continue', decide: { gate: 'resume' } }
         }
       }
       return null
@@ -881,11 +996,12 @@ const guard = (node, fallback = null, resetKey) => h(Guard, { fallback, resetKey
 
 // -----------------------------------------------------------------------------
 // Styles. Disk plugins are not scanned by Tailwind, so layout lives here and
-// every colour is a theme variable. The one literal is black behind video
-// frames (letterbox), which is the film's, not the theme's.
+// every colour is a theme variable. The one literal is --sc-letterbox, the
+// black behind video frames, which is the film's, not the theme's. Core
+// primitives (LogView, Codicon, the media player) keep their own styling.
 
 const CSS = `
-.sc-page,.sc-wrap,.sc-status{--sc-err:var(--color-destructive,var(--dt-destructive,var(--ui-red)));--sc-pop:var(--color-popover,var(--ui-bg-elevated))}
+.sc-page,.sc-wrap{--sc-err:var(--color-destructive,var(--dt-destructive,var(--ui-red)));--sc-pop:var(--color-popover,var(--ui-bg-elevated));--sc-letterbox:black}
 .sc-page{height:100%;min-height:0;overflow:auto;container-type:inline-size;color:var(--ui-text-primary);font-size:.8125rem;line-height:1.45}
 .sc-studio{display:grid;grid-template-columns:268px minmax(0,1fr);min-height:100%}
 .sc-side{display:flex;flex-direction:column;gap:14px;min-width:0;padding:18px 8px 24px 16px}
@@ -905,12 +1021,12 @@ const CSS = `
 .sc-loader svg{width:100%;height:100%}
 .sc-group{display:flex;flex-direction:column;gap:1px;min-width:0}
 .sc-group>.sc-label{padding:0 8px 6px}
-.sc-prow{all:unset;box-sizing:border-box;display:grid;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:center;min-width:0;padding:6px 8px;border-radius:3px;cursor:pointer;transition:background-color .1s}
+.sc-prow{display:grid;width:100%;border:0;background:none;color:inherit;font:inherit;text-align:start;grid-template-columns:64px minmax(0,1fr);gap:10px;align-items:center;min-width:0;padding:6px 8px;border-radius:3px;cursor:pointer;transition:background-color .1s}
 .sc-prow:hover{background:var(--ui-row-hover-background);transition:none}
 .sc-prow[data-selected=true]{background:var(--ui-row-active-background)}
 .sc-prow:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
 .sc-thumb{display:block;width:64px;aspect-ratio:16/9;border-radius:2px;overflow:hidden;background:var(--ui-bg-quaternary)}
-.sc-thumb[data-ready=true]{background:black}
+.sc-thumb[data-ready=true]{background:var(--sc-letterbox)}
 .sc-thumb img{display:block;width:100%;height:100%;object-fit:cover}
 .sc-ptext{display:flex;flex-direction:column;gap:2px;min-width:0}
 .sc-ptitle{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -918,8 +1034,6 @@ const CSS = `
 .sc-acct{display:flex;align-items:center;justify-content:flex-end;gap:6px 14px;flex-wrap:wrap;min-height:20px;font-size:.75rem;color:var(--ui-text-tertiary)}
 .sc-acct b{color:var(--ui-text-primary);font-weight:600}
 .sc-acct-item{display:inline-flex;align-items:center;gap:6px;min-width:0}
-.sc-okdot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ui-green);flex:none}
-.sc-warndot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--ui-yellow);flex:none}
 .sc-head{display:flex;align-items:flex-end;gap:10px 16px;flex-wrap:wrap}
 .sc-head-text{min-width:0;flex:1 1 320px}
 .sc-h1{margin:4px 0 6px;font-size:1.375rem;line-height:1.2;font-weight:600;overflow-wrap:anywhere}
@@ -946,27 +1060,25 @@ const CSS = `
 .sc-decide-acts{grid-row:1/3;grid-column:2;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 @container (max-width:700px){.sc-decide{grid-template-columns:minmax(0,1fr)}.sc-decide-acts{grid-row:auto;grid-column:auto;justify-content:flex-start;margin-top:6px}}
 .sc-detail-extra{display:flex;flex-direction:column;gap:8px;min-width:0}
-.sc-statement{max-height:180px;overflow:auto;white-space:pre-wrap;font-size:.75rem;line-height:1.5;color:var(--ui-text-secondary);padding:10px 0;border-top:1px solid var(--ui-stroke-tertiary)}
+.sc-statement{max-height:180px;overflow:auto;white-space:pre-wrap;font-size:.75rem;line-height:1.5;color:var(--ui-text-secondary)}
 .sc-files{display:flex;flex-direction:column;gap:2px;font-size:.75rem;color:var(--ui-text-secondary)}
 .sc-files span{display:flex;gap:6px;align-items:center}
 .sc-table{display:grid;grid-template-columns:auto 1fr auto;gap:2px 14px;font-size:.75rem;align-items:baseline;max-width:360px}
 .sc-cell-r{text-align:right;font-variant-numeric:tabular-nums}
-.sc-flagrow{display:flex;flex-direction:column;gap:4px;padding:8px 0;border-top:1px solid var(--ui-stroke-tertiary)}
+.sc-flagrow{display:flex;flex-direction:column;gap:4px;padding:4px 0}
 .sc-flagrow-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.sc-note{width:100%;min-height:44px;padding:7px 9px;resize:vertical;font:inherit;font-size:.8125rem;line-height:1.45;color:var(--ui-text-primary,inherit);background:transparent;border:1px solid var(--ui-stroke-secondary);border-radius:6px;outline:none}
-.sc-note:focus{border-color:var(--ui-accent)}
-.sc-note::placeholder{color:var(--ui-text-tertiary,var(--ui-text-secondary))}
-.sc-chooser-go{display:flex;justify-content:flex-end;padding-top:8px;border-top:1px solid var(--ui-stroke-tertiary)}
+.sc-note{width:100%;resize:vertical}
+.sc-chooser-go{display:flex;justify-content:flex-end;padding-top:6px}
 .sc-issues{display:flex;flex-direction:column;gap:2px;margin:0;padding:0;list-style:none;font-size:.75rem;color:var(--ui-text-secondary)}
 .sc-issues li{display:flex;gap:6px}
-.sc-film{position:relative;width:100%;max-height:60vh;overflow:hidden;background:black}
+.sc-film{position:relative;width:100%;max-height:60vh;overflow:hidden;background:var(--sc-letterbox)}
 .sc-film>video,.sc-film>img{position:absolute;inset:0;display:block;width:100%;height:100%}
 .sc-film>video{object-fit:contain}
 .sc-film>img{object-fit:cover}
 .sc-film[data-portrait=true]>img{object-fit:contain}
 .sc-film[data-started=false]>video{opacity:0}
 .sc-film[data-started=false][data-has-poster=false]>video{opacity:1}
-.sc-stage{display:flex;justify-content:center;min-width:0;background:black;--sc-cap:clamp(220px,calc(100vh - 540px),620px)}
+.sc-stage{display:flex;justify-content:center;min-width:0;background:var(--sc-letterbox);--sc-cap:clamp(220px,calc(100vh - 540px),620px)}
 .sc-stage>.sc-film{flex:none;width:min(100%,calc(var(--sc-cap) * var(--sc-ar,1.7778)));max-height:none}
 .sc-stage>.sc-film-fallback{flex:1;padding:12px;background:var(--ui-bg-secondary)}
 .sc-posterbar{display:flex;align-items:center;justify-content:flex-end;gap:2px 8px;flex-wrap:wrap;min-height:24px;margin-top:-12px;font-size:.6875rem;color:var(--ui-text-tertiary)}
@@ -976,8 +1088,8 @@ const CSS = `
 .sc-film[data-compact=true] .sc-film-over{left:12px;right:12px;bottom:10px}
 .sc-ontime{margin-left:auto;padding:1px 6px;border-radius:3px;font-size:.6875rem;color:var(--ui-text-secondary);background:color-mix(in srgb,var(--sc-pop) 82%,transparent)}
 .sc-probe{display:none}
-.sc-wrap img,.sc-wrap video,.sc-page img,.sc-page video{margin:0;max-width:none;border-radius:0}
-.sc-wrap h4,.sc-wrap p,.sc-wrap figcaption{margin:0}
+.sc-film>img,.sc-film>video,.sc-thumb img,.sc-seg img{margin:0;max-width:none;border-radius:0}
+.sc-wclip>figcaption{margin:0}
 .sc-tl{display:flex;flex-direction:column;gap:6px;min-width:0}
 .sc-tl-head{display:flex;align-items:baseline;gap:4px 10px;flex-wrap:wrap}
 .sc-tl-head .sc-mono{font-size:.6875rem;color:var(--ui-text-tertiary)}
@@ -986,7 +1098,7 @@ const CSS = `
 .sc-tl[data-compact=true] .sc-track{height:40px}
 .sc-seg{all:unset;box-sizing:border-box;position:relative;flex:1 1 0;min-width:6px;display:flex;overflow:hidden;background:var(--ui-bg-quaternary)}
 button.sc-seg{cursor:pointer}
-.sc-seg[data-ready=true]{background:black}
+.sc-seg[data-ready=true]{background:var(--sc-letterbox)}
 .sc-seg img{flex:none;height:100%;width:auto;max-width:none;opacity:.88;transition:opacity .1s}
 button.sc-seg:hover img{opacity:1;transition:none}
 .sc-seg[data-selected=true]{outline:2px solid var(--ui-accent);outline-offset:2px;z-index:1}
@@ -1000,7 +1112,7 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-seg[data-kind=now] .sc-tag{background:none;color:var(--ui-accent)}
 .sc-seg[data-kind=failed] .sc-tag{background:none;color:var(--sc-err)}
 .sc-tl[data-compact=true] .sc-tag{font-size:.59375rem}
-.sc-flag{position:absolute;right:3px;top:3px;display:grid;place-items:center;width:14px;height:14px;border-radius:2px;background:var(--ui-yellow);color:black;font-size:10px;font-weight:800;line-height:1}
+.sc-flag{position:absolute;right:3px;top:3px;display:grid;place-items:center;width:14px;height:14px;border-radius:2px;background:var(--ui-yellow);font-size:10px;font-weight:800;line-height:1}
 .sc-tl[data-compact=true] .sc-flag{width:12px;height:12px;font-size:9px}
 .sc-wave{display:block;width:100%;height:30px;color:var(--ui-text-tertiary);opacity:.4}
 .sc-tl[data-compact=true] .sc-wave{height:20px}
@@ -1019,9 +1131,6 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-verdict{display:flex;gap:10px;padding:10px 0;border-top:1px solid var(--ui-stroke-tertiary)}
 .sc-verdict>.codicon{flex:none;margin-top:2px;line-height:1}
 .sc-verdict>.codicon,.sc-line>.codicon,.sc-step .codicon{align-self:flex-start}
-/* A spinning glyph turns about its own box; a box stretched by a flex row is taller than the glyph, so it
-   would swing the arc around an off-centre point instead of turning it in place. */
-[class^='sc-'] .codicon-modifier-spin,[class*=' sc-'] .codicon-modifier-spin{display:inline-flex;align-items:center;justify-content:center;width:1em;height:1em;line-height:1;transform-origin:50% 50%}
 .sc-verdict b{display:block;margin-bottom:2px;font-weight:600}
 .sc-verdict span{color:var(--ui-text-secondary);overflow-wrap:anywhere}
 .sc-warn{color:var(--ui-yellow)}
@@ -1034,10 +1143,9 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-insp .sc-acts{margin-top:4px}
 .sc-details>summary{display:inline-flex;align-items:center;gap:4px;cursor:pointer;list-style:none;font-size:.75rem;color:var(--ui-text-tertiary)}
 .sc-details>summary::-webkit-details-marker{display:none}
-.sc-details>summary .codicon{transition:transform .1s}
-.sc-details[open]>summary .codicon{transform:rotate(90deg)}
 .sc-details>*+*{margin-top:8px}
-.sc-log{max-height:240px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem;line-height:1.5;color:var(--ui-text-secondary)}
+.sc-log{max-height:240px}
+pre.sc-log{margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:.6875rem;line-height:1.5;color:var(--ui-text-secondary)}
 .sc-first{display:flex;flex-direction:column;gap:18px;min-width:0;padding-top:6px}
 .sc-first-tl .sc-wave{opacity:.28}
 .sc-first-tl .sc-seg[data-kind=plan]{box-shadow:inset 0 0 0 1px var(--ui-stroke-secondary)}
@@ -1056,8 +1164,8 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-wc-head>.codicon{color:var(--ui-text-tertiary)}
 .sc-wc-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 .sc-wc-body{display:flex;flex-direction:column;gap:8px;padding:12px 14px 13px;min-width:0}
-.sc-wc-decide{display:flex;flex-direction:column;gap:2px;padding:11px 14px;background:color-mix(in srgb,var(--ui-accent) 9%,transparent)}
-.sc-wc-decide[data-tone=error]{background:color-mix(in srgb,var(--sc-err) 9%,transparent)}
+.sc-wc-decide{display:flex;flex-direction:column;gap:2px;padding:4px 14px 8px}
+.sc-wc-decide[data-tone=error] b{color:var(--sc-err)}
 .sc-wc-decide b{font-weight:600}
 .sc-wc-decide span{color:var(--ui-text-secondary);overflow-wrap:anywhere}
 .sc-wc-acts{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:8px}
@@ -1070,12 +1178,10 @@ button.sc-seg:focus-visible{outline:2px solid var(--ui-accent);outline-offset:2p
 .sc-line{display:flex;align-items:flex-start;gap:7px;font-size:.75rem;color:var(--ui-text-secondary)}
 .sc-line>.codicon{flex:none;margin-top:2px;line-height:1}
 .sc-line>span{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.sc-status{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;gap:4px;height:100%;padding:0 7px;font-size:.6875rem;color:var(--ui-text-tertiary);cursor:pointer;font-variant-numeric:tabular-nums;white-space:nowrap;transition:background-color .1s,color .1s}
-.sc-status:hover{background:var(--chrome-action-hover);color:var(--ui-text-primary);transition:none}
-.sc-status:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}
-.sc-status b{font-weight:600;color:var(--ui-text-secondary)}
-.sc-status-attn{color:var(--ui-accent)}
-@media (prefers-reduced-motion:reduce){.sc-page *,.sc-wcard *,.sc-status{transition:none!important;animation:none!important}}
+.sc-sb{font-variant-numeric:tabular-nums}
+.sc-sb b{font-weight:600;color:var(--ui-text-secondary)}
+.sc-sb-attn{color:var(--ui-accent)}
+@media (prefers-reduced-motion:reduce){.sc-page *,.sc-wcard *{transition:none!important;animation:none!important}}
 `
 
 function installStyles(ctx) {
@@ -1207,7 +1313,6 @@ function useMedia(id, running) {
       const d = query && query.state ? query.state.data : null
       return d && d.pending ? 2_500 : running ? 2 * FAST_POLL_MS : 60_000
     },
-    refetchIntervalInBackground: true,
     staleTime: 2_000,
     retry: 1
   })
@@ -1260,6 +1365,10 @@ function Frame({ name, className, alt = '' }) {
 // probe renders the line and the player reads the source from it; if the
 // probe yields nothing, the built-in player is shown as it is.
 
+// Why the probe exists: the SDK exports no path -> playable URL resolver outside a tool media renderer (whose
+// `file.resolveUrl()` the clip cards use), and Desktop's own pipeline is the only way a backend file plays
+// with the host's ticketing. The probe renders that pipeline in a hidden node of our own and reads the source
+// it settles on; the query and the observer are scoped to that node, never to the app's DOM.
 function MediaProbe({ path, onSrc, visible }) {
   const ref = useRef(null)
   useEffect(() => {
@@ -1289,7 +1398,7 @@ function MediaProbe({ path, onSrc, visible }) {
   const q = path.includes('"') ? '`' : '"'
   return h(
     'div',
-    { ref, className: visible ? 'sc-probe-visible' : 'sc-probe', 'aria-hidden': visible ? undefined : true },
+    { ref, className: visible ? undefined : 'sc-probe', 'aria-hidden': visible ? undefined : true },
     guard(h(MessageTextContent, { text: `MEDIA:${q}${path}${q}` }), visible ? h(RevealFallback, { path }) : null, path)
   )
 }
@@ -1341,7 +1450,7 @@ function PosterBar({ production, film, paused, filmApi }) {
       setBusy(false)
     }
   }
-  const useFrame = () => {
+  const takeFrame = () => {
     const t = filmApi.current && filmApi.current.timeMs()
     if (num(t) === null) return undefined
     return choose(Math.max(0, Math.round(t)))
@@ -1352,7 +1461,7 @@ function PosterBar({ production, film, paused, filmApi }) {
     : film.posterAtMs !== null
       ? `Poster ${fmtClock(film.posterAtMs)} \u00b7 ${film.posterChosen ? 'your pick' : 'picked automatically'}`
       : null
-  const useBtn = h(Btn, { label: 'Use this frame as poster', iconName: 'device-camera', variant: 'ghost', size: 'xs', disabled: !paused || busy, onClick: useFrame })
+  const useBtn = h(Btn, { label: 'Use this frame as poster', iconName: 'device-camera', variant: 'ghost', size: 'xs', disabled: !paused || busy, onClick: takeFrame })
   return h(
     'div',
     { className: 'sc-posterbar' },
@@ -1534,13 +1643,9 @@ function askForVideo() {
     } catch {
       ok = false
     }
-    if (!ok && tries < 6) {
-      if (CTX && typeof CTX.setTimeout === 'function') CTX.setTimeout(fill, 250)
-      else setTimeout(fill, 250)
-    }
+    if (!ok && tries < 6) wait(fill, 250)
   }
-  if (CTX && typeof CTX.setTimeout === 'function') CTX.setTimeout(fill, 150)
-  else setTimeout(fill, 150)
+  wait(fill, 150)
 }
 
 // -----------------------------------------------------------------------------
@@ -1599,8 +1704,26 @@ function Wave({ wave, totalMs }) {
   )
 }
 
-function SegStrip({ name }) {
-  return h(Frame, { name })
+// The check flag's mark in the theme's own readable ink (the SDK's readableOn) for whatever --ui-yellow the
+// theme paints; it is measured again when the theme changes.
+function useThemeKey() {
+  const t = typeof sdk.useTheme === 'function' ? sdk.useTheme() : null
+  return t ? `${t.themeName}:${t.renderedMode}` : ''
+}
+
+function Flag() {
+  const ref = useRef(null)
+  const theme = useThemeKey()
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el || typeof sdk.readableOn !== 'function') return
+    try {
+      el.style.color = sdk.readableOn(getComputedStyle(el).backgroundColor)
+    } catch {
+      // keep the inherited colour
+    }
+  }, [theme])
+  return h('span', { ref, className: 'sc-flag', 'aria-hidden': true }, '!')
 }
 
 function checksSummary(p) {
@@ -1649,7 +1772,7 @@ function SceneTrack({ production, media, selectedId, onSelect, timeMs, compact }
       'data-selected': selectedId === r.id ? 'true' : 'false',
       'aria-label': label
     }
-    const inner = [ready ? h(SegStrip, { key: 'img', name: m.strip }) : null, h('span', { key: 'tag', className: 'sc-tag sc-mono' }, tag), flag ? h('span', { key: 'flag', className: 'sc-flag', 'aria-hidden': true }, '!') : null]
+    const inner = [ready ? h(Frame, { key: 'img', name: m.strip }) : null, h('span', { key: 'tag', className: 'sc-tag sc-mono' }, tag), flag ? h(Flag, { key: 'flag' }) : null]
     return onSelect
       ? h('button', { ...props, type: 'button', 'aria-pressed': selectedId === r.id, onClick: () => onSelect(r.id) }, inner)
       : h('div', { ...props, role: 'img' }, inner)
@@ -1757,22 +1880,15 @@ function verdictOf(scene, p) {
         return { tone: 'run', icon: 'clock', title: 'Queued', text: 'Waiting for a render slot.' }
       case 'quoted':
       case 'unsubmitted':
-        if (scene.rerolled) return { tone: 'run', icon: 'sync', title: 'New take quoted', text: 'It renders once you approve its quote in chat.' }
+        if (scene.rerolled) return { tone: 'run', icon: 'sync', title: 'New take quoted', text: 'It renders once its quote is approved on the film card.' }
         break
       case 'failed':
         return { tone: 'err', icon: 'error', title: 'The render failed', text: 'Reroll it, or ask Hermes what went wrong.' }
       case 'uncertain':
         return { tone: 'warn', icon: 'warning', title: 'Not sure the render started', text: 'Hermes can recover it without paying twice.' }
       default:
-        return {
-          tone: 'mute',
-          icon: 'circle-large-outline',
-          title: 'Not rendered yet',
-          text: scene.quoteCredits !== null ? `Quoted at ${fmtCredits(scene.quoteCredits)} credits. It renders after the quote is approved.` : 'It renders after the quote is approved.'
-        }
+        break
     }
-  }
-  if (!scene.clip) {
     return {
       tone: 'mute',
       icon: 'circle-large-outline',
@@ -1814,7 +1930,7 @@ function sceneFacts(scene) {
   }
 }
 
-function sceneActions(scene, p, send, { compact } = {}) {
+function sceneActions(scene, p, { compact } = {}) {
   const out = []
   const flagged = scene.clip && scene.check && scene.check.verdict === 'fail' && !scene.checkAccepted
   // A flagged take at the take check is answered in the decision above (keep or reroll, all at once).
@@ -1834,17 +1950,46 @@ function ActionRow({ actions, className = 'sc-acts' }) {
   return h(
     'div',
     { className },
-    actions.filter(Boolean).map(a => (a.node ? h(Fragment, { key: a.key }, a.node) : h(Btn, { key: a.key, label: a.label, iconName: a.iconName, variant: a.variant || 'ghost', size: 'sm', disabled: a.disabled, loading: a.loading, onClick: a.onClick })))
+    actions.filter(Boolean).map(a => {
+      if (a.node) return h(Fragment, { key: a.key }, a.node)
+      const button = h(Btn, { label: a.label, iconName: a.iconName, variant: a.variant || 'ghost', size: 'sm', disabled: a.disabled, loading: a.loading, onClick: a.onClick })
+      // A disabled button takes no hover, so its tip sits on a wrapper.
+      return a.tip && Tip ? h(Tip, { key: a.key, label: a.tip }, h('span', { className: 'sc-tipwrap' }, button)) : h(Fragment, { key: a.key }, button)
+    })
   )
 }
 
-function SceneInspector({ production, scene, media, send, hideClip }) {
+// A decision the card cannot answer from what it holds: read the production again (now, then a few times)
+// instead of guessing, and say so quietly.
+function Updating({ productionId }) {
+  const scope = useScopeKey()
+  useEffect(() => {
+    let left = 6
+    const refetch = () => {
+      try {
+        queryClient.invalidateQueries({ queryKey: keys.detail(scope, productionId) })
+      } catch {
+        // no client: the regular poll catches up
+      }
+    }
+    refetch()
+    const stop = every(() => {
+      left -= 1
+      if (left <= 0) stop()
+      refetch()
+    }, FAST_POLL_MS)
+    return stop
+  }, [scope, productionId])
+  return h(Waiting, { label: 'Updating' })
+}
+
+function SceneInspector({ production, scene, media, hideClip }) {
   const [open, setOpen] = useState(false)
   useEffect(() => setOpen(false), [scene.id])
   const v = verdictOf(scene, production)
   const f = sceneFacts(scene)
   const m = media && media.scenes[scene.id]
-  const actions = sceneActions(scene, production, send)
+  const actions = sceneActions(scene, production)
   if (scene.beat) actions.push({ key: 'dir', label: open ? 'Hide direction' : 'Show direction', variant: 'ghost', onClick: () => setOpen(x => !x) })
   return h(
     'section',
@@ -1889,19 +2034,41 @@ function pickScene(p) {
 // -----------------------------------------------------------------------------
 // The decision (studio: actions inside, on the right; chat: actions below the card)
 
+// Gate answers go to the production; a `text` action is for the agent and needs a chat to go to (`send`), so
+// without one it is left out (the film card then says where to ask).
 function decisionActions(production, model, send, { inChat, busy, note } = {}) {
   const out = []
   // A reroll asked with a note: the note is the new take's direction (else the production derives one).
   const said = a => (a.note && str(note).trim() && model.noteScene ? { ...a.decide, reroll: [{ scene: model.noteScene, direction: str(note).trim().slice(0, 600) }] } : a.decide)
+  const usable = a => Boolean(a && (a.decide || send))
   const run = a => (a.decide ? decideOnCard(production, said(a)) : send(a.text))
-  if (model.primary) out.push({ key: 'primary', label: model.primary.label, variant: 'default', disabled: busy, loading: busy && Boolean(model.primary.decide), onClick: () => run(model.primary) })
-  arr(model.secondary).forEach(s => out.push({ key: s.label, label: s.label, variant: inChat ? 'ghost' : 'secondary', disabled: busy, onClick: () => run(s) }))
+  if (model.pending) out.push({ key: 'updating', node: h(Updating, { productionId: production.id }) })
+  if (usable(model.primary)) out.push({ key: 'primary', label: model.primary.label, variant: 'default', disabled: busy, loading: busy && Boolean(model.primary.decide), onClick: () => run(model.primary) })
+  arr(model.secondary)
+    .filter(usable)
+    .forEach(s => out.push({ key: s.label, label: s.label, variant: inChat ? 'ghost' : 'secondary', disabled: busy, onClick: () => run(s) }))
   if (inChat) {
     if (model.planActions) out.push({ key: 'plan', label: 'See the scene plan', onClick: () => openStudio(production.id) })
     else out.push({ key: 'studio', label: 'Open in studio', onClick: () => openStudio(production.id) })
   }
-  if (model.planActions) out.push({ key: 'change', label: 'Change the plan', variant: 'ghost', onClick: () => send(`I want to change the plan for ${filmRef(production)} before approving it.`) })
+  if (model.planActions && send) out.push({ key: 'change', label: 'Change the plan', variant: 'ghost', onClick: () => send(`I want to change the plan for ${filmRef(production)} before approving it.`) })
   return out
+}
+
+// True when the model has something to ask the agent that this surface cannot send.
+function asksWithoutChat(model, send) {
+  if (!model || send) return false
+  return Boolean((model.primary && !model.primary.decide) || arr(model.secondary).some(s => !s.decide) || model.planActions)
+}
+
+function Disclosure({ label, children }) {
+  const [open, setOpen] = useState(false)
+  return h(
+    'details',
+    { className: 'sc-details', onToggle: e => setOpen(e.currentTarget.open) },
+    h('summary', null, DisclosureCaret ? h(DisclosureCaret, { open }) : icon('chevron-right'), label),
+    open ? children : null
+  )
 }
 
 function Decision({ production, model, send }) {
@@ -1915,7 +2082,7 @@ function Decision({ production, model, send }) {
   )
 }
 
-function NeedsDetail({ production, send }) {
+function NeedsDetail({ production }) {
   const detail = obj(production.needsDetail)
   switch (production.needs) {
     case 'rights': {
@@ -1949,7 +2116,7 @@ function NeedsDetail({ production, send }) {
       if (total !== null) {
         cells.push(h('b', { key: 'tl' }, 'Total'), h('span', { key: 'tg' }), h('b', { key: 'tc', className: 'sc-cell-r' }, `${fmtCredits(total)} cr`))
       }
-      return h('details', { className: 'sc-details' }, h('summary', null, icon('chevron-right'), 'Quote by scene'), h('div', { className: 'sc-table' }, cells))
+      return h(Disclosure, { label: 'Quote by scene' }, h('div', { className: 'sc-table' }, cells))
     }
     case 'shot_review':
       return h(ShotChooser, { production })
@@ -1957,6 +2124,11 @@ function NeedsDetail({ production, send }) {
       return null
   }
 }
+
+const KEEP_OR_REROLL = [
+  { id: 'keep', label: 'Keep' },
+  { id: 'reroll', label: 'Reroll' }
+]
 
 // Keep or reroll, per flagged take, then one answer for all of them: kept takes are accepted and every reroll is
 // quoted together (the card then asks for that one approval).
@@ -1977,8 +2149,18 @@ function ShotChooser({ production }) {
     : reroll.length
       ? `Quote ${plural(reroll.length, 'new take')}${price ? ` \u00b7 about ${fmtCredits(price)} credits` : ''}`
       : keep.length === 1 ? 'Keep it and finish the film' : 'Keep them and finish the film'
-  const choice = (scene, value, label) =>
-    h(Btn, { label, size: 'xs', variant: pick[scene] === value ? 'default' : 'secondary', disabled: busy, ariaLabel: `${label} ${scene}`, onClick: () => setPick({ ...pick, [scene]: value }) })
+  const choose = (scene, value) => setPick(prev => ({ ...prev, [scene]: value }))
+  // Keep or reroll is one choice of two per take: the SDK's segmented control, labelled by its scene.
+  const choice = scene =>
+    SegmentedControl
+      ? h('div', { role: 'group', 'aria-label': `Keep or reroll ${scene.toUpperCase()}` }, h(SegmentedControl, { options: KEEP_OR_REROLL, value: pick[scene], disabled: busy, onChange: v => choose(scene, v) }))
+      : h(
+          Fragment,
+          null,
+          KEEP_OR_REROLL.map(o =>
+            h(Btn, { key: o.id, label: o.label, size: 'xs', variant: pick[scene] === o.id ? 'default' : 'secondary', disabled: busy, ariaLabel: `${o.label} ${scene}`, onClick: () => choose(scene, o.id) })
+          )
+        )
   return h(
     'div',
     { className: 'sc-detail-extra sc-chooser' },
@@ -1997,7 +2179,7 @@ function ShotChooser({ production }) {
       return h(
         'div',
         { key: `${scene}-${i}`, className: 'sc-flagrow' },
-        h('div', { className: 'sc-flagrow-head' }, h('b', { className: 'sc-mono' }, scene.toUpperCase()), h('span', { className: 'sc-spacer' }), choice(scene, 'keep', 'Keep'), choice(scene, 'reroll', 'Reroll')),
+        h('div', { className: 'sc-flagrow-head' }, h('b', { className: 'sc-mono' }, scene.toUpperCase()), h('span', { className: 'sc-spacer' }), choice(scene)),
         issues.length ? h(IssueList, { issues }) : null
       )
     }),
@@ -2029,6 +2211,8 @@ function IssueList({ issues }) {
 // -----------------------------------------------------------------------------
 // Studio: account (quiet text, top right)
 
+const dot = tone => (StatusDot ? h(StatusDot, { tone }) : null)
+
 const VIA_LABEL = { 'hermes sign-in': 'Signed in with Hermes', 'personal token': 'Signed in with a personal token' }
 
 function Account({ brief } = {}) {
@@ -2040,7 +2224,7 @@ function Account({ brief } = {}) {
   const s = status.data
   if (!s.connected) {
     // On the first run the sign-in command sits beside the first action instead (said once).
-    if (brief) return h('div', { className: 'sc-acct' }, h('span', { className: 'sc-acct-item' }, h('span', { className: 'sc-warndot', 'aria-hidden': true }), 'Not signed in'))
+    if (brief) return h('div', { className: 'sc-acct' }, h('span', { className: 'sc-acct-item' }, dot('warn'), 'Not signed in'))
     return h(
       'div',
       { className: 'sc-acct' },
@@ -2053,13 +2237,13 @@ function Account({ brief } = {}) {
   const expiresMs = s.expiresAt ? s.expiresAt * 1000 : null
   const expired = expiresMs !== null && expiresMs <= Date.now()
   const svcDown = s.service.submissionReady === false
-  const signedIn = h('span', { className: 'sc-acct-item' }, h('span', { className: expired ? 'sc-warndot' : 'sc-okdot', 'aria-hidden': true }), expired ? 'Session expired' : VIA_LABEL[s.via] || 'Signed in')
+  const signedIn = h('span', { className: 'sc-acct-item' }, dot(expired ? 'warn' : 'good'), expired ? 'Session expired' : VIA_LABEL[s.via] || 'Signed in')
   return h(
     'div',
     { className: 'sc-acct' },
     expiresMs && !expired && Tip ? h(Tip, { label: `Session renews ${fmtWhen(expiresMs)} (${fmtWhenAbsolute(expiresMs)})` }, signedIn) : signedIn,
-    svcDown ? h('span', { className: 'sc-acct-item' }, h('span', { className: 'sc-warndot', 'aria-hidden': true }), 'SLOPCANNON is not accepting renders right now') : null,
-    s.node && !s.node.ok ? h('span', { className: 'sc-acct-item' }, h('span', { className: 'sc-warndot', 'aria-hidden': true }), s.node.message || 'Node.js is missing on the Hermes machine') : null,
+    svcDown ? h('span', { className: 'sc-acct-item' }, dot('warn'), 'SLOPCANNON is not accepting renders right now') : null,
+    s.node && !s.node.ok ? h('span', { className: 'sc-acct-item' }, dot('warn'), s.node.message || 'Node.js is missing on the Hermes machine') : null,
     s.error ? h('span', { className: 'sc-acct-item' }, redact(s.error)) : null,
     c && c.available !== null
       ? h('span', { className: 'sc-acct-item sc-num' }, h('b', null, fmtCredits(c.available)), 'credits', c.reserved ? h('span', { className: 'sc-faint' }, `${fmtCredits(c.reserved)} held`) : null)
@@ -2098,8 +2282,8 @@ function ProductionRow({ p, selected, onSelect, thumb }) {
   const g = groupOf(p)
   const meta = [p.counts.total ? plural(p.counts.total, 'scene') : null, dur, g === 'running' && when ? `updated ${when}` : g === 'done' || g === 'idle' ? when : null].filter(Boolean).join(' \u00b7 ')
   return h(
-    'button',
-    { type: 'button', className: 'sc-prow', title: p.title, 'data-selected': selected ? 'true' : 'false', 'aria-current': selected ? 'true' : undefined, onClick: () => onSelect(p.id) },
+    RowButton || 'button',
+    { type: 'button', className: 'sc-prow', 'data-selected': selected ? 'true' : 'false', 'aria-current': selected ? 'true' : undefined, onClick: () => onSelect(p.id) },
     h('span', { className: 'sc-thumb', 'data-ready': thumb ? 'true' : 'false', 'aria-hidden': true }, thumb ? h(Frame, { name: thumb }) : null),
     h('span', { className: 'sc-ptext' }, h('span', { className: 'sc-ptitle' }, p.title), h('span', { className: 'sc-pmeta' }, rowChip(p), h('span', { className: 'sc-num' }, meta)))
   )
@@ -2178,9 +2362,9 @@ function filmSubject(p) {
     const row = (p.rows || []).find(r => r.id === str(d.scene)) || (p.rows || [])[0]
     if (clip) return { kind: 'first', path: clip.path, row }
   }
-  if (p.state === 'running' || p.state === 'needs' || p.state === 'idle') {
+  if (p.state === 'running') {
     const row = latestClip(p)
-    if (row && p.state === 'running') return { kind: 'latest', path: row.clip.path, row }
+    if (row) return { kind: 'latest', path: row.clip.path, row }
   }
   return null
 }
@@ -2195,7 +2379,7 @@ function ProductionDetail({ id, summary }) {
   const [paused, setPaused] = useState(false)
   const filmApi = useRef(null)
   if (!p) {
-    if (q.isError) return h('div', { className: 'sc-quiet' }, isNotFound(q.error) ? 'This production no longer exists.' : backendDownText(q.error))
+    if (q.isError) return h('div', { className: 'sc-quiet' }, isMissingProduction(q.error) ? 'This production no longer exists.' : backendDownText(q.error))
     return h(Waiting, { label: 'Opening the production' })
   }
   const send = text => sendFromStudio(p, text)
@@ -2246,7 +2430,7 @@ function ProductionDetail({ id, summary }) {
     ),
     guard(h(Stepper, { production: p })),
     model ? guard(h(Decision, { production: p, model, send }), null, `${p.id}:${p.needs}:${p.state}`) : null,
-    model ? guard(h(NeedsDetail, { production: p, send }), null, `${p.id}:${p.needs}`) : null,
+    model ? guard(h(NeedsDetail, { production: p }), null, `${p.id}:${p.needs}`) : null,
     !model && p.message && p.state !== 'done' ? h('div', { className: 'sc-quiet' }, redact(p.message)) : null,
     p.state === 'running' ? h(Progress, { production: p }) : null,
     subject
@@ -2273,14 +2457,9 @@ function ProductionDetail({ id, summary }) {
     subject && subject.kind === 'film' && media ? guard(h(PosterBar, { production: p, film: media.film, paused, filmApi }), null, p.id) : null,
     rows.length ? guard(h(SceneTrack, { production: p, media, selectedId: selected && selected.id, onSelect, timeMs: subject && subject.kind === 'film' ? t : 0 }), null, p.id) : null,
     !rows.length && p.counts.total ? h(Waiting, { label: 'Reading the scenes' }) : null,
-    selected ? guard(h(SceneInspector, { production: p, scene: selected, media, send, hideClip: Boolean(subject && subject.row && subject.row.id === selected.id) }), null, `${p.id}:${selected.id}`) : null,
+    selected ? guard(h(SceneInspector, { production: p, scene: selected, media, hideClip: Boolean(subject && subject.row && subject.row.id === selected.id) }), null, `${p.id}:${selected.id}`) : null,
     p.log && p.log.length
-      ? h(
-          'details',
-          { className: 'sc-details' },
-          h('summary', null, icon('chevron-right'), 'Driver log'),
-          LogView ? h(LogView, { className: 'sc-log' }, p.log.map(redact).join('\n')) : h('pre', { className: 'sc-log' }, p.log.map(redact).join('\n'))
-        )
+      ? h(Disclosure, { label: 'Driver log' }, LogView ? h(LogView, { className: 'sc-log' }, p.log.map(redact).join('\n')) : h('pre', { className: 'sc-log' }, p.log.map(redact).join('\n')))
       : null
   )
 }
@@ -2418,41 +2597,28 @@ function StudioPage() {
 }
 
 // -----------------------------------------------------------------------------
-// Status bar: 'SLOPCANNON 443 cr · 1 rendering'
+// Status bar: 'SLOPCANNON 443 cr · 1 rendering · 1 needs you'. The item is the bar's own StatusbarItem
+// (button, tooltip, a place in the bar's show/hide menu); only this detail is live.
 
-function StatusItem() {
+function StatusDetail() {
   const status = useStatus()
   const productions = useProductions()
   if (!status.data) return null
   const s = status.data
-  if (!s.connected) {
-    const button = h(
-      'button',
-      { type: 'button', className: 'sc-status', onClick: () => openStudio(), 'aria-label': 'SLOPCANNON: not signed in. Open the studio.' },
-      'SLOPCANNON',
-      h('span', { className: 'sc-status-attn' }, 'sign in')
-    )
-    return Tip ? h(Tip, { label: `Not signed in. Run ${s.signInCommand} in a terminal.` }, button) : button
-  }
+  if (!s.connected) return h('span', { className: 'sc-sb-attn' }, 'sign in')
   const list = productions.data || []
   const running = list.filter(p => p.state === 'running').length
   const waiting = list.filter(p => groupOf(p) === 'needs').length
   const c = s.credits
-  const tipParts = []
-  if (c && c.available !== null) tipParts.push(`${fmtCredits(c.available)} Cannon Credits${c.reserved ? `, ${fmtCredits(c.reserved)} held` : ''}`)
-  if (running) tipParts.push(`${plural(running, 'production')} rendering`)
-  if (waiting) tipParts.push(`${plural(waiting, 'production')} waiting for you`)
-  tipParts.push('Open the studio')
-  const tip = tipParts.join('. ')
-  const button = h(
-    'button',
-    { type: 'button', className: 'sc-status', onClick: () => openStudio(), 'aria-label': `SLOPCANNON. ${tip}.` },
-    'SLOPCANNON',
-    c && c.available !== null ? h(Fragment, null, h('b', null, fmtCredits(c.available)), 'cr') : null,
-    running ? h(Fragment, null, h('span', { 'aria-hidden': true }, '\u00b7'), h('b', null, `${running} rendering`)) : null,
-    waiting ? h(Fragment, null, h('span', { 'aria-hidden': true }, '\u00b7'), h('span', { className: 'sc-status-attn' }, `${waiting} needs you`)) : null
+  const parts = []
+  if (c && c.available !== null) parts.push(h(Fragment, { key: 'c' }, h('b', null, fmtCredits(c.available)), ' cr'))
+  if (running) parts.push(h('b', { key: 'r' }, `${running} rendering`))
+  if (waiting) parts.push(h('span', { key: 'w', className: 'sc-sb-attn' }, `${waiting} needs you`))
+  return h(
+    Fragment,
+    null,
+    parts.map((part, i) => (i ? h(Fragment, { key: `d${i}` }, h('span', { 'aria-hidden': true }, ' \u00b7 '), part) : part))
   )
-  return Tip ? h(Tip, { label: tip }, button) : button
 }
 
 // -----------------------------------------------------------------------------
@@ -2485,6 +2651,7 @@ function FilmCard({ productionId, sessionId }) {
   const status = useStatus()
   const busy = useDeciding(productionId)
   const [note, setNote] = useState('')
+  const [picked, setPicked] = useState(null)
   const p = q.data
   const noteFor = p ? `${p.needs || ''}:${str(obj(p.needsDetail).sha256)}` : ''
   useEffect(() => setNote(''), [noteFor])
@@ -2493,14 +2660,14 @@ function FilmCard({ productionId, sessionId }) {
     return h(
       CardShell,
       { title: 'SLOPCANNON' },
-      h('div', { className: 'sc-wc-body' }, q.isError ? h('div', { className: 'sc-quiet' }, isNotFound(q.error) ? 'This production is not on this machine.' : backendDownText(q.error)) : h(Waiting, { label: 'Opening the production' }))
+      h('div', { className: 'sc-wc-body' }, q.isError ? h('div', { className: 'sc-quiet' }, isMissingProduction(q.error) ? 'This production is not on this machine.' : backendDownText(q.error)) : h(Waiting, { label: 'Opening the production' }))
     )
   }
-  const send = text => sendFromCard(sessionId, text)
+  // Questions for the agent go only to the chat this card is in; a card that does not know its chat sends none.
+  const send = sessionId ? text => sendFromCard(sessionId, text) : null
   const model = needsModel(p, { available: status.data && status.data.credits ? status.data.credits.available : null })
   const subject = filmSubject(p)
   const subjectMedia = subject && subject.row && media ? media.scenes[subject.row.id] : null
-  const ref = filmRef(p)
   const player = subject
     ? guard(
         h(Player, {
@@ -2527,13 +2694,14 @@ function FilmCard({ productionId, sessionId }) {
       h('div', { className: 'sc-wc-body' }, track, h(Meta, { items: [fmtDur(filmDuration(p)), p.counts.total ? plural(p.counts.total, 'scene') : null, p.aspectRatio, 'direction by Hermes'] })),
       h('div', { className: 'sc-wc-decide', 'data-tone': model.tone }, h('b', null, model.headline), h('span', null, model.body)),
       ['rights', 'approval', 'reroll_approval', 'shot_review'].includes(p.needs)
-        ? h('div', { className: 'sc-wc-body' }, guard(h(NeedsDetail, { production: p, send }), null, `${p.id}:${p.needs}`))
+        ? h('div', { className: 'sc-wc-body' }, guard(h(NeedsDetail, { production: p }), null, `${p.id}:${p.needs}`))
         : null,
+      asksWithoutChat(model, send) ? h('div', { className: 'sc-wc-body sc-quiet' }, 'To ask the agent, use the chat this card belongs to.') : null,
       model.noteScene
         ? h(
             'div',
             { className: 'sc-wc-body' },
-            h('textarea', {
+            h(Textarea || 'textarea', {
               className: 'sc-note',
               rows: 2,
               value: note,
@@ -2551,11 +2719,23 @@ function FilmCard({ productionId, sessionId }) {
     body = h(Fragment, null, player, h('div', { className: 'sc-wc-body' }, track, h(Progress, { production: p })))
     actions = [{ key: 'studio', label: 'Open in studio', onClick: () => openStudio(p.id) }, { key: 'stop', node: h(StopControl, { production: p }) }]
   } else if (p.state === 'done') {
-    body = h(Fragment, null, player, h('div', { className: 'sc-wc-body' }, track, h(Meta, { items: doneMeta(p) })))
+    // Reroll from the finished film: choose the scene on the track, then answer the reroll gate for it.
+    const pickedRow = (p.rows || []).find(r => r.id === picked && r.clip && !r.id.includes('.')) || null
+    const doneTrack = (p.rows || []).length
+      ? guard(h(SceneTrack, { production: p, media, compact: true, selectedId: pickedRow && pickedRow.id, onSelect: sid => setPicked(cur => (cur === sid ? null : sid)) }), null, p.id)
+      : null
+    body = h(Fragment, null, player, h('div', { className: 'sc-wc-body' }, doneTrack, h(Meta, { items: doneMeta(p) })))
     actions = [
       { key: 'studio', label: 'Open in studio', onClick: () => openStudio(p.id) },
       p.master ? { key: 'reveal', label: 'Show in folder', onClick: () => reveal(p.master.path) } : null,
-      { key: 'reroll', label: 'Reroll a scene', onClick: () => send(`I want to reroll a scene of ${ref}. Ask me which one.`) }
+      {
+        key: 'reroll',
+        label: pickedRow ? `Reroll scene ${pickedRow.index + 1}` : 'Reroll a scene',
+        disabled: !pickedRow || busy,
+        loading: busy && Boolean(pickedRow),
+        tip: pickedRow ? null : 'Choose a scene on the track first',
+        onClick: () => decideOnCard(p, { gate: 'reroll', reroll: [pickedRow.id] }).then(ok => ok && setPicked(null))
+      }
     ]
   } else {
     body = h(
@@ -2569,12 +2749,27 @@ function FilmCard({ productionId, sessionId }) {
   return h(CardShell, { title: p.title, badge: h(StateBadge, { production: p }), actions }, body)
 }
 
+// The card never vanishes from the chat: a render failure leaves one quiet line, the studio and a retry.
+function CardFallback({ productionId, retry }) {
+  return h(
+    CardShell,
+    {
+      title: 'SLOPCANNON',
+      actions: [
+        { key: 'studio', label: 'Open in studio', onClick: () => openStudio(productionId) },
+        { key: 'retry', label: 'Try again', onClick: retry }
+      ]
+    },
+    h('div', { className: 'sc-wc-body' }, h('div', { className: 'sc-quiet' }, 'This film card could not be shown.'))
+  )
+}
+
 function renderDirective(props) {
   const attrs = obj(props && props.attrs)
   const id = typeof attrs.id === 'string' ? attrs.id.trim() : ''
   if (!PRODUCTION_ID.test(id)) return null
   const sessionId = props && typeof props.sessionId === 'string' ? props.sessionId : null
-  return guard(h(FilmCard, { productionId: id, sessionId }), null, id)
+  return guard(h(FilmCard, { productionId: id, sessionId }), reset => h(CardFallback, { productionId: id, retry: reset }), id)
 }
 
 // -----------------------------------------------------------------------------
@@ -2584,8 +2779,9 @@ function clipContext(toolName, args, result, file) {
   const r = obj(parseMaybeJson(result))
   const a = obj(args)
   const out = { kind: 'clip', productionId: null, title: null, needs: null, sceneId: null, generationId: null, assemblyId: null }
-  const sceneArg = [a.sceneId, a.scene_id, a.scene].find(v => typeof v === 'string' && /^sc\d{1,3}$/i.test(v))
-  if (sceneArg) out.sceneId = sceneArg.toLowerCase()
+  // A reroll take (sc09.r1) belongs to its root scene (sc09).
+  const sceneArg = [a.sceneId, a.scene_id, a.scene].map(v => (typeof v === 'string' ? /^(sc\d{1,3})(?:\.r\d{1,3})?$/i.exec(v) : null)).find(Boolean)
+  if (sceneArg) out.sceneId = sceneArg[1].toLowerCase()
   const idArg = [a.productionId, a.production_id, a.id].find(v => typeof v === 'string' && PRODUCTION_ID.test(v))
   if (idArg) out.productionId = idArg
 
@@ -2699,16 +2895,7 @@ function ToolClipCardInner({ file, toolName, args, result, sessionId, fallback }
   const media = useMedia(p ? p.id : null, false).data || null
   if (src === '') return fallback === undefined ? null : fallback
 
-  const send = text => sendFromCard(sessionId, text)
   const row = p && where.sceneId ? (p.rows || []).find(r => r.id === where.sceneId) || null : null
-  const ref = p ? filmRef(p) : where.productionId ? `production ${where.productionId}` : null
-  const subjectText = fallbackSubject => {
-    let text = where.sceneId ? `scene ${where.sceneId}` : fallbackSubject
-    if (ref) text += ` of ${ref}`
-    if (info.generationId) text += `, generation ${info.generationId}`
-    else if (!where.sceneId && !ref) text += ` (${file.name})`
-    return text
-  }
 
   if (info.kind === 'master') {
     const actions = [
@@ -2727,12 +2914,10 @@ function ToolClipCardInner({ file, toolName, args, result, sessionId, fallback }
   const v = row ? verdictOf(row, p) : null
   const f = row ? sceneFacts(row) : null
   const actions = []
-  // The first scene's decision is on the film card above it: one place to answer, never two.
-  if (row && p) sceneActions(row, p, send, { compact: true }).forEach(a => actions.push(a))
-  else {
-    actions.push({ key: 'reroll', label: 'Reroll this scene', onClick: () => send(`Reroll ${subjectText('this scene')}.`) })
-    actions.push({ key: 'check', label: 'Check again', onClick: () => send(`Check ${subjectText('this take')} for defects.`) })
-  }
+  // The first scene's decision is on the film card above it: one place to answer, never two. A clip whose
+  // production is still being read says so instead of offering an answer it cannot name yet.
+  if (row && p) sceneActions(row, p, { compact: true }).forEach(a => actions.push(a))
+  else if (where.productionId && !p) actions.push({ key: 'updating', node: h(Updating, { productionId: where.productionId }) })
   if (where.productionId) actions.push({ key: 'studio', label: 'Open in studio', onClick: () => openStudio(where.productionId) })
   const title = row ? `Scene ${row.index + 1}` : where.sceneId ? `Scene ${where.sceneId.replace(/^sc0*/, '')}` : file.name
   return h(
@@ -2808,8 +2993,8 @@ export default {
   defaultEnabled: true,
   register(ctx) {
     CTX = ctx
-    lastSeenNeeds.clear()
-    savers.clear()
+    lastSeenNeeds = boundedMap(200)
+    savers = boundedMap(50)
     try {
       const saved = ctx.storage.get('selected', null)
       $selected.set(typeof saved === 'string' && PRODUCTION_ID.test(saved) ? saved : null)
@@ -2842,7 +3027,15 @@ export default {
         id: 'status',
         area: STATUSBAR_AREAS.right,
         order: 95,
-        render: () => guard(h(StatusItem))
+        data: {
+          id: 'slopcannon.status',
+          label: 'SLOPCANNON',
+          detail: guard(h(StatusDetail)),
+          title: 'Open the SLOPCANNON studio',
+          toggleLabel: 'SLOPCANNON',
+          className: 'sc-sb',
+          onSelect: () => openStudio()
+        }
       },
       {
         id: 'open',

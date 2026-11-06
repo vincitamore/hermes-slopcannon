@@ -20,21 +20,29 @@ from types import ModuleType
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Query
-from fastapi.responses import FileResponse
 
 # The path as Hermes gave it, never resolved: Hermes lends the sign-in only to code whose file lies
 # under a plugins folder, so a plugin installed as a link (a junction or symlink to a checkout) that
 # loads itself from the resolved target is refused ("must be called from an installed plugin's code").
 _PACKAGE_DIR = Path(__file__).absolute().parents[1]
 _ALIAS = "hermes_slopcannon_studio"
+_found: ModuleType | None = None
 
 
 def _package() -> ModuleType:
-    """The plugin package: the copy Hermes already loaded, else one loaded from this folder."""
+    """The plugin package: the copy Hermes already loaded, else one loaded from this folder.
+
+    Resolved once and kept while that module is still the one in ``sys.modules`` (a scan of every loaded
+    module per request would otherwise run on each studio poll)."""
+    global _found
+    if _found is not None and sys.modules.get(_found.__name__) is _found:
+        return _found
     init = _PACKAGE_DIR / "__init__.py"
+    target = init.resolve()
     for name, module in list(sys.modules.items()):
         file = getattr(module, "__file__", None)
-        if file and name.count(".") <= 1 and Path(file).resolve() == init.resolve():
+        if file and name.count(".") <= 1 and Path(file).resolve() == target:
+            _found = module
             return module
     if _ALIAS not in sys.modules:
         spec = importlib.util.spec_from_file_location(_ALIAS, init, submodule_search_locations=[str(_PACKAGE_DIR)])
@@ -43,7 +51,8 @@ def _package() -> ModuleType:
         module = importlib.util.module_from_spec(spec)
         sys.modules[_ALIAS] = module
         spec.loader.exec_module(module)
-    return sys.modules[_ALIAS]
+    _found = sys.modules[_ALIAS]
+    return _found
 
 
 def _mod(name: str) -> Any:
@@ -157,9 +166,11 @@ def locate(path: str = Query("", max_length=4096), generationId: str = Query("",
 def production_stop(production_id: str) -> dict[str, Any]:
     production = _mod("production")
     try:
+        if production.load_state(production_id) is None:
+            raise production.ProductionError(f"no production {production_id}", "unknown_production")
         return {"stopped": production.stop(production_id)}
     except production.ProductionError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=404 if exc.code == "unknown_production" else 400, detail=str(exc))
 
 
 @router.post("/productions/{production_id}/decide")
@@ -168,41 +179,11 @@ def production_decide(production_id: str, body: dict[str, Any] = Body(default_fa
     try:
         return {"ok": True, "production": production.decide(production_id, body if isinstance(body, dict) else {})}
     except production.ProductionError as exc:
-        raise HTTPException(status_code=409 if exc.code in ("busy", "stale_decision") else 400, detail=str(exc))
-
-
-@router.post("/login")
-def login() -> dict[str, Any]:
-    """How to connect. Sign-in is Hermes's own and runs in a terminal; the plugin never starts one."""
-    auth = _mod("auth")
-    return {"started": False, **_sign_in(auth)}
+        code = 404 if exc.code == "unknown_production" else 409 if exc.code in ("busy", "stale_decision") else 400
+        raise HTTPException(status_code=code, detail=str(exc))
 
 
 def _sign_in(auth: Any) -> dict[str, Any]:
     return {"command": auth.SIGN_IN_COMMAND, "clientIdCommand": auth.CLIENT_ID_COMMAND,
             "signOutCommand": auth.SIGN_OUT_COMMAND,
             "alternative": "Or enter a slop.cc/account token as the plugin's Agent token setting."}
-
-
-@router.get("/media")
-def media(path: str = Query(..., min_length=1)) -> FileResponse:
-    """Stream a clip or master this plugin saved (byte ranges supported); nothing else on disk."""
-    production = _mod("production")
-    target = Path(path).expanduser()
-    try:
-        target = target.resolve(strict=True)
-    except (OSError, RuntimeError):
-        raise HTTPException(status_code=404, detail="not found")
-    allowed = False
-    for root in production.allowed_media_roots():
-        try:
-            target.relative_to(Path(root).resolve())
-            allowed = True
-            break
-        except ValueError:
-            continue
-    if not allowed or not target.is_file() or target.suffix.lower() not in {".mp4", ".mov", ".webm", ".m4a", ".mp3", ".wav"}:
-        raise HTTPException(status_code=404, detail="not found")
-    media_type = {".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
-                  ".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav"}[target.suffix.lower()]
-    return FileResponse(target, media_type=media_type, headers={"Cache-Control": "private, max-age=3600"})
